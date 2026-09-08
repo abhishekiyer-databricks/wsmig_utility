@@ -1,0 +1,22 @@
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant T as Target workspace
+    participant S as Source (REST)
+    participant V as Staging Volume
+    Op->>T: Run 00_Install_Jobs (deploy jobs, bake config)
+    Op->>T: Run "direct end-to-end (DRY RUN)" Job
+    activate T
+    T->>S: 01 Inventory  (OAuth M2M)
+    T->>S: 02 Export  (OAuth M2M)
+    T->>V: write bundle + manifest
+    T->>T: 04 Import (dry_run=true) - decide, write NOTHING
+    deactivate T
+    T-->>Op: dry-run reports (import_status_dry_run.xlsx)
+    Note over Op,T: Review preflight verdict + intended actions
+    Op->>T: Run "direct end-to-end (LIVE)" Job (dry_run=false)
+    activate T
+    T->>V: read + verify bundle
+    T->>T: 04 Import - create/update in dependency order, ACLs last
+    deactivate T
+    T-->>Op: import reports + manual_actions_import.md

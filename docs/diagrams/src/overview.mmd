@@ -1,0 +1,22 @@
+graph LR
+    subgraph SRC["SOURCE workspace"]
+        I["Identity<br/>users · SPs · groups"]
+        C["Compute<br/>pools · policies · clusters"]
+        W["Workspace<br/>notebooks · files · repos"]
+        A["Jobs · SQL · DLT<br/>dashboards · Genie · serving"]
+    end
+    B[["Self-describing<br/>bundle"]]
+    subgraph TGT["TARGET workspace"]
+        R["Recreated assets<br/>+ permissions (ACLs)"]
+    end
+    I --> B
+    C --> B
+    W --> B
+    A --> B
+    B ==> R
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef stg fill:#FFF8E1,stroke:#F57F17,stroke-width:2px,color:#E65100;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class SRC src
+    class B stg
+    class TGT tgt

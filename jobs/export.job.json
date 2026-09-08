@@ -1,0 +1,47 @@
+{
+  "name": "wsmig - export",
+  "description": "Workspace Migration: export only (02_Export). Turns the inventory into the portable bundle.",
+  "run_as": {
+    "service_principal_name": "{{RUN_AS_SP}}"
+  },
+  "max_concurrent_runs": 1,
+  "tags": {
+    "wsmig": "true"
+  },
+  "tasks": [
+    {
+      "task_key": "export",
+      "notebook_task": {
+        "notebook_path": "{{REPO_PATH}}/notebooks/02_Export",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "connectivity_mode": "",
+          "source_workspace_id": "",
+          "staging_location": "",
+          "run_id": "",
+          "source_workspace_url": "",
+          "source_sp_client_id": "",
+          "source_sp_secret_scope": "",
+          "source_sp_secret_key": "",
+          "spn_secret_value": "",
+          "max_scim": "0",
+          "max_workspace_items": "0",
+          "max_ws_api_calls": "0",
+          "content_fetch_workers": "8",
+          "force_full_export": "false",
+          "migrate_identity": "true",
+          "migrate_compute": "true",
+          "migrate_workspace": "true",
+          "migrate_secrets": "true",
+          "migrate_jobs": "true",
+          "migrate_sql": "true",
+          "migrate_dlt": "true",
+          "migrate_dashboards": "true",
+          "migrate_serving": "true",
+          "migrate_genie": "true",
+          "migrate_misc": "true"
+        }
+      }
+    }
+  ]
+}

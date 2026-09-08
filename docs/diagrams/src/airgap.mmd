@@ -1,0 +1,18 @@
+graph LR
+    subgraph SRCSIDE["SOURCE SIDE - inside the SOURCE workspace"]
+        direction TB
+        A1["01 Inventory"] --> A2["02 Export"] --> V1[("Staging<br/>location A")]
+    end
+    HOP{{"Operator moves<br/>the bundle<br/>(A to B)"}}
+    subgraph TGTSIDE["TARGET SIDE - inside the TARGET workspace"]
+        direction TB
+        V2[("Staging<br/>location B")] --> A4["04 Import"]
+    end
+    V1 -. "no network link<br/>physical handoff" .-> HOP
+    HOP -.-> V2
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef bad fill:#FFEBEE,stroke:#C62828,stroke-width:2px,color:#B71C1C;
+    class SRCSIDE src
+    class TGTSIDE tgt
+    class HOP bad

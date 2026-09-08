@@ -1,0 +1,35 @@
+{
+  "name": "wsmig - inventory",
+  "description": "Workspace Migration: inventory only (01_Inventory). Reads the source, writes inventory + the bundle skeleton.",
+  "run_as": {
+    "service_principal_name": "{{RUN_AS_SP}}"
+  },
+  "max_concurrent_runs": 1,
+  "tags": {
+    "wsmig": "true"
+  },
+  "tasks": [
+    {
+      "task_key": "inventory",
+      "notebook_task": {
+        "notebook_path": "{{REPO_PATH}}/notebooks/01_Inventory",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "connectivity_mode": "",
+          "source_workspace_id": "",
+          "staging_location": "",
+          "run_id": "",
+          "source_workspace_url": "",
+          "source_sp_client_id": "",
+          "source_sp_secret_scope": "",
+          "source_sp_secret_key": "",
+          "spn_secret_value": "",
+          "max_scim": "0",
+          "max_workspace_items": "0",
+          "max_ws_api_calls": "0",
+          "force_full": "false"
+        }
+      }
+    }
+  ]
+}

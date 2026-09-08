@@ -1,0 +1,14 @@
+graph TB
+    subgraph AIRGAP["airgap mode"]
+        SA["Source run-as SP<br/>workspace-admin on SOURCE"]
+        TA["Target run-as SP<br/>workspace-admin on TARGET"]
+    end
+    subgraph DIRECTM["direct mode (default)"]
+        TD["Target run-as SP<br/>workspace-admin on TARGET<br/>(runs ALL stages)"]
+        SD["Source read SP<br/>workspace-admin on SOURCE<br/>OAuth M2M secret"]
+        TD -. "reads source over REST" .-> SD
+    end
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class AIRGAP src
+    class DIRECTM tgt

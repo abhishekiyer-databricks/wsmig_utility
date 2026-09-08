@@ -1,0 +1,12 @@
+graph LR
+    R["Live import"] --> F{Any failed or<br/>skipped units?}
+    F -->|No| DONE([Done])
+    F -->|Yes| FIX["Fix the prerequisite<br/>(grant / assign / create scope)"]
+    FIX --> RT["Re-run with<br/>retry_mode=failed_only"]
+    RT --> R
+    classDef n fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    classDef term fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class R,FIX,RT n
+    class F gate
+    class DONE term

@@ -1,0 +1,17 @@
+graph LR
+    A["1 - Install Jobs<br/>00_Install_Jobs"] --> B["2 - Dry-run Job<br/>inventory - export - import"]
+    B --> C{Dry run<br/>reads clean?}
+    C -->|No| F["Fix preflight / config"]
+    F --> B
+    C -->|Yes| D["3 - Live Job<br/>dry_run=false"]
+    D --> E["4 - Review reports<br/>+ manual actions"]
+    E --> G{Failures?}
+    G -->|Yes| H["Fix cause -><br/>retry_mode=failed_only"]
+    H --> D
+    G -->|No| DONE([Pair migrated])
+    classDef step fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    classDef term fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class A,B,D,E,F,H step
+    class C,G gate
+    class DONE term

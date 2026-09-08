@@ -1,0 +1,21 @@
+graph TD
+    PF["Preflight - verify only<br/>(never mutates the target)"] --> C1["Bundle integrity<br/>manifest + checksums"]
+    PF --> C2["Staging readable<br/>from target"]
+    PF --> C3["Target workspace-admin<br/>SCIM readable"]
+    PF --> C4["Migration state schema<br/>when live"]
+    PF --> C5["Source connectivity<br/>direct: OAuth M2M + admin"]
+    C1 --> V{Verdict}
+    C2 --> V
+    C3 --> V
+    C4 --> V
+    C5 --> V
+    V -->|GO| RUN["Import runs"]
+    V -->|"NO-GO (preflight_enforce=true)"| STOP["Import does NOT run"]
+    classDef n fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    classDef ok fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef bad fill:#FFEBEE,stroke:#C62828,stroke-width:2px,color:#B71C1C;
+    class PF,C1,C2,C3,C4,C5 n
+    class V gate
+    class RUN ok
+    class STOP bad

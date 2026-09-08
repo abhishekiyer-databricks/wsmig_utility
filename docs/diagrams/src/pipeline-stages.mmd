@@ -1,0 +1,20 @@
+graph LR
+    subgraph STAGE1["Stage 1 - Inventory (read-only)"]
+        direction TB
+        I1["List every asset<br/>via SCIM + workspace APIs"] --> I2["Classify identities"] --> I3["Assign a stable natural_key"]
+    end
+    subgraph STAGE2["Stage 2 - Export"]
+        direction TB
+        E1["Dump enabled assets<br/>(migrate_* toggles)"] --> E2["Strip runtime fields"] --> E3["natural_key + fingerprint"] --> E4["manifest + checksums"]
+    end
+    subgraph STAGE3["Stage 3 - Import"]
+        direction TB
+        M1["Preflight go/no-go"] --> M2["Create / Update / Skip<br/>in dependency order"] --> M3["Replay ACLs last"] --> M4["Reports + state upsert"]
+    end
+    STAGE1 ==> STAGE2 ==> STAGE3
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef stg fill:#FFF8E1,stroke:#F57F17,stroke-width:2px,color:#E65100;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class STAGE1 src
+    class STAGE2 stg
+    class STAGE3 tgt

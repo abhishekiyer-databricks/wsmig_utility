@@ -1,0 +1,13 @@
+graph TD
+    A["Asset in bundle<br/>(natural_key + fingerprint)"] --> B{In state table?}
+    B -->|No| C["CREATE on target<br/>store source id, target id, fingerprint"]
+    B -->|Yes| D{Fingerprint<br/>changed?}
+    D -->|No| E["SKIP (unchanged)"]
+    D -->|Yes| F["UPDATE the stored target id<br/>(asset edit API)"]
+    C --> G["Change report:<br/>created / updated / unchanged / deleted-in-source"]
+    E --> G
+    F --> G
+    classDef n fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    class A,C,E,F,G n
+    class B,D gate

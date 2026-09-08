@@ -1,0 +1,20 @@
+graph LR
+    subgraph TGT["TARGET workspace - every stage runs here"]
+        direction TB
+        D1["01 Inventory"] --> D2["02 Export"] --> D4["04 Import"]
+        V[("Staging Volume<br/>single location")]
+        D1 -. writes .-> V
+        D2 -. writes .-> V
+        V -. reads .-> D4
+    end
+    subgraph SRC["SOURCE workspace"]
+        SAPI["REST API<br/>/api/2.0/..."]
+    end
+    D1 -. "OAuth M2M<br/>(source SP client_id + secret)" .-> SAPI
+    D2 -. "OAuth M2M" .-> SAPI
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef stg fill:#FFF8E1,stroke:#F57F17,stroke-width:2px,color:#E65100;
+    class SRC src
+    class TGT tgt
+    class V stg

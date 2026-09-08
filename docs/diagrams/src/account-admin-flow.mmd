@@ -1,0 +1,12 @@
+graph TD
+    A{Account identity already<br/>assigned to the target workspace?}
+    A -->|Yes| S["Skip create/assign,<br/>just set entitlements + ACLs"]
+    A -->|No| B{Run-as SP has<br/>account-admin?}
+    B -->|Yes| C["Tool assigns it<br/>(PermissionAssignments API)"]
+    B -->|No| D["Tool DETECTS the gap and REPORTS it<br/>as a prerequisite for customer IT"]
+    classDef n fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    classDef warn fill:#FFF8E1,stroke:#F57F17,stroke-width:2px,color:#E65100;
+    class S,C n
+    class A,B gate
+    class D warn

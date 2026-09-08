@@ -1,0 +1,32 @@
+# ── Databricks CLI local state (contains workspace host URLs + user paths) ──
+.databricks/
+
+# ── Local tooling / assistant config (may contain local paths + settings) ──
+.claude/
+.isaac/
+.idea/
+.vscode/
+
+# ── Test config (excluded per infosec review) ──
+pytest.ini
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# ── Virtualenvs / secrets / env ──
+.venv/
+venv/
+env/
+.env
+*.env
+
+# ── OS cruft ──
+.DS_Store
+Thumbs.db

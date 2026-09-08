@@ -1,0 +1,7 @@
+graph LR
+    N1["1<br/>Identity"] --> N2["2<br/>Compute"] --> N3["3<br/>Workspace"] --> N4["4<br/>Secrets"] --> N5["5<br/>SQL"] --> N6["6<br/>DLT"]
+    N6 --> N7["7<br/>Jobs"] --> N8["8<br/>Dashboards"] --> N9["9<br/>Genie"] --> N10["10<br/>Serving"] --> N11["11<br/>Misc"] --> N12["12<br/>ACLs"]
+    classDef n fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef last fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10,N11 n
+    class N12 last

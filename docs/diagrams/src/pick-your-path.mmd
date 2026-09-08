@@ -1,0 +1,11 @@
+graph TD
+    START([I need to...]) --> Q1{What is my goal?}
+    Q1 -->|Understand how it works| ARCH["ARCHITECTURE.md"]
+    Q1 -->|Request access / permissions| PERM["PERMISSIONS_GUIDE.md"]
+    Q1 -->|Set widgets / job params| CFG["CONFIGURATION_GUIDE.md"]
+    Q1 -->|Actually run a migration| RUN["RUNBOOK.md"]
+    RUN --> DONE([Migrate!])
+    classDef doc fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef term fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    class ARCH,PERM,CFG,RUN doc
+    class START,DONE term

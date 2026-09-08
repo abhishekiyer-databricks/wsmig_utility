@@ -1,0 +1,10 @@
+graph LR
+    W["Notebook widgets<br/>OR Job base_parameters"] --> FD["Config.from_dbutils(stage=...)"]
+    FD --> ROLE["Derives role<br/>from stage + mode"]
+    FD --> VAL["validate()<br/>fail-fast on bad config"]
+    VAL --> CFG["Config dataclass<br/>single source of truth"]
+    CFG --> RED["redacted() writes<br/>config_resolved.json<br/>(no secrets)"]
+    classDef n fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    class W,FD,CFG,RED n
+    class ROLE,VAL gate

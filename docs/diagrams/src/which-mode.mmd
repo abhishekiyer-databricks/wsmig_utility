@@ -1,0 +1,10 @@
+graph TD
+    Q{Is there a network path<br/>between source and target?}
+    Q -->|"No connectivity (air-gapped)"| A["Use AIRGAP mode<br/>two sides + manual bundle hop"]
+    Q -->|"Target can reach source"| D["Use DIRECT mode (default)<br/>one end-to-end Job"]
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef gate fill:#F3E5F5,stroke:#6A1B9A,stroke-width:2px,color:#4A148C;
+    class A src
+    class D tgt
+    class Q gate

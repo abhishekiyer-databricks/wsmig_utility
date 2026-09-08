@@ -1,0 +1,19 @@
+graph TB
+    subgraph AG["airgap mode - NO source credentials needed"]
+        direction TB
+        AGS["SOURCE side (01, 02) runs INSIDE the source<br/>uses the run-as SP context token<br/>-> authenticates to the SOURCE only"]
+        AGT["TARGET side (04) runs INSIDE the target<br/>uses the run-as SP context token<br/>-> authenticates to the TARGET only"]
+    end
+    subgraph DIR["direct mode - source credential REQUIRED"]
+        direction TB
+        DT["ALL stages run INSIDE the target<br/>run-as SP context token -> TARGET"]
+        DS["To read the SOURCE over REST:<br/>source workspace-admin SP<br/>OAuth M2M (client_id + secret)"]
+        DT -. "reads source" .-> DS
+    end
+    NP["No PATs in either mode"]
+    classDef tgt fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+    classDef src fill:#E3F2FD,stroke:#1565C0,stroke-width:2px,color:#0D47A1;
+    classDef bad fill:#FFEBEE,stroke:#C62828,stroke-width:2px,color:#B71C1C;
+    class AG tgt
+    class DIR src
+    class NP bad

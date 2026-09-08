@@ -1,0 +1,112 @@
+{
+  "name": "wsmig - direct end-to-end (DRY RUN)",
+  "description": "Workspace Migration: full direct-mode run with the import task pinned dry_run=true. The safe first run; writes the _dryrun state table and import_status_dry_run.xlsx.",
+  "run_as": {
+    "service_principal_name": "{{RUN_AS_SP}}"
+  },
+  "max_concurrent_runs": 1,
+  "tags": {
+    "wsmig": "true"
+  },
+  "tasks": [
+    {
+      "task_key": "inventory",
+      "notebook_task": {
+        "notebook_path": "{{REPO_PATH}}/notebooks/01_Inventory",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "connectivity_mode": "",
+          "source_workspace_id": "",
+          "staging_location": "",
+          "run_id": "",
+          "source_workspace_url": "",
+          "source_sp_client_id": "",
+          "source_sp_secret_scope": "",
+          "source_sp_secret_key": "",
+          "spn_secret_value": "",
+          "max_scim": "0",
+          "max_workspace_items": "0",
+          "max_ws_api_calls": "0",
+          "force_full": "false"
+        }
+      }
+    },
+    {
+      "task_key": "export",
+      "notebook_task": {
+        "notebook_path": "{{REPO_PATH}}/notebooks/02_Export",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "connectivity_mode": "",
+          "source_workspace_id": "",
+          "staging_location": "",
+          "run_id": "",
+          "source_workspace_url": "",
+          "source_sp_client_id": "",
+          "source_sp_secret_scope": "",
+          "source_sp_secret_key": "",
+          "spn_secret_value": "",
+          "max_scim": "0",
+          "max_workspace_items": "0",
+          "max_ws_api_calls": "0",
+          "content_fetch_workers": "8",
+          "force_full_export": "false",
+          "migrate_identity": "true",
+          "migrate_compute": "true",
+          "migrate_workspace": "true",
+          "migrate_secrets": "true",
+          "migrate_jobs": "true",
+          "migrate_sql": "true",
+          "migrate_dlt": "true",
+          "migrate_dashboards": "true",
+          "migrate_serving": "true",
+          "migrate_genie": "true",
+          "migrate_misc": "true"
+        }
+      },
+      "depends_on": [
+        {
+          "task_key": "inventory"
+        }
+      ]
+    },
+    {
+      "task_key": "import",
+      "notebook_task": {
+        "notebook_path": "{{REPO_PATH}}/notebooks/04_Import",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "connectivity_mode": "",
+          "source_workspace_id": "",
+          "staging_location": "",
+          "run_id": "",
+          "source_workspace_url": "",
+          "source_sp_client_id": "",
+          "source_sp_secret_scope": "",
+          "source_sp_secret_key": "",
+          "spn_secret_value": "",
+          "dry_run": "true",
+          "state_catalog": "",
+          "state_schema": "",
+          "import_assets": "all",
+          "retry_mode": "off",
+          "preflight_enforce": "true",
+          "force_full_import": "false",
+          "allow_deletes": "false",
+          "library_force_start_clusters": "false",
+          "workspace_home_backup": "true",
+          "workspace_home_backup_root": "/Users_Backup",
+          "account_id": "",
+          "user_domain_mapping": "",
+          "user_id_mapping": "",
+          "pause_job_schedules": "true"
+        }
+      },
+      "depends_on": [
+        {
+          "task_key": "export"
+        }
+      ]
+    }
+  ]
+}

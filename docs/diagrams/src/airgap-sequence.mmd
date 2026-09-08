@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant S as Source workspace
+    participant VA as Staging A (source)
+    participant VB as Staging B (target)
+    participant Tg as Target workspace
+    Op->>S: Run "airgap_source" Job (01 Inventory + 02 Export)
+    activate S
+    S->>VA: write bundle + manifest
+    deactivate S
+    Note over VA,VB: Operator PHYSICALLY moves the bundle<br/>(download from A, upload to B) - the only thing that crosses
+    Op->>Tg: Run 04 Import (dry_run=true)
+    activate Tg
+    Tg->>VB: read bundle, verify manifest (counts + checksums)
+    deactivate Tg
+    Tg-->>Op: dry-run reports
+    Op->>Tg: Run 04 Import (dry_run=false)
+    activate Tg
+    Tg->>VB: read bundle
+    Tg->>Tg: create/update in dependency order, ACLs last
+    deactivate Tg
+    Tg-->>Op: import reports + manual_actions_import.md
