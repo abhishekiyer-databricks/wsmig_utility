@@ -29,32 +29,41 @@ dbutils.widgets.multiselect(
     "deploy_jobs", "direct_end_to_end_dry_run",
     ["direct_end_to_end_dry_run", "direct_end_to_end_live", "inventory", "export", "import",
      "airgap_source"],
-    "Jobs to deploy (create or reset by name)")
+    "0a. Jobs to deploy (create or reset by name)")
+
+# B12: a numeric "<N><letter>. " prefix is prepended to each widget's ORIGINAL display name so
+# Databricks groups them in the bar (0=Install, 1=Source, 2=Output, 4=Import). Prefix only — the
+# display text and the widget names/defaults are unchanged.
 
 # The identity each created job runs as — a TARGET workspace-admin SP (applicationId).
-dbutils.widgets.text("run_as_sp", "", "Run-as SP applicationId (target workspace admin)")
+dbutils.widgets.text("run_as_sp", "", "0b. Run-as SP applicationId (target workspace admin)")
+# B1: the SOURCE workspace-admin SP the AIRGAP SOURCE job (airgap_source: 01→02, run inside the
+# source) runs as. Used ONLY when connectivity_mode=airgap; ignored in direct mode (01/02 run in the
+# target and read the source over OAuth M2M). applicationId only — no secret. The installer must
+# hold `servicePrincipal.user` on it or the Jobs API refuses to create the job.
+dbutils.widgets.text("source_run_as_spn", "",
+                     "0c. [airgap] Source run-as SP applicationId (source ws admin)")
 
 # Common config, projected onto every job (each job keeps only the keys its tasks declare).
-dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"], "Connectivity mode")
-dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("staging_location", "", "Staging location (/Volumes/...)")
-
-# direct-mode source connection. Secret via scope pointer (preferred) OR spn_secret_value.
-dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
-dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
-dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope for the SP secret")
-dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
-dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only baked in if opt-in below)")
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
+                         "1a. Connectivity mode")
+dbutils.widgets.text("source_workspace_id", "", "1b. Source workspace id")
+dbutils.widgets.text("source_workspace_url", "", "1c. [direct] Source workspace URL")
+dbutils.widgets.text("source_sp_client_id", "", "1d. [direct] Source SP applicationId (not a secret)")
+dbutils.widgets.text("source_sp_secret_scope", "", "1e. [direct] Secret scope for the SP secret")
+dbutils.widgets.text("source_sp_secret_key", "", "1f. [direct] Secret key within that scope")
+dbutils.widgets.text("spn_secret_value", "", "1g. [direct] SP secret (only baked in if opt-in below)")
 # OPT-IN: bake spn_secret_value into the jobs' base_parameters. OFF by default because Job params
 # are visible in cleartext on the run/job page and kept in run history — the scope pointer avoids
 # that. Turn ON only for your own authorized run / a throwaway smoke test.
 dbutils.widgets.dropdown("allow_secret_in_job_params", "false", ["true", "false"],
-                         "[direct] Bake spn_secret_value into job params (VISIBLE in cleartext)")
+                         "1h. [direct] Bake spn_secret_value into job params (VISIBLE in cleartext)")
 
-# import-side config (only projected onto jobs that have an import task).
-dbutils.widgets.text("state_catalog", "", "State catalog (shared, must exist)")
-dbutils.widgets.text("state_schema", "", "State schema (shared, must exist)")
-dbutils.widgets.text("account_id", "", "Account id (optional)")
+# Output group: staging + the shared state catalog/schema (per B12 these are ONE "Output" group).
+dbutils.widgets.text("staging_location", "", "2a. Staging location (/Volumes/...)")
+dbutils.widgets.text("state_catalog", "", "2b. State catalog (shared, must exist)")
+dbutils.widgets.text("state_schema", "", "2c. State schema (shared, must exist)")
+dbutils.widgets.text("account_id", "", "4h. Account id (optional)")
 
 # COMMAND ----------
 
@@ -108,7 +117,8 @@ _REPO_ROOT, _REPO_WS_PATH = _resolve_repo_context()
 print(f"repo root on sys.path : {_REPO_ROOT}")
 print(f"repo workspace path   : {_REPO_WS_PATH}  (job notebook_path prefix)")
 
-from src.utils.job_templates import create_or_reset, load_template, render_template
+from src.utils.job_templates import (create_or_reset, load_template, render_template,
+                                     run_as_for_job)
 
 # COMMAND ----------
 
@@ -174,7 +184,10 @@ elif not _raw_secret:
           "pointer, or spn_secret_value + allow_secret_in_job_params=true.")
 
 _tokens = {"REPO_PATH": _REPO_WS_PATH, "RUN_AS_SP": _run_as_sp}
-_run_as = {"service_principal_name": _run_as_sp}
+# B1: the airgap SOURCE job runs as the SOURCE ws-admin SP (when given, airgap mode); every other
+# job runs as the target run-as SP. Decided per job in the deploy loop via run_as_for_job.
+_source_run_as_spn = _w("source_run_as_spn").strip()
+_mode = _w("connectivity_mode", "direct")
 
 # COMMAND ----------
 
@@ -193,10 +206,13 @@ _results = []
 for _name in _selected:
     _path = os.path.join(_REPO_ROOT, "jobs", f"{_name}.job.json")
     _template = load_template(_path)
-    _rendered = render_template(_template, tokens=_tokens, params=_params, run_as=_run_as)
+    _job_run_as = run_as_for_job(_name, _mode, _run_as_sp, _source_run_as_spn)   # B1
+    _rendered = render_template(_template, tokens=_tokens, params=_params, run_as=_job_run_as)
     _out = create_or_reset(client, _rendered)
     _results.append(_out)
-    print(f"  {_out['action']:<8} {_out['name']:<44} job_id={_out['job_id'] or '(new)'}")
+    _who = _job_run_as["service_principal_name"]
+    print(f"  {_out['action']:<8} {_out['name']:<44} job_id={_out['job_id'] or '(new)'}"
+          f"  run_as={_who}")
 
 print("\nDone. Open Workflows → Jobs to run them.")
 print("Recommended first run: `wsmig - direct end-to-end (DRY RUN)` → read "

@@ -32,7 +32,9 @@ import base64
 import os
 import posixpath
 
-from src.importers.base_importer import BaseImporter, HomeResolution, PrerequisiteMissing
+from src.importers.base_importer import (BaseImporter, DeferredHome, HomeResolution,
+                                         PrerequisiteMissing)
+from src.state.state_store import ACTION_FAILED, CAT_API_ERROR
 from src.utils.helpers import home_owner, looks_like_app_id, safe_str
 
 # The home-resolution seam (`_resolve_home_target`, `_roster_status`, `_home_present`,
@@ -83,6 +85,49 @@ def is_user_home(path: str) -> bool:
 class WorkspaceImporter(BaseImporter):
     component = "workspace"
     asset_types = ("directory", "notebook", "workspace_file", "repo")
+
+    def run(self):
+        """Run the phase, then B8 END-OF-PHASE RE-SWEEP of any deferred home content.
+
+        A home-descendant unit whose `/Users/<owner>` home wasn't present during the main loop was
+        PARKED (not recorded, not cache-pinned). After the whole phase — maximising the time the
+        platform had to lazily provision — re-check each deferred home against a FRESH `get-status`:
+        a home that appeared is now imported; one still absent becomes a clean `prerequisite_missing`
+        that a later `retry_mode=failed_only` heals. This removes the stale-cache `failed_only` loop
+        for within-run provisioners without ever `mkdir`-ing a protected home."""
+        result = super().run()
+        if self._deferred_units:
+            if self._resweep_at_phase_end:
+                # Direct call (unit test / standalone) — re-sweep now so deferred units get a final
+                # outcome.
+                self._resweep_deferred_homes()
+            elif self.context is not None:
+                # Runner-driven — publish the parked units so the runner re-sweeps them LATE, just
+                # before the ACL phase (B8): maximum time for lazy home provisioning, still before
+                # ACLs so healed content gets its permissions this run.
+                self.context.setdefault("deferred_home_units", []).extend(self._deferred_units)
+        return result
+
+    def _resweep_deferred_homes(self) -> None:
+        deferred, self._deferred_units = self._deferred_units, []
+        self._in_resweep = True
+        self._home_present_cache = {}   # fresh — a home may have provisioned since the main loop
+        self.log.info("home re-sweep: re-checking deferred home content against a fresh get-status",
+                      component=self.component, deferred=len(deferred))
+        try:
+            existing = self.existing_keys()
+        except Exception as exc:  # noqa: BLE001 — re-sweep must not crash the phase
+            self.log.warning("re-sweep existence check failed", error=str(exc)[:200])
+            existing = {}
+        for unit in deferred:
+            try:
+                self._process_one(unit, existing)
+            except Exception as exc:  # noqa: BLE001 — fail-soft, same as the main loop
+                self._record(unit, ACTION_FAILED,
+                             note=f"unexpected importer error during home re-sweep: {exc}",
+                             error_raw=str(exc), category=CAT_API_ERROR)
+        self.flush_checkpoint()
+        self._in_resweep = False
 
     def load(self) -> list[dict]:
         """Directories (shallowest first) → notebooks → files → repos.
@@ -183,10 +228,17 @@ class WorkspaceImporter(BaseImporter):
         # A home ROOT is never mkdir'd — it is auto-provisioned when its owner is created/assigned.
         if res.kind == "skip_root":
             return {"target_id": res.target_path, "note": res.note}
-        # Owner absent on target and not eligible for backup → one clean, actionable prerequisite
+        # Owner genuinely absent (deleted in source, backup off) → one clean, actionable prerequisite
         # (Bug 8/14 + A2), never a raw DIRECTORY_PROTECTED / parent-missing error.
         if res.kind == "prerequisite":
             self._raise_home_prerequisite(path)
+        # B8: the home may still be lazily provisioned (in-roster/unknown owner) — DEFER for the
+        # end-of-phase re-sweep instead of hard-failing + pinning the stale cache. On the re-sweep
+        # (last word) a still-absent home becomes a clean prerequisite. We NEVER mkdir a home root.
+        if res.kind == "defer":
+            if self._in_resweep:
+                self._raise_home_prerequisite(path)
+            raise DeferredHome(path)
         # not_home / normal_home / remapped_sp / backup → create at the RESOLVED path. For `backup`
         # the resolved path is `<backup_root>/<owner>/…` (the home ROOT unit becomes the
         # `<backup_root>/<owner>` dir, so descendants land into an existing tree).
@@ -213,10 +265,15 @@ class WorkspaceImporter(BaseImporter):
                     "note": "inside a platform-internal directory — owned by Databricks, not "
                             "recreated by this tool"}
         res = self._resolve_home_target(source_path)
-        # A descendant of a home whose owner is absent on target and not eligible for backup → one
-        # clean prerequisite (Bug 8/14), rather than a raw parent-missing / DIRECTORY_PROTECTED error.
+        # A descendant of a home whose owner is genuinely absent (deleted, backup off) → one clean
+        # prerequisite (Bug 8/14), rather than a raw parent-missing / DIRECTORY_PROTECTED error.
         if res.kind == "prerequisite":
             self._raise_home_prerequisite(source_path)
+        # B8: the home may still be provisioned lazily — DEFER for the end-of-phase re-sweep.
+        if res.kind == "defer":
+            if self._in_resweep:
+                self._raise_home_prerequisite(source_path)
+            raise DeferredHome(source_path)
         # A notebook/file under a recreated SP's home follows the home to its NEW appId path (IMP-6);
         # an orphaned home's content lands under the backup root (PLAN 9). Both come from the resolver.
         path = res.target_path
@@ -232,9 +289,12 @@ class WorkspaceImporter(BaseImporter):
 
         data = self._read_content(content_ref)
         parent = posixpath.dirname(path)
-        if parent and not is_skippable_path(parent):
+        if parent and not is_skippable_path(parent) and not is_user_home(parent):
             # Cheap insurance: a content unit whose parent directory was filtered out, or whose
-            # family ran alone, would otherwise fail on a missing parent.
+            # family ran alone, would otherwise fail on a missing parent. B8: NEVER mkdir a
+            # `/Users/<owner>` home root — it is protected (DIRECTORY_PROTECTED) and lazily
+            # provisioned; a content unit directly under a home relies on the home already existing
+            # (the resolver deferred it until then), so skip the parent-mkdir for a home root.
             try:
                 self.client.post("api/2.0/workspace/mkdirs", {"path": parent})
             except Exception:  # noqa: BLE001 — idempotent; a real problem resurfaces on import

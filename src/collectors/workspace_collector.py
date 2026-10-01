@@ -37,6 +37,24 @@ class WorkspaceCollector(BaseCollector):
         objs.extend(self._repos())
         return objs
 
+    def enrich(self, objects: list[dict]) -> list[dict]:
+        """B6 Scope 1: fetch workspace-content ACLs in a bounded PARALLEL pass (the ~852K-call
+        hotspot). Each worker fills its own record in place, so completion order is irrelevant and
+        the bundle is identical to the serial run; `parallel_threads=1` IS the serial run. Repo ACLs
+        are already set inline in `_repos()` (far fewer), so they are left as-is."""
+        content = [o for o in objects if isinstance(o, dict) and o.get("acl") is None
+                   and safe_str(o.get("object_type")) in ("NOTEBOOK", "DIRECTORY", "FILE")]
+        if not content:
+            return objects
+
+        def _fill(rec: dict) -> dict:
+            rec["acl"] = self._object_acl(safe_str(rec.get("object_type")),
+                                          rec.get("object_id"), safe_str(rec.get("path")))
+            return rec
+
+        self.map_parallel(content, _fill)
+        return objects
+
     def _budget_left(self) -> bool:
         return self._max_calls == 0 or self._api_calls < self._max_calls
 
@@ -109,7 +127,10 @@ class WorkspaceCollector(BaseCollector):
                 "is_user_root": self._is_user_root(p),
                 "deployed_by_dab": dab["deployed_by_dab"],
                 "dab_scope": dab["dab_scope"],
-                "acl": self._object_acl(otype, obj.get("object_id")),
+                # B6 Scope 1: the ACL is fetched in a PARALLEL enrich pass (below), not inline — the
+                # per-object permissions GET is the ~852K-call / ~11h customer-scale hotspot. Left
+                # None here and filled in `enrich()`.
+                "acl": None,
             }
             # Remember bundle STATE files (`<root>/state/resources.json` or the legacy
             # `terraform.tfstate`). They map each bundle-owned resource to the concrete workspace
@@ -128,12 +149,21 @@ class WorkspaceCollector(BaseCollector):
             if otype == "DIRECTORY":
                 self._walk(p, out)
 
-    def _object_acl(self, otype: str, object_id) -> list | None:
+    def _object_acl(self, otype: str, object_id, path: str = "") -> list | None:
         # /Shared ACL is immutable on target (handled at import); still inventory others.
         # FILE objects DO have permissions (/api/2.0/permissions/files/{id}) — verified live.
         perm_type = {"NOTEBOOK": "notebooks", "DIRECTORY": "directories",
                      "FILE": "files"}.get(otype)
         if not perm_type:
+            return None
+        # B10: don't fetch the ACL of a platform-internal path (`.db_internal`/`.ide`/`.databricks`)
+        # — nobody has Manage on it, so its grant can never be applied on target (a permanent 403
+        # that `failed_only` would retry forever). Not collecting it keeps acls.json clean AND trims
+        # the ACL-enrichment volume (ties the PLAN 12 / B6 ACL-enrich cost). The import side also
+        # skips it belt-and-suspenders, so an older bundle still heals.
+        from src.importers.workspace_importer import _INTERNAL_SEGMENTS
+        p = safe_str(path).rstrip("/") + "/"
+        if any((seg + "/") in p for seg in _INTERNAL_SEGMENTS):
             return None
         return self.fetch_acl(perm_type, object_id)
 

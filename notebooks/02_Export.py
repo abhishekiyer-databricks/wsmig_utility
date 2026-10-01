@@ -18,28 +18,36 @@
 
 # COMMAND ----------
 
-dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"], "Connectivity mode")
-dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("staging_location", "", "Staging location (/Volumes/...)")
+# B12: a numeric "<N><letter>. " prefix is prepended to each widget's ORIGINAL display name so
+# Databricks groups them in the bar (1=Source, 2=Output, 3=Bundle scope, 5=Run). Prefix only —
+# the display text and the widget names/defaults are unchanged.
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
+                         "1a. Connectivity mode")
+dbutils.widgets.text("source_workspace_id", "", "1b. Source workspace id")
 # direct-mode source connection. The secret is EITHER a scope pointer (preferred — a widget value is
 # visible on the run page and kept in run history) OR spn_secret_value; scope+key wins when both set.
-dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
-dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
-dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope for the SP secret")
-dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
-dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no scope/key; redacted)")
-dbutils.widgets.text("run_id", "", "Run id (blank = use LATEST_INVENTORY / resume incomplete)")
-dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
-dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
-dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
-dbutils.widgets.text("content_fetch_workers", "8", "Parallel content-fetch workers")
+dbutils.widgets.text("source_workspace_url", "", "1c. [direct] Source workspace URL")
+dbutils.widgets.text("source_sp_client_id", "", "1d. [direct] Source SP applicationId (not a secret)")
+dbutils.widgets.text("source_sp_secret_scope", "", "1e. [direct] Secret scope for the SP secret")
+dbutils.widgets.text("source_sp_secret_key", "", "1f. [direct] Secret key within that scope")
+dbutils.widgets.text("spn_secret_value", "", "1g. [direct] SP secret (only if no scope/key; redacted)")
+dbutils.widgets.text("staging_location", "", "2a. Staging location (/Volumes/...)")
+dbutils.widgets.text("max_scim", "0", "3a. Max SCIM per type (0 = all)")
+dbutils.widgets.text("max_workspace_items", "0", "3b. Max workspace items (0 = all)")
+dbutils.widgets.text("max_ws_api_calls", "0", "3c. Max workspace/list calls (0 = unlimited)")
+dbutils.widgets.text("content_fetch_workers", "8", "3d. Parallel content-fetch workers")
 dbutils.widgets.dropdown("force_full_export", "false", ["true", "false"],
-                         "Ignore checkpoint/resume — re-export everything")
+                         "3e. Ignore checkpoint/resume — re-export everything")
 # Per-asset toggles (all default true; set false to skip a family — still recorded as 'skip').
 # These are BUNDLE scope and belong on the source side; import narrows with `import_assets` instead.
 for _t in ["identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
            "dashboards", "genie", "serving", "misc"]:
-    dbutils.widgets.dropdown(f"migrate_{_t}", "true", ["true", "false"], f"Migrate {_t}")
+    dbutils.widgets.dropdown(f"migrate_{_t}", "true", ["true", "false"],
+                             f"3z. Migrate {_t}")
+dbutils.widgets.text("run_id", "", "5a. Run id (blank = use LATEST_INVENTORY / resume incomplete)")
+dbutils.widgets.text("log_level", "DEBUG", "5b. Log level (DEBUG shows every step)")      # B5
+dbutils.widgets.text("parallel_threads", "1",
+                     "5c. Parallel enrichment threads (1 = serial)")                      # B6
 
 # COMMAND ----------
 
@@ -131,6 +139,8 @@ print(f"Bundle           : {cfg.output_path}")
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
 _logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_EXPORT_LOG))
+# B5: structured per-step logging live in THIS cell (run_id + stage on every line, DEBUG default).
+_logger.configure_logging(run_id=cfg.run_id, stage="EXPORT", level=cfg.log_level, capture=False)
 
 _workers = int((dbutils.widgets.get("content_fetch_workers") or "8") or 8)
 result = ExportRunner(client, cfg, aw, dbutils=dbutils,

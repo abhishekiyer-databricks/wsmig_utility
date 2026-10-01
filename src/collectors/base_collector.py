@@ -30,6 +30,23 @@ class BaseCollector(ABC):
         self._objects: list[dict] = []
         self._elapsed: float = 0.0
         self._errors: list[str] = []
+        # B6 Scope 1: bounded thread-pool size for per-object enrichment (esp. the ~852K-call ACL
+        # fetch at customer scale — the ~11h hotspot). 1 = today's exact serial behaviour (the safe
+        # default / kill-switch). The per-call 429/5xx backoff is inherited unchanged.
+        self.parallel_threads = max(1, int(getattr(config, "parallel_threads", 1) or 1))
+
+    def map_parallel(self, items, fn) -> None:
+        """Run `fn(item)` over `items` on the bounded pool (B6 Scope 1), fail-soft per item.
+
+        `fn` MUST mutate the item in place (or a shared, lock-guarded structure) — results are
+        discarded here, so order never matters and the bundle stays identical regardless of
+        completion order. A per-item failure is logged (never raised). `parallel_threads=1` runs
+        serially (byte-identical to the old loop)."""
+        from src.exporters.parallel import parallel_map
+        for item, _result, error in parallel_map(items, fn, self.parallel_threads):
+            if error is not None:
+                self.log.warning("parallel enrichment failed", object_type=self.object_type,
+                                 error=str(error)[:200])
 
     # ── abstract interface ────────────────────────────────────────────────
     @abstractmethod

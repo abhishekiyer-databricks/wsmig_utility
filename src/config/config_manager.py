@@ -206,6 +206,12 @@ class Config:
     max_scim: int = 0
     max_workspace_items: int = 0
     max_ws_api_calls: int = 0
+    # B5: the structured-logging floor (DEBUG default, matching the UC utility — a run shows every
+    # per-object line + the API call at DEBUG with no opt-in). B6: the bounded thread-pool size for
+    # inventory/export enrichment + super-safe import sub-level parallelism; 1 = today's exact
+    # serial behaviour (the safe fallback / kill-switch).
+    log_level: str = "DEBUG"
+    parallel_threads: int = 1
     # PLAN 11 Finding-12: DAB bundle-root indicators for PATH-based DAB detection. Each entry is
     # either a folder-name glob (e.g. `.bundle`, `*.bundle`) or an absolute directory prefix (e.g.
     # `/Users/dab-deployer@corp.com`). Default `.bundle` = the CLI standard, byte-identical to the
@@ -213,6 +219,12 @@ class Config:
     # `deployed_by_dab` flag but also carries this for any residual path re-derivation. Jobs/DLT
     # pipelines are UNAFFECTED (they use `deployment.kind`, the reliable field signal).
     dab_bundle_roots: list = field(default_factory=lambda: [".bundle"])
+    # B13: catalog rename on target. Flat map {source_catalog_name: target_catalog_name}; blank =
+    # identity (byte-identical to today, no remap). Applied to EXACTLY three asset types on import —
+    # AI/BI dashboards (serialized_dashboard dataset queries), Genie spaces (serialized_space), and
+    # DLT pipelines (the structured `catalog` field). All other catalog-bearing assets are OUT OF
+    # SCOPE (documented). Recorded in config_resolved.json.
+    catalog_mapping: dict = field(default_factory=dict)
 
     # ── mode helpers ──────────────────────────────────────────────────────
     @property
@@ -305,7 +317,8 @@ class Config:
         caller is expected to populate `cfg.ctx` afterwards (notebooks do this via
         auth.build_client). Widget parsing itself needs no workspace calls.
         """
-        from src.utils.helpers import now_compact, parse_bool, parse_csv, parse_kv_list
+        from src.utils.helpers import (now_compact, parse_bool, parse_catalog_mapping, parse_csv,
+                                        parse_kv_list)
 
         w = lambda n, d="": cls._widget(dbutils, n, d)  # noqa: E731
 
@@ -390,6 +403,9 @@ class Config:
             max_ws_api_calls=int(w("max_ws_api_calls", "0") or 0),
             # Finding-12: CSV of bundle-root matchers; alias-accepts a single value. Default .bundle.
             dab_bundle_roots=parse_csv(w("dab_bundle_roots", ".bundle")) or [".bundle"],
+            log_level=(w("log_level", "DEBUG") or "DEBUG").strip().upper(),
+            parallel_threads=max(1, int(w("parallel_threads", "1") or 1)),
+            catalog_mapping=parse_catalog_mapping(w("catalog_mapping_json")),
         )
         cfg.ctx.account_id = w("account_id")
 
@@ -477,6 +493,9 @@ class Config:
             max_workspace_items=d.get("max_workspace_items", 0),
             max_ws_api_calls=d.get("max_ws_api_calls", 0),
             dab_bundle_roots=d.get("dab_bundle_roots", [".bundle"]),
+            log_level=d.get("log_level", "DEBUG"),
+            parallel_threads=d.get("parallel_threads", 1),
+            catalog_mapping=d.get("catalog_mapping", {}) or {},
         )
         cfg.ctx = WorkspaceContext(**d.get("ctx", {}))
         return cfg

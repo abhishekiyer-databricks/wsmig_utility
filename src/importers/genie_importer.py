@@ -15,7 +15,7 @@ unusable until they do, which is why the note says so explicitly.
 from __future__ import annotations
 
 from src.importers.base_importer import BaseImporter
-from src.utils.helpers import safe_str
+from src.utils.helpers import remap_catalog_refs, safe_str
 
 
 class GenieImporter(BaseImporter):
@@ -74,9 +74,13 @@ class GenieImporter(BaseImporter):
         if payload.get("description"):
             body["description"] = payload["description"]
         # Verbatim: the API round-trips exactly what it emitted, and rewriting it risks corrupting a
-        # schema we don't own.
-        if payload.get("serialized_space") is not None:
-            body["serialized_space"] = payload["serialized_space"]
+        # schema we don't own — EXCEPT the B13 catalog rename, a token-boundary-safe rewrite of
+        # catalog refs in the serialized space's table FQNs (blank mapping → unchanged).
+        serialized = payload.get("serialized_space")
+        if serialized is not None:
+            mapping = getattr(self.config, "catalog_mapping", None) or {}
+            body["serialized_space"] = remap_catalog_refs(serialized, mapping) if mapping \
+                else serialized
 
         notes = []
         src_wh = safe_str(payload.get("warehouse_id"))

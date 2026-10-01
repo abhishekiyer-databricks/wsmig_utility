@@ -131,6 +131,21 @@ class ImportRunner:
                          "partial migration")
             return {"ok": True, "skipped": True, "missing": [], "mismatched": []}
         verify = self.aw.verify_manifest()
+        if not verify["ok"] and verify.get("manifest") is None:
+            # B9: no manifest.json AT ALL → the export for this run_id never completed (manifest is
+            # written as export's LAST step). Don't emit a bare "missing manifest.json" — point the
+            # operator straight at the last COMPLETED export via LATEST_EXPORT.json.
+            from src.exporters.bundle_state import read_latest_export_pointer
+            pointer = read_latest_export_pointer(self.config) or {}
+            latest = safe_str(pointer.get("run_id"))
+            raise BundleVerificationError(
+                f"bundle `{self.config.run_id}` has no manifest — its export did not complete, so "
+                f"there is nothing to import from this run directory (manifest.json is written as "
+                f"export's LAST step, so its absence means the export was interrupted).\n"
+                + (f"Use the last COMPLETED export run_id `{latest}` (named in LATEST_EXPORT.json), "
+                   f"or re-run 02_Export." if latest else
+                   "Run 02_Export to produce a complete bundle (no LATEST_EXPORT.json pointer was "
+                   "found yet), or pass an explicit run_id for a completed export."))
         if not verify["ok"]:
             raise BundleVerificationError(
                 "The bundle failed its manifest check, so import will NOT start — a partial upload "
@@ -221,8 +236,17 @@ class ImportRunner:
             self._record_not_selected(units_by_type, selected)
 
             # ── phases ────────────────────────────────────────────────────
-            for family in ordered(selected):
+            # B8: the home-content re-sweep runs just BEFORE the ACL phase (max lazy-provisioning
+            # time, still before ACLs so healed content gets its permissions). If `acls` isn't
+            # selected this run, the re-sweep runs after the last phase so deferred homes still get a
+            # final outcome.
+            families = list(ordered(selected))
+            for family in families:
+                if family == "acls":
+                    self._resweep_home_content(units_by_type)
                 self._run_phase(family, units_by_type)
+            if "acls" not in families:
+                self._resweep_home_content(units_by_type)
 
             # ── deleted-in-source detection (report only, D5) ─────────────
             self._report_deleted_in_source(units_by_type, selected)
@@ -240,11 +264,46 @@ class ImportRunner:
             if self.state is not None:
                 self.state.flush()
             summary.update(self._summarize(t0))
+            aborting = (self.run_status == "aborted")
             try:
                 self._write_reports(summary)
-            except Exception as exc:  # noqa: BLE001 — reporting must not mask the real error
-                _LOG.warning("report writing failed", error=str(exc))
+                # B11: don't trust "write didn't raise" — confirm the xlsx actually landed +
+                # is non-empty (a FUSE/Volume flush stall can lose it silently). Raises if not.
+                self._verify_report_written(summary)
+            except Exception as exc:  # noqa: BLE001
+                if aborting:
+                    # Already failing for another reason — keep THAT the primary error (it is
+                    # re-raised below), but still log the report failure loudly (not a WARNING).
+                    _LOG.error("report writing ALSO failed on an already-aborting run",
+                               exc_info=True, error=str(exc))
+                else:
+                    # B11: a CLEAN run whose report did not write must NOT present as success. The
+                    # report is the source of truth (ties B4) — mark the run not-cleanly-complete,
+                    # log at ERROR with the traceback, and carry the reason so the notebook surfaces
+                    # it. (Only the OLD code swallowed this as a WARNING and returned success.)
+                    self.run_status = "completed_no_report"
+                    summary["run_status"] = "completed_no_report"
+                    summary["report_write_error"] = str(exc)
+                    _LOG.error("import ran but its report (import_status.xlsx) was NOT written",
+                               exc_info=True, error=str(exc))
         return summary
+
+    def _verify_report_written(self, summary: dict) -> None:
+        """B11: confirm the import xlsx was actually written and is non-empty.
+
+        `write_import_reports` returning without raising is NOT proof the file landed on a UC Volume
+        (FUSE flush can stall under restricted networking — PLAN 12 Finding-6). Re-check the path it
+        reported; raise if missing/empty so the clean-run path above flips to `completed_no_report`.
+        """
+        import os
+        rel = (summary.get("reports") or {}).get("xlsx")
+        if not rel:
+            raise RuntimeError("no import status xlsx path was recorded by the report writer")
+        path = os.path.join(self.aw.root, rel)
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            raise RuntimeError(
+                f"the import status report {rel} is missing or empty at {path} after writing — "
+                f"the write did not durably land (check the staging/Volume write path).")
 
     # ── bundle reading ────────────────────────────────────────────────────
     def _units_from_bundle(self) -> dict:
@@ -347,6 +406,11 @@ class ImportRunner:
         importer.units_by_type = units_by_type
         importer.retry_keys = (self.state.retry_keys(self.config.imports.retry_mode)
                                if self.state is not None else None)
+        if family == "workspace":
+            # B8: don't re-sweep home content at the end of the workspace phase; the runner re-sweeps
+            # it just before ACLs (maximises lazy-provisioning time). The importer only publishes its
+            # parked units to the shared context.
+            importer._resweep_at_phase_end = False
         try:
             self.results.append(importer.run())
         finally:
@@ -355,6 +419,39 @@ class ImportRunner:
             importer.flush_checkpoint()
             if self.state is not None:
                 self.state.flush()
+
+    def _resweep_home_content(self, units_by_type: dict) -> None:
+        """B8: heal deferred home-content (notebooks/files/dirs under a `/Users/<owner>` home that
+        wasn't provisioned yet during the workspace phase) just BEFORE the ACL phase — the latest
+        safe point, so lazy provisioning had the whole pipeline's elapsed time, while the content is
+        still created before ACLs so its permissions apply this run. A home still absent → a clean
+        `prerequisite_missing` that `retry_mode=failed_only` heals later. Runs at most once per run.
+        """
+        deferred = list(self.context.get("deferred_home_units") or [])
+        if not deferred:
+            return
+        self.context["deferred_home_units"] = []   # consumed — never re-swept twice
+        from src.importers.workspace_importer import WorkspaceImporter
+        identity_map = (self.state.load_identity_map() if self.state is not None
+                        else {"sp_mapping": {}, "group_map": {}, "user_map": {}, "scim_ids": {}})
+        by_type: dict = {}
+        for u in deferred:
+            by_type.setdefault(safe_str(u.get("asset_type")), []).append(u)
+        imp = WorkspaceImporter(self.client, self.config, self.aw, state=self.state,
+                                identity_map=identity_map, dbutils=self.dbutils,
+                                context=self.context, units_by_type=by_type)
+        imp.retry_keys = (self.state.retry_keys(self.config.imports.retry_mode)
+                          if self.state is not None else None)
+        imp._deferred_units = deferred
+        _LOG.info("home re-sweep (pre-ACL): re-checking deferred home content against a fresh "
+                  "get-status", deferred=len(deferred))
+        try:
+            imp._resweep_deferred_homes()
+        finally:
+            imp.flush_checkpoint()
+            if self.state is not None:
+                self.state.flush()
+        self.results.append(imp.result)
 
     def _record_not_selected(self, units_by_type: dict, selected: list) -> None:
         """Record deferred families as `not_selected` — deferred work must be visible, not absent.

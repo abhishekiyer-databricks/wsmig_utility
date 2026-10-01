@@ -101,8 +101,10 @@ class SqlCollector(BaseCollector):
         return items
 
     def _enrich_query_parent_path(self, raw: dict, oid: str) -> None:
-        """Best-effort: merge `parent_path` from GET-by-id into the (shallower) LIST object. The
-        query still exports if this fails — it just lands at the root on import (Bug 7)."""
+        """Best-effort: merge `parent_path` AND `owner_user_name` from GET-by-id into the (shallower)
+        LIST object. parent_path lets the query land in its SOURCE folder (Bug 7); owner_user_name is
+        the source owner B2 re-applies after create (it is stripped from the create payload, so it is
+        carried as a top-level unit field instead). The query still exports if this fails."""
         if not oid:
             return
         try:
@@ -112,6 +114,8 @@ class SqlCollector(BaseCollector):
             return
         if full.get("parent_path") is not None:
             raw["parent_path"] = full.get("parent_path")
+        if full.get("owner_user_name") is not None:
+            raw["owner_user_name"] = full.get("owner_user_name")
 
     def _alerts_v2(self) -> list[dict]:
         """Alerts V2 (/api/2.0/alerts) — the current alert surface (legacy-alert creation

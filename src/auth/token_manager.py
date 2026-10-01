@@ -459,6 +459,10 @@ def build_clients(config, dbutils=None, spark=None) -> tuple[ApiClient, ApiClien
         return local, local
 
     secret = config.resolve_source_secret(dbutils)   # never logged, never stored
+    # B5: register the M2M secret so the structured logger scrubs it from EVERY line, regardless of
+    # which code path logs (defence in depth beyond "never pass it to a log call").
+    from src.utils.logger import register_secret
+    register_secret(secret)
     provider = oauth_m2m_token_provider(config.source.workspace_url, config.source.client_id,
                                         secret)
     source_client = ApiClient(config.source.workspace_url, provider)

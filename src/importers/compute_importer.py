@@ -111,8 +111,7 @@ class ComputeImporter(BaseImporter):
             return {"target_id": target_id}
         if asset_type == "cluster_policy":
             body = {"policy_id": target_id, "name": safe_str(payload.get("name"))}
-            if payload.get("definition") is not None:
-                body["definition"] = payload["definition"]
+            self._put_policy_shape(body, payload)   # B3: family_id+overrides XOR definition (edit too)
             warns = self._remap_policy_body_ids(body)   # Bug 9: remap pinned pool ids on update too
             self.client.post("api/2.0/policies/clusters/edit", body)
             return {"target_id": target_id, "warning": "; ".join(warns) if warns else ""}
@@ -138,8 +137,8 @@ class ComputeImporter(BaseImporter):
         """Send only what create accepts (a policy-FAMILY policy is a different shape)."""
         payload = dict(unit.get("payload") or {})
         body = {"name": safe_str(payload.get("name")) or self.natural_key(unit)}
-        for field in ("definition", "description", "libraries", "max_clusters_per_user",
-                      "policy_family_id", "policy_family_definition_overrides"):
+        self._put_policy_shape(body, payload)   # B3: family_id+overrides XOR definition
+        for field in ("description", "libraries", "max_clusters_per_user"):
             if payload.get(field) is not None:
                 body[field] = payload[field]
         warns = self._remap_policy_body_ids(body)
@@ -147,6 +146,27 @@ class ComputeImporter(BaseImporter):
         policy_id = safe_str(created.get("policy_id"))
         self.context.setdefault("cluster_policy_target_ids", {})[self.natural_key(unit)] = policy_id
         return {"target_id": policy_id, "warning": "; ".join(warns) if warns else ""}
+
+    @staticmethod
+    def _put_policy_shape(body: dict, payload: dict) -> None:
+        """B3: a cluster policy has TWO mutually-exclusive shapes, and the create/edit endpoints
+        REJECT sending both with 400 `policy_family_id and definition cannot be used together`.
+
+        A policy built on a POLICY FAMILY (e.g. "Job Compute") is returned by GET/list carrying BOTH
+        `policy_family_id` (+ `policy_family_definition_overrides`) AND a fully RESOLVED `definition`
+        (the family merged with the overrides) — so copying every present field blindly 400s. Branch:
+          • `policy_family_id` present → send family_id (+ overrides); DROP the resolved `definition`.
+          • else (custom policy) → send `definition`.
+        (Verified live source_ws 2026-10-01: family create with family_id+overrides and NO definition
+        succeeds; family_id + definition together → 400.)"""
+        if payload.get("policy_family_id"):
+            body["policy_family_id"] = payload["policy_family_id"]
+            if payload.get("policy_family_definition_overrides") is not None:
+                body["policy_family_definition_overrides"] = \
+                    payload["policy_family_definition_overrides"]
+            body.pop("definition", None)   # never send the resolved definition alongside the family
+        elif payload.get("definition") is not None:
+            body["definition"] = payload["definition"]
 
     def _remap_policy_body_ids(self, body: dict) -> list[str]:
         """Remap SOURCE object ids pinned inside the policy `definition`/overrides (Bug 9).

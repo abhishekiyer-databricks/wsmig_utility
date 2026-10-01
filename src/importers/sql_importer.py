@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.importers.base_importer import BaseImporter, HardRemapFailure, UnsupportedOperation
+from src.importers.base_importer import (BaseImporter, HardRemapFailure, UnsupportedOperation,
+                                         verify_applied)
 from src.utils.helpers import safe_str
 
 # The v1 alert `op` vocabulary. The modern `condition.op` uses words; v1 wants symbols.
@@ -117,7 +118,9 @@ class SqlImporter(BaseImporter):
             body, _res = self._query_body(payload)
             self.client.patch(f"api/2.0/sql/queries/{target_id}",
                               {"query": body, "update_mask": ",".join(sorted(body.keys()))})
-            return {"target_id": target_id}
+            # B2: keep the owner in sync on an update too (read-back verified; orphaned → run-as SP).
+            owner_note, owner_warn = self._set_query_owner(unit, target_id)
+            return {"target_id": target_id, "note": owner_note, "warning": owner_warn}
         if asset_type == "legacy_alert":
             self.client.put(f"api/2.0/sql/alerts/{target_id}", self._legacy_alert_body(payload))
             return {"target_id": target_id}
@@ -164,7 +167,42 @@ class SqlImporter(BaseImporter):
         # created_with_warning (parity with notebooks), never a hard prerequisite_missing failure.
         if res.kind == "backup":
             return {"target_id": qid, "warning": res.note}
-        return {"target_id": qid, "note": f"created in {parent}" if parent else ""}
+        # B2: re-apply the source OWNER (read-only at create, so a verified follow-up PATCH).
+        owner_note, owner_warn = self._set_query_owner(unit, qid)
+        note = f"created in {parent}" if parent else ""
+        note = f"{note}. {owner_note}".strip(". ") if (note and owner_note) else (note or owner_note)
+        return {"target_id": qid, "note": note, "warning": owner_warn}
+
+    def _set_query_owner(self, unit: dict, qid: str) -> tuple[str, str]:
+        """B2: transfer a legacy query's OWNER to the remapped source owner, READ-BACK verified.
+
+        `owner_user_name` is read-only at CREATE (the target attributes the query to the run-as SP),
+        so the only way to set the source owner is a follow-up PATCH via the Queries update API, then
+        a GET to confirm it took (B4 report-truth: never claim 'owner set' from a bare 200).
+
+        Orphaned / left-the-org owner (absent from the target roster): the PATCH is rejected or the
+        read-back won't match → the query is LEFT owned by the run-as SP (the creator default) with a
+        WARNING, never a hard failure and never a non-existent principal (B2 orphaned-owner rule).
+        Returns `(note, warning)`; a non-empty warning makes the row `created_with_warning`."""
+        source_owner = safe_str(unit.get("source_owner"))
+        if not source_owner:
+            return "", ""   # no owner on source → run-as SP (creator) by default; nothing to do
+        target_owner = self.resolve_principal(source_owner, "user")
+        try:
+            self.client.patch(f"api/2.0/sql/queries/{qid}",
+                              {"query": {"owner_user_name": target_owner},
+                               "update_mask": "owner_user_name"})
+        except Exception as exc:  # noqa: BLE001 — orphaned owner / not on target → keep run-as SP
+            return "", (f"owner `{target_owner}` could not be set (likely not present on target / "
+                        f"left the org) — the query is left owned by the migration run-as SP: "
+                        f"{str(exc)[:120]}")
+        ok, observed = verify_applied(
+            lambda: safe_str((self.client.get(f"api/2.0/sql/queries/{qid}") or {})
+                             .get("owner_user_name")), target_owner)
+        if ok:
+            return f"owner set to {target_owner} (verified)", ""
+        return "", (f"owner `{target_owner}` did not apply (read-back shows `{observed}`) — the "
+                    f"query is left owned by the migration run-as SP")
 
     def _query_body(self, payload: dict):
         body = dict(payload)

@@ -49,6 +49,15 @@ from src.utils.helpers import safe_str
 # is rejected on write. Omitting it PRESERVES parity rather than breaking it.
 _BUILTIN_ADMINS = "admins"
 
+
+def _is_platform_internal(object_key: str) -> bool:
+    """B10: whether a workspace path is a Databricks platform-internal dir (`.db_internal`/`.ide`/
+    `.databricks`) whose ACL cannot be changed by anyone. Reuses the workspace importer's
+    segment-based matcher so collection and import agree."""
+    from src.importers.workspace_importer import _INTERNAL_SEGMENTS
+    p = safe_str(object_key).rstrip("/") + "/"
+    return any((seg + "/") in p for seg in _INTERNAL_SEGMENTS)
+
 # Objects whose ACL the API refuses to change.
 _IMMUTABLE_PATHS = ("/Shared",)
 
@@ -176,6 +185,19 @@ class AclImporter(BaseImporter):
                 f"`{object_key}` is a workspace root whose ACL the API refuses to change, so it was "
                 f"not attempted. Its access is fixed by the platform on BOTH sides, so this is not a "
                 f"parity gap.", category=CAT_NOT_SUPPORTED)
+
+        # B10: a platform-internal workspace path (`.db_internal`, `.ide`, `.databricks`) is managed
+        # by Databricks — NOBODY, not even a workspace admin, has Manage on it, so a `PUT permissions`
+        # returns a permanent 403 that `retry_mode=failed_only` would re-attempt forever, polluting
+        # the success signal. The workspace importer already SKIPS creating these; skip their ACL the
+        # same way (like `/Shared`) so they never show as a failure. Per-user, so it can't be a fixed
+        # literal — matched by the shared segment-based `is_skippable_path`.
+        if perm_type in ("directories", "notebooks", "files") and _is_platform_internal(object_key):
+            raise SkippedNoObject(
+                f"`{object_key}` is a platform-internal path (.db_internal/.ide/.databricks) managed "
+                f"by Databricks — no principal (not even a workspace admin) has Manage on it, so its "
+                f"ACL is fixed by the platform on BOTH sides and was not attempted. Not a parity gap.",
+                category=CAT_NOT_SUPPORTED)
 
         target_id = self._resolve_target_object(perm_type, object_asset_type, object_key)
         if not target_id:

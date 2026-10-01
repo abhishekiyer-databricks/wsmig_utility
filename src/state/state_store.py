@@ -116,6 +116,10 @@ CAT_API_ERROR = "api_error"
 CAT_DEPENDENCY_UNRESOLVED = "dependency_unresolved"
 CAT_PERMISSION_DENIED = "permission_denied"
 CAT_NOT_SUPPORTED = "not_supported"
+# B4: a mutating call returned HTTP 200 but a read-back showed the intended state was NOT applied
+# (silently dropped — workspace/account-policy dependent). FAILED, but distinct from an api_error so
+# "sent but not verified applied" is queryable; the fingerprint is not advanced so a re-run retries.
+CAT_NOT_APPLIED = "not_applied"
 # The seven `skipped_no_object` sub-cases for ACL rows (§6b-i) — WHY a grant had no object.
 CAT_DAB_REDEPLOY = "dab_redeploy"
 CAT_REPO_OUT_OF_SCOPE = "repo_out_of_scope"

@@ -157,12 +157,18 @@ def _render(name, **over):
 def test_render_substitutes_tokens_and_leaves_no_placeholders():
     spec = _render("direct_end_to_end_dry_run")
     blob = json.dumps(spec)
-    assert "{{" not in blob, "a placeholder survived rendering"
+    # No INSTALLER placeholder ({{UPPER_SNAKE}}) may survive — those must all be filled. The one
+    # intentional survivor is `{{job.run_id}}`, a Databricks DYNAMIC reference the PLATFORM
+    # substitutes at launch so the bundle dir name = the Jobs-UI run id (B9) — not an installer bug.
+    import re
+    assert not re.search(r"\{\{[A-Z0-9_]+\}\}", blob), "an installer placeholder survived rendering"
     assert spec["run_as"]["service_principal_name"] == "sp-app-id"
     for task in spec["tasks"]:
         assert task["notebook_task"]["notebook_path"].startswith("/Repos/me/wsmig/notebooks/")
         # the direct templates leave connectivity_mode BLANK so the installer's config fills it
         assert task["notebook_task"]["base_parameters"]["connectivity_mode"] == "direct"
+        # B9: run_id is pinned to the job-run-id dynamic reference, left intact by the installer
+        assert task["notebook_task"]["base_parameters"]["run_id"] == "{{job.run_id}}"
 
 
 def test_params_are_projected_only_onto_declared_keys():

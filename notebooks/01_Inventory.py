@@ -19,21 +19,28 @@
 
 # COMMAND ----------
 
-dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"], "Connectivity mode")
-dbutils.widgets.text("source_workspace_id", "", "Source workspace id")
-dbutils.widgets.text("staging_location", "", "Staging location (/Volumes/...)")
+# B12: a numeric "<N><letter>. " prefix is prepended to each widget's ORIGINAL display name so
+# Databricks groups them in the bar (1=Source, 2=Output, 3=Bundle scope, 5=Run). Prefix only —
+# the display text and the widget names/defaults are unchanged.
+dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
+                         "1a. Connectivity mode")
+dbutils.widgets.text("source_workspace_id", "", "1b. Source workspace id")
 # direct-mode source connection. Secret = scope+key (preferred) OR spn_secret_value; scope wins.
-dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
-dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
-dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope for the SP secret")
-dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
-dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no scope/key; redacted)")
-dbutils.widgets.text("run_id", "", "Run id (blank = auto YYYYMMDD_HHMMSS)")
-dbutils.widgets.text("max_scim", "0", "Max SCIM per type (0 = all)")
-dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)")
-dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
+dbutils.widgets.text("source_workspace_url", "", "1c. [direct] Source workspace URL")
+dbutils.widgets.text("source_sp_client_id", "", "1d. [direct] Source SP applicationId (not a secret)")
+dbutils.widgets.text("source_sp_secret_scope", "", "1e. [direct] Secret scope for the SP secret")
+dbutils.widgets.text("source_sp_secret_key", "", "1f. [direct] Secret key within that scope")
+dbutils.widgets.text("spn_secret_value", "", "1g. [direct] SP secret (only if no scope/key; redacted)")
+dbutils.widgets.text("staging_location", "", "2a. Staging location (/Volumes/...)")
+dbutils.widgets.text("max_scim", "0", "3a. Max SCIM per type (0 = all)")
+dbutils.widgets.text("max_workspace_items", "0", "3b. Max workspace items (0 = all)")
+dbutils.widgets.text("max_ws_api_calls", "0", "3c. Max workspace/list calls (0 = unlimited)")
 dbutils.widgets.dropdown("force_full", "false", ["true", "false"],
-                         "Force a fresh snapshot (ignore an incomplete bundle to resume)")
+                         "3e. Force a fresh snapshot (ignore an incomplete bundle to resume)")
+dbutils.widgets.text("run_id", "", "5a. Run id (blank = auto YYYYMMDD_HHMMSS)")
+dbutils.widgets.text("log_level", "DEBUG", "5b. Log level (DEBUG shows every step)")      # B5
+dbutils.widgets.text("parallel_threads", "1",
+                     "5c. Parallel enrichment threads (1 = serial)")                      # B6
 
 # COMMAND ----------
 
@@ -142,6 +149,8 @@ aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
 # Inventory gets its OWN log file (under misc/, PLAN 7 §D) — it used to share
 # `execution_export.log` with 02_Export, so the two runs' records landed in one file.
 _logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_INVENTORY_LOG))
+# B5: structured per-step logging live in THIS cell (run_id + stage on every line, DEBUG default).
+_logger.configure_logging(run_id=cfg.run_id, stage="INVENTORY", level=cfg.log_level, capture=False)
 
 result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
 

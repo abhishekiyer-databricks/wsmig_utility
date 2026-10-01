@@ -127,6 +127,24 @@ def render_template(template: dict, *, tokens: dict, params: dict,
     return spec
 
 
+def run_as_for_job(job_name: str, connectivity_mode: str, target_run_as_sp: str,
+                   source_run_as_spn: str = "") -> dict:
+    """B1: the `run_as` SP for a deployed job.
+
+    The AIRGAP SOURCE job (`airgap_source` — 01_Inventory→02_Export run INSIDE the source workspace)
+    runs as a SOURCE workspace-admin SP when `source_run_as_spn` is given and the mode is `airgap`.
+    Every OTHER job (and `airgap_source` in `direct` mode) runs as the TARGET run-as SP — in `direct`
+    mode 01/02 run in the target and read the source over OAuth M2M, so the source SP widget is
+    ignored. (Prerequisite: whoever installs the job must hold `servicePrincipal.user` on the chosen
+    SP, or the Jobs API refuses to create the job — the error at install time is the signal.)"""
+    sp = target_run_as_sp
+    if (job_name == "airgap_source"
+            and str(connectivity_mode or "").strip().lower() == "airgap"
+            and source_run_as_spn):
+        sp = source_run_as_spn
+    return {"service_principal_name": sp}
+
+
 def find_job_id_by_name(client, name: str) -> str:
     """The job id of an existing job with this exact `name`, or "" if none. Paginates.
 

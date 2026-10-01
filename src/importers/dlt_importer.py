@@ -51,6 +51,14 @@ class DltImporter(BaseImporter):
         warnings: list[str] = []
         spec["name"] = safe_str(spec.get("name")) or self.natural_key(unit)
 
+        # B13: catalog rename on target — remap the structured `catalog` field (and the `target`
+        # schema is left as-is; only the catalog NAME is remapped). Blank mapping → unchanged.
+        mapping = getattr(self.config, "catalog_mapping", None) or {}
+        src_cat = safe_str(spec.get("catalog"))
+        if mapping and src_cat and mapping.get(src_cat):
+            spec["catalog"] = mapping[src_cat]
+            warnings.append(f"catalog remapped `{src_cat}` → `{mapping[src_cat]}` (catalog_mapping)")
+
         self._remap_libraries(spec, warnings)
         self._remap_clusters(spec, warnings)
         self._remap_run_as(spec, warnings)

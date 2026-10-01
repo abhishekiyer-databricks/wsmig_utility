@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import json
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing, SkippedNoObject
+from src.importers.base_importer import (BaseImporter, PrerequisiteMissing, SkippedNoObject,
+                                         VerificationFailed, verify_applied)
 from src.state.state_store import CAT_DEPENDENCY_UNRESOLVED
 from src.utils.helpers import safe_str
 
@@ -47,6 +48,11 @@ KNOWN_CONF_KEYS = frozenset({
 class MiscImporter(BaseImporter):
     component = "misc"
     asset_types = ("global_init_script", "cluster_library", "workspace_conf")
+    # B6 Scope 2: misc stays SERIAL even when parallel_threads>1 — the cluster-library force-start/
+    # stop batching (Bug 1) depends on a serial start→poll→install→stop sequence per cluster, and
+    # parallel installs on the SAME cluster would resurrect exactly the start/stop race that fix
+    # removed. misc is tiny, so serialising it costs nothing.
+    parallel_safe = False
 
     # Workspace conf is DECLARATIVE against a workspace that always exists, so an "adopt" must still
     # write the value — otherwise a conf key would never actually be applied.
@@ -306,7 +312,26 @@ class MiscImporter(BaseImporter):
                 f"Set it by hand if it is wanted: value on source was {value!r}.")
         # One key per call: a single rejected key must not take the others down with it.
         self.client.patch("api/2.0/workspace-conf", {key: safe_str(value)})
-        return {"target_id": key, "note": f"{key} set to {safe_str(value)!r}"}
+        # B4: READ-BACK VERIFY — a 200 is NOT proof the key took. Whether a key is silently dropped
+        # is workspace/account-policy dependent and unpredictable (enableWebTerminal drops on one ws,
+        # enableExportNotebook on another, both returning 200), so a static "route these via the
+        # Settings API" list cannot work — read-back is the only reliable mechanism. On a mismatch
+        # the unit is FAILED (observed vs intended) and the fingerprint is NOT advanced (base_importer
+        # stores "" for FAILED), so a re-run re-attempts the unapplied key instead of self-concealing.
+        ok, observed = verify_applied(lambda: self._read_conf_key(key), safe_str(value))
+        if not ok:
+            raise VerificationFailed(
+                f"workspace-conf `{key}` was PATCHed to {safe_str(value)!r} and the call returned "
+                f"HTTP 200, but a read-back shows the target value is {observed!r} — the platform "
+                f"did NOT honour it (this is workspace/account-policy dependent and returns 200 "
+                f"regardless). Set `{key}` via the Settings API or by hand on the target.")
+        return {"target_id": key,
+                "note": f"{key} set to {safe_str(value)!r} (verified by read-back)"}
+
+    def _read_conf_key(self, key: str):
+        """Read ONE workspace-conf key's live value on target (for B4 read-back)."""
+        conf = self.client.get("api/2.0/workspace-conf", params={"keys": key}) or {}
+        return conf.get(key) if isinstance(conf, dict) else None
 
 
 def _library_label(library) -> str:

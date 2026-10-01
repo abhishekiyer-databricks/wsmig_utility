@@ -27,59 +27,59 @@
 # COMMAND ----------
 
 dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
-                         "Connectivity mode")
-dbutils.widgets.text("source_workspace_id", "", "Source workspace id (identifies the bundle)")
-dbutils.widgets.text("staging_location", "", "Staging location (UC Volume /Volumes/...)")
-dbutils.widgets.text("run_id", "", "Run id (blank = resume, else LATEST_EXPORT.json)")
+                         "1a. Connectivity mode")
+dbutils.widgets.text("source_workspace_id", "", "1b. Source workspace id (identifies the bundle)")
+dbutils.widgets.text("staging_location", "", "2a. Staging location (UC Volume /Volumes/...)")
+dbutils.widgets.text("run_id", "", "5a. Run id (blank = resume, else LATEST_EXPORT.json)")
 
 # Dry run FIRST. Flip to false only once the rehearsal reads clean.
 dbutils.widgets.dropdown("dry_run", "true", ["true", "false"],
-                         "Dry run (true = decide everything, write nothing)")
+                         "4a. Dry run (true = decide everything, write nothing)")
 
 # The migration state table: ONE shared catalog+schema for every workspace pair, both assumed to
 # already exist. The tool owns the table NAMES. Required when dry_run=false.
-dbutils.widgets.text("state_catalog", "", "State catalog (shared, must exist)")
-dbutils.widgets.text("state_schema", "", "State schema (shared, must exist)")
+dbutils.widgets.text("state_catalog", "", "2b. State catalog (shared, must exist)")
+dbutils.widgets.text("state_schema", "", "2c. State schema (shared, must exist)")
 
 # This session's work list over what the bundle contains. `acls` is independently selectable
 # because ACL replay is the pass most likely to need a second attempt.
 dbutils.widgets.multiselect("import_assets", "all",
                             ["all", "identity", "compute", "workspace", "secrets", "jobs", "sql",
                              "dlt", "dashboards", "genie", "serving", "misc", "acls"],
-                            "Asset families to import THIS run")
+                            "4b. Asset families to import THIS run")
 
 # Narrow the run to outstanding units after fixing a prerequisite. One dropdown, not booleans, so an
 # invalid combination cannot be set.
 dbutils.widgets.dropdown("retry_mode", "off",
                          ["off", "failed_only", "skipped_only", "failed_and_skipped"],
-                         "Retry mode (narrows the work list only)")
+                         "4c. Retry mode (narrows the work list only)")
 
 dbutils.widgets.dropdown("preflight_enforce", "true", ["true", "false"],
-                         "Fail the run on a preflight NO-GO")
+                         "4d. Fail the run on a preflight NO-GO")
 dbutils.widgets.dropdown("force_full_import", "false", ["true", "false"],
-                         "Ignore the checkpoint and re-evaluate every unit")
+                         "4e. Ignore the checkpoint and re-evaluate every unit")
 dbutils.widgets.dropdown("allow_deletes", "false", ["true", "false"],
-                         "Allow deleting target objects removed from source (default: report only)")
+                         "4f. Allow deleting target objects removed from source (default: report only)")
 dbutils.widgets.dropdown("library_force_start_clusters", "false", ["true", "false"],
-                         "Start stopped clusters to install libraries (consumes DBUs)")
-dbutils.widgets.text("account_id", "", "Account id (optional; enables account-level checks)")
+                         "4g. Start stopped clusters to install libraries (consumes DBUs)")
+dbutils.widgets.text("account_id", "", "4h. Account id (optional; enables account-level checks)")
 
 # PLAN 9: an orphaned home is content under `/Users/<owner>` whose owner was DELETED in source (so
 # it is absent from the roster and never created on target). Rather than failing it as a
 # prerequisite, divert it to a top-level backup folder, preserving the sub-tree, so no bytes are
 # lost and an operator can reassign them. Flip to false to restore the prerequisite behaviour.
 dbutils.widgets.dropdown("workspace_home_backup", "true", ["true", "false"],
-                         "Back up orphaned (deleted-in-source) home content instead of failing it")
+                         "4i. Back up orphaned (deleted-in-source) home content instead of failing it")
 dbutils.widgets.text("workspace_home_backup_root", "/Users_Backup",
-                     "Top-level folder for orphaned home backups")
+                     "4j. Top-level folder for orphaned home backups")
 
 # `direct`-mode only — how to reach the SOURCE. The secret is EITHER a scope pointer (preferred:
 # a widget value is visible on the run page and kept in run history) OR spn_secret_value.
-dbutils.widgets.text("source_workspace_url", "", "[direct] Source workspace URL")
-dbutils.widgets.text("source_sp_client_id", "", "[direct] Source SP applicationId (not a secret)")
-dbutils.widgets.text("source_sp_secret_scope", "", "[direct] Secret scope holding the SP secret")
-dbutils.widgets.text("source_sp_secret_key", "", "[direct] Secret key within that scope")
-dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no scope/key; redacted)")
+dbutils.widgets.text("source_workspace_url", "", "1c. [direct] Source workspace URL")
+dbutils.widgets.text("source_sp_client_id", "", "1d. [direct] Source SP applicationId (not a secret)")
+dbutils.widgets.text("source_sp_secret_scope", "", "1e. [direct] Secret scope holding the SP secret")
+dbutils.widgets.text("source_sp_secret_key", "", "1f. [direct] Secret key within that scope")
+dbutils.widgets.text("spn_secret_value", "", "1g. [direct] SP secret (only if no scope/key; redacted)")
 
 # NOTE: no Azure Key Vault / AAD widgets. An AKV-backed secret scope cannot be created from this
 # environment — it needs an Azure AD token that a Databricks SPN credential / managed-identity-backed
@@ -89,9 +89,17 @@ dbutils.widgets.text("spn_secret_value", "", "[direct] SP secret (only if no sco
 # Transform options. NOTE: the per-asset `migrate_*` toggles are NOT on import — they are bundle
 # scope, set on the SOURCE side (01/02). Here `import_assets` is the work-list selector instead.
 dbutils.widgets.dropdown("pause_job_schedules", "true", ["true", "false"],
-                         "Pause imported job schedules AND continuous triggers")
-dbutils.widgets.text("user_domain_mapping", "", "old.com=new.com,...")
-dbutils.widgets.text("user_id_mapping", "", "old@a.com=new@b.com,...")
+                         "4k. Pause imported job schedules AND continuous triggers")
+dbutils.widgets.text("user_domain_mapping", "", "4l. old.com=new.com,...")
+dbutils.widgets.text("user_id_mapping", "", "4m. old@a.com=new@b.com,...")
+
+# B13: catalog rename on target. Flat JSON {"source_catalog":"target_catalog"}; blank = no remap
+# (identity). Applied to AI/BI dashboards, Genie spaces and DLT pipelines only. Lives in Output.
+dbutils.widgets.text("catalog_mapping_json", "",
+                     '2d. Catalog rename map {"src":"tgt"} (blank = none)')
+# B5 / B6 run controls.
+dbutils.widgets.text("log_level", "DEBUG", "5b. Log level (DEBUG shows every step)")
+dbutils.widgets.text("parallel_threads", "1", "5c. Parallel enrichment threads (1 = serial)")
 
 # COMMAND ----------
 
@@ -187,6 +195,8 @@ print(f"Home backup      : {'ON → ' + cfg.imports.workspace_home_backup_root i
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
 aw.ensure_output_path()
 _logger.set_log_file(os.path.join(aw.root, BP.EXECUTION_IMPORT_LOG))
+# B5: structured per-step logging live in THIS cell (run_id + stage on every line, DEBUG default).
+_logger.configure_logging(run_id=cfg.run_id, stage="IMPORT", level=cfg.log_level, capture=False)
 
 _index = aw.read_json(BP.EXPORT_INDEX_JSON) or {}
 _bundle_cfg = aw.read_json(BP.CONFIG_RESOLVED_JSON) or {}
@@ -251,6 +261,14 @@ result = runner.run()
 
 print(f"\n=== IMPORT {result['run_status'].upper()} "
       f"({'DRY RUN' if cfg.dry_run else 'LIVE'}) in {result['elapsed_sec']}s ===")
+
+# B11: a report-write failure is LOUD, never swallowed — a run that produced no import_status.xlsx
+# is NOT cleanly complete (the report is the source of truth, ties B4).
+if result.get("run_status") == "completed_no_report":
+    print("\n*** WARNING — IMPORT RAN BUT ITS REPORT WAS NOT WRITTEN ***")
+    print(f"    {result.get('report_write_error', '')}")
+    print("    Treat this run as NOT cleanly complete: import_status.xlsx is the source of truth. "
+          "Investigate the staging/Volume write path (see PLAN 12 Finding-6) and re-run.")
 _totals = result.get("totals", {})
 for _k in ("total", "created", "updated", "adopted", "skipped", "created_with_warning",
            "manual", "not_selected", "skipped_no_object", "failed"):

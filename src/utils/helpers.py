@@ -4,6 +4,8 @@ Shared helpers.
 from __future__ import annotations
 
 import datetime as _dt
+import json as _json
+import re as _re
 from typing import Any, Iterable
 
 
@@ -178,3 +180,45 @@ def parse_bool(raw: Any, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() in ("true", "1", "yes", "y")
+
+
+def parse_catalog_mapping(inline_json: str = "") -> dict:
+    """Parse the B13 `catalog_mapping_json` widget into a flat {source: target} dict.
+
+    Adapted from the UC utility's `parse_catalog_mapping`, but to the FLAT shape the user specified
+    (`{"source_catalog_name": "target_catalog_name"}`) — NOT UC's nested `{"catalogs": {...}}`. For
+    forgiveness a nested `{"catalogs": {...}}` is still unwrapped. Blank -> {} (identity, no remap).
+    Rejects a blank source/target or two sources mapping to the same target (ambiguous)."""
+    raw = (inline_json or "").strip()
+    if not raw:
+        return {}
+    data = _json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("`catalog_mapping_json` must be a JSON object {\"src\": \"tgt\"}")
+    if "catalogs" in data and isinstance(data["catalogs"], dict):
+        data = data["catalogs"]
+    mapping = {str(k).strip(): str(v).strip() for k, v in data.items()}
+    if any(not k or not v for k, v in mapping.items()):
+        raise ValueError("`catalog_mapping_json` cannot contain a blank source or target name")
+    non_identity = {k: v for k, v in mapping.items() if k != v}
+    if len(set(non_identity.values())) != len(non_identity):
+        raise ValueError("each source catalog must map to a distinct target catalog")
+    return mapping
+
+
+def remap_catalog_refs(text: Any, mapping: dict) -> str:
+    """Rewrite catalog references source->target in a block of SQL/serialized text (B13).
+
+    Ported from the UC utility's `rewrite_catalog_references` — token-boundary safe, so `src` is
+    rewritten only as a whole catalog identifier: backticked (`` `src` ``), as a qualifier
+    (`src.schema.table`), or standalone (`USE CATALOG src`). A longer identifier that merely
+    CONTAINS `src` (e.g. `src_archive`, `mysrc`) is never touched. Blank mapping -> text unchanged
+    (byte-identical to today)."""
+    out = safe_str(text)
+    for src, tgt in (mapping or {}).items():
+        if not src or not tgt or src == tgt:
+            continue
+        out = out.replace(f"`{src}`", f"`{tgt}`")
+        out = _re.sub(rf"(?<![\w`.]){_re.escape(src)}(?=\.)", tgt, out)       # src.<rest>
+        out = _re.sub(rf"(?<![\w`.]){_re.escape(src)}(?![\w`.])", tgt, out)   # bare
+    return out

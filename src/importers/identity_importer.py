@@ -104,6 +104,11 @@ def _kind_of(unit: dict) -> str:
 class IdentityImporter(BaseImporter):
     component = "identity"
     asset_types = ("user", "service_principal", "group", "group_membership")
+    # B6 Scope 2: identity stays SERIAL even when parallel_threads>1 — nested groups (nested-first),
+    # the two-pass membership (must run after ALL groups exist), and the displayName index PASS-1
+    # builds for PASS-2 are subtle ordering constraints the asset_type sub-level split doesn't
+    # capture; serialising identity is the safe choice (it is also far from the per-object hotspot).
+    parallel_safe = False
     # Built-in group membership is declarative against a group that ALWAYS exists on target, so an
     # ADOPT must still perform the member PATCH — otherwise a source workspace admin silently
     # would not be an admin on target.

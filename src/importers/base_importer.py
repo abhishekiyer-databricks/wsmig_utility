@@ -33,6 +33,7 @@ error classification, reporting — lives here so it is written once and behaves
 from __future__ import annotations
 
 import posixpath
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, namedtuple
@@ -41,8 +42,9 @@ from typing import Any, Optional
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
                                    ACTION_FAILED, ACTION_MANUAL, ACTION_NOT_SELECTED,
                                    ACTION_SKIPPED, ACTION_SKIPPED_NO_OBJECT, ACTION_UPDATED,
-                                   CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_SUPPORTED,
-                                   CAT_PERMISSION_DENIED, CAT_PREREQUISITE_MISSING, UpsertAction)
+                                   CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_APPLIED,
+                                   CAT_NOT_SUPPORTED, CAT_PERMISSION_DENIED,
+                                   CAT_PREREQUISITE_MISSING, UpsertAction)
 from src.utils.helpers import (folder_natural_key, home_owner, looks_like_app_id, normalize_ws_path,
                                safe_str)
 from src.utils.logger import get_logger
@@ -135,6 +137,21 @@ class HardRemapFailure(RuntimeError):
     """
 
 
+class DeferredHome(RuntimeError):
+    """A home-descendant content unit whose `/Users/<owner>` home is NOT present on target YET, but
+    whose owner is in the source roster / unknown (so the home MIGHT still be lazily provisioned)
+    (PLAN 13 B8).
+
+    User homes are PROTECTED + lazily provisioned — `mkdir` is impossible (200/200 `DIRECTORY_
+    PROTECTED` at scale, live-verified) and the tool cannot force one. So instead of hard-failing
+    mid-phase (and pinning the miss in the home cache, forcing endless `failed_only`), the unit is
+    DEFERRED: parked, not recorded, and re-attempted ONCE at the end of the workspace phase against a
+    FRESH `get-status` (the home may have provisioned since). A home still absent at the re-sweep
+    becomes a clean `prerequisite_missing` that a later `failed_only` heals. A genuinely-absent owner
+    (deleted in source) is NOT deferred — it is diverted to backup (PLAN 9) or an immediate
+    prerequisite. The raiser carries the home path for diagnostics."""
+
+
 class SkippedNoObject(RuntimeError):
     """A declarative apply (an ACL) whose TARGET OBJECT does not exist (§6b-i, D23).
 
@@ -161,6 +178,31 @@ class UnsupportedOperation(RuntimeError):
     """
 
 
+class VerificationFailed(RuntimeError):
+    """A mutating call returned HTTP 200 (did not raise) but a READ-BACK showed the intended state
+    was NOT applied (PLAN 13 B4). The report must be the source of truth: a 200 is not proof the
+    state changed (workspace-conf keys are silently dropped on some workspaces, 200 and all). Filed
+    FAILED with `not_applied` and observed-vs-intended; the raiser writes the verbatim message, and
+    `_record` does NOT advance the fingerprint on a FAILED outcome, so a re-run re-attempts it.
+    Reused by B7's publish read-back. Distinct type so `classify_error` passes the message through.
+    """
+
+
+def verify_applied(getter, intended) -> tuple[bool, str]:
+    """Read-back verify a declarative mutating call (PLAN 13 B4). Returns `(ok, observed)`.
+
+    `getter` is a zero-arg callable performing the GET and returning the live value. The comparison
+    is string-normalised (conf values, embed flags, warehouse ids are all scalar). A getter that
+    raises is reported as a verification failure (observed names the read error) rather than crashing
+    — "we could not confirm it applied" is still NOT parity. This is the ONE reusable primitive the
+    B4 audit and B7's publish reconcile share: PATCH/PUT/POST → GET → compare → report the truth."""
+    try:
+        observed = getter()
+    except Exception as exc:  # noqa: BLE001 — "cannot confirm" is a verification failure, not a crash
+        return False, f"<read-back failed: {exc}>"
+    return safe_str(observed) == safe_str(intended), safe_str(observed)
+
+
 def classify_error(exc: Exception) -> tuple[str, str]:
     """`(failure_category, human_message)` for an error.
 
@@ -179,6 +221,8 @@ def classify_error(exc: Exception) -> tuple[str, str]:
         return CAT_DEPENDENCY_UNRESOLVED, raw
     if isinstance(exc, UnsupportedOperation):
         return CAT_NOT_SUPPORTED, raw
+    if isinstance(exc, VerificationFailed):
+        return CAT_NOT_APPLIED, raw
     for marker, category, hint in _ERROR_MAP:
         if marker.lower() in raw.lower():
             # actual server error FIRST, remediation hint appended — the operator sees both.
@@ -269,6 +313,15 @@ class BaseImporter(ABC):
 
     component: str = "unknown"
     asset_types: tuple = ()
+    # B6 Scope 2: whether this importer's units may be processed in a bounded thread pool WITHIN each
+    # dependency sub-level (barrier between sub-levels). The default sub-level split is one group per
+    # asset_type in dependency order (`sublevels()`), which is correct for compute (pools→policies→
+    # clusters), sql (warehouses→queries→alerts) and workspace (dirs→content). Importers with subtle
+    # intra-family state set this False and stay fully serial: IDENTITY (nested groups + the
+    # two-pass membership + the displayName index PASS-1 builds for PASS-2) and MISC (the cluster-lib
+    # force-start/stop batching, whose start/stop race the serial Bug-1 fix depends on). Only engages
+    # when `parallel_threads > 1`; `parallel_threads=1` (default) is always the exact serial loop.
+    parallel_safe: bool = True
     # asset_types whose work is DECLARATIVE against an object that already exists — adding members
     # to a built-in group, or PUTting an object's permissions. For these, "the object is on target"
     # does NOT mean "the operation was applied", so an ADOPT must still perform the call rather than
@@ -300,6 +353,22 @@ class BaseImporter(ABC):
         self.result = ImportResult(self.component)
         self._pending_cp: list[str] = []
         self._pending_cp_results: dict = {}
+        # B8: home-descendant content units parked for the end-of-phase re-sweep (populated when a
+        # create raises DeferredHome). `_in_resweep` is set during the re-sweep so a still-absent
+        # home becomes a clean prerequisite rather than deferring forever.
+        self._deferred_units: list[dict] = []
+        self._in_resweep: bool = False
+        # B8: when driven by the ImportRunner, the home-content re-sweep is DEFERRED to just before
+        # the ACL phase (max lazy-provisioning time, still before ACLs) — the importer only PUBLISHES
+        # its parked units to the shared context. A direct call (a unit test) keeps the end-of-phase
+        # re-sweep so the deferred units still get a final outcome. The runner flips this to False.
+        self._resweep_at_phase_end: bool = True
+        # B6 Scope 2: a lock serialising the in-memory RECORDING (result counters, state batch,
+        # checkpoint batch) while the API calls themselves run concurrently; and a flag so the
+        # batched checkpoint flush is DEFERRED to the sub-level barrier during a parallel section
+        # (never flushed mid-section from a worker thread).
+        self._lock = threading.Lock()
+        self._in_parallel: bool = False
 
     # ── properties ────────────────────────────────────────────────────────
     @property
@@ -565,21 +634,29 @@ class BaseImporter(ABC):
                           f"(the SP was recreated with a new applicationId on target)")
 
     def _home_present(self, home_root: str) -> bool:
-        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?"""
+        """Does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?
+
+        B8: caches only a genuinely-settled PRESENT. A transient ABSENT is NOT pinned — a home may be
+        lazily provisioned LATER in the same run, and the old whole-run "absent" cache was exactly
+        what forced the endless `failed_only` loop (a home that appeared later was never re-probed).
+        So an absent reading re-probes each time (and the end-of-phase re-sweep sees it fresh)."""
         if not home_root:
             return True
         cache = getattr(self, "_home_present_cache", None)
         if cache is None:
             cache = self._home_present_cache = {}
-        if home_root not in cache:
-            owner = home_owner(home_root)
-            sp_map = self.identity_map.get("sp_mapping") or {}
-            if sp_map.get(owner):
-                cache[home_root] = True   # an SP's home is auto-provisioned at SP-create
-            else:
-                remapped, _ = self._remap_home_path(home_root)
-                cache[home_root] = bool(self._get_status(remapped))
-        return cache[home_root]
+        if cache.get(home_root):
+            return True
+        owner = home_owner(home_root)
+        sp_map = self.identity_map.get("sp_mapping") or {}
+        if sp_map.get(owner):
+            cache[home_root] = True   # an SP's home is auto-provisioned at SP-create
+            return True
+        remapped, _ = self._remap_home_path(home_root)
+        present = bool(self._get_status(remapped))
+        if present:
+            cache[home_root] = True   # settle only POSITIVES; never pin a transient absent
+        return present
 
     def _backup_path(self, path: str, owner: str) -> str:
         """`<backup_root>/<owner>/<path-relative-to-/Users/owner>` (PLAN 9 §4.2)."""
@@ -615,10 +692,13 @@ class BaseImporter(ABC):
           1. owner is a recreated SP (`sp_mapping`) → remap to /Users/<newAppId>/… (IMP-6).
           2. else owner's real home is present on target → use it as-is.
           3. else owner absent on target:
-             - `workspace_home_backup` off → prerequisite (the pre-PLAN-9 behaviour).
-             - owner ABSENT from the source roster (deleted in source) → divert to the backup root.
-             - owner in-roster / unknown → prerequisite; recovers into the REAL home on
-               retry_mode=failed_only, never a silent divert.
+             - owner ABSENT from the source roster (deleted in source):
+                 • `workspace_home_backup` on (default) → divert to the backup root.
+                 • off → prerequisite (the pre-PLAN-9 behaviour); won't appear, so NOT deferred.
+             - owner in-roster / unknown → `defer` (B8): the home may be lazily provisioned, so the
+               unit is parked for the end-of-phase re-sweep (fresh re-check), then recovers into the
+               REAL home on `retry_mode=failed_only` — never a silent divert, never a stale-cache
+               `failed_only` loop, never a `mkdir` of the protected home.
         """
         norm = normalize_ws_path(path)
         owner = home_owner(norm)
@@ -643,17 +723,21 @@ class BaseImporter(ABC):
                                       "user home directory — already provisioned")
             return HomeResolution(norm, "normal_home", "")
 
-        backup_on = bool(getattr(self.config.imports, "workspace_home_backup", False))
-        if not backup_on:
-            return HomeResolution(norm, "prerequisite", "")
+        # Home not present. A genuinely-absent (deleted-in-source) owner has no home to wait for.
         if self._roster_status(owner) == "absent":
-            backup_path = self._backup_path(norm, owner)
-            who = "service principal" if looks_like_app_id(owner) else "user"
-            note = (f"owner ({who}) `{owner}` was deleted in source (absent from the source "
-                    f"roster) — its home cannot be recreated under /Users/; object preserved at "
-                    f"`{backup_path}`. Reassign to the intended owner if needed.")
-            return HomeResolution(backup_path, "backup", note)
-        return HomeResolution(norm, "prerequisite", "")
+            backup_on = bool(getattr(self.config.imports, "workspace_home_backup", False))
+            if backup_on:
+                backup_path = self._backup_path(norm, owner)
+                who = "service principal" if looks_like_app_id(owner) else "user"
+                note = (f"owner ({who}) `{owner}` was deleted in source (absent from the source "
+                        f"roster) — its home cannot be recreated under /Users/; object preserved at "
+                        f"`{backup_path}`. Reassign to the intended owner if needed.")
+                return HomeResolution(backup_path, "backup", note)
+            return HomeResolution(norm, "prerequisite", "")
+        # in-roster / unknown owner → the home MAY still provision lazily → DEFER (B8). The caller
+        # (workspace content) parks it for the end-of-phase re-sweep; folder-placed callers treat it
+        # like a missing parent (keeps the source path → clean missing_parent_prerequisite).
+        return HomeResolution(norm, "defer", "")
 
     def require_remap(self, ref_type: str, source_id: str, referenced_by: str = "") -> str:
         """Resolve a SOURCE object id to the TARGET object THIS TOOL created for it — exact or fail
@@ -735,20 +819,16 @@ class BaseImporter(ABC):
                 f"falls back to RESOURCE_ALREADY_EXISTS handling")
             existing = {}
 
+        threads = max(1, int(getattr(self.config, "parallel_threads", 1) or 1))
         self.log.info("importing", component=self.component, units=len(units),
-                      already_on_target=len(existing), dry_run=self.dry_run)
+                      already_on_target=len(existing), dry_run=self.dry_run,
+                      threads=(threads if (threads > 1 and self.parallel_safe) else 1))
 
-        for unit in units:
-            try:
-                self._process_one(unit, existing)
-            except Exception as exc:  # noqa: BLE001 — THE fail-soft guarantee (D21)
-                # Nothing a single unit does may end the run. This is the last line of defence:
-                # _process_one already handles expected API errors, so reaching here means a bug or
-                # an unforeseen shape — still recorded per-unit, still continuing.
-                self._record(unit, ACTION_FAILED, note=f"unexpected importer error: {exc}",
-                             error_raw=str(exc), category=CAT_API_ERROR)
-                self.log.error("unit failed (unexpected)", component=self.component,
-                               natural_key=self.natural_key(unit), error=str(exc))
+        if threads > 1 and self.parallel_safe and len(units) > 1:
+            self._run_parallel(units, existing, threads)
+        else:
+            for unit in units:
+                self._process_one_safe(unit, existing)
 
         self.flush_checkpoint()
         self.result.elapsed_sec = time.time() - t0
@@ -756,6 +836,58 @@ class BaseImporter(ABC):
             k: v for k, v in self.result.as_dict().items()
             if k in ("total", "created", "updated", "adopted", "skipped", "failed", "manual")})
         return self.result
+
+    def _process_one_safe(self, unit: dict, existing: dict) -> None:
+        """`_process_one` with the fail-soft last line of defence (D21) — nothing a single unit does
+        may end the run. Shared by the serial loop AND each parallel worker."""
+        try:
+            self._process_one(unit, existing)
+        except Exception as exc:  # noqa: BLE001 — _process_one handles expected API errors; reaching
+            # here is a bug/unforeseen shape — still recorded per-unit, still continuing.
+            self._record(unit, ACTION_FAILED, note=f"unexpected importer error: {exc}",
+                         error_raw=str(exc), category=CAT_API_ERROR)
+            self.log.error("unit failed (unexpected)", component=self.component,
+                           natural_key=self.natural_key(unit), error=str(exc))
+
+    def sublevels(self, units: list[dict]) -> list[list[dict]]:
+        """B6 Scope 2: split units into ordered dependency SUB-LEVELS for parallel import.
+
+        Default: ONE sub-level per asset_type, in first-seen (dependency) order — units within a
+        sub-level are mutually independent and run in parallel; a hard barrier (checkpoint + state
+        flush) separates sub-levels so the next sub-level sees a complete id map. This is correct for
+        compute (instance_pool→cluster_policy→cluster), sql (sql_warehouse→legacy_query→…) and
+        workspace (directory→notebook→workspace_file), because `load()` already yields each
+        asset_type's units contiguously in dependency order. Importers that need a different split
+        (or must stay serial) override this or set `parallel_safe=False`."""
+        groups: dict[str, list[dict]] = {}
+        order: list[str] = []
+        for u in units:
+            at = safe_str(u.get("asset_type"))
+            if at not in groups:
+                groups[at] = []
+                order.append(at)
+            groups[at].append(u)
+        return [groups[at] for at in order]
+
+    def _run_parallel(self, units: list[dict], existing: dict, threads: int) -> None:
+        """Process units one dependency sub-level at a time: parallel WITHIN a sub-level, a hard
+        BARRIER (checkpoint + state flush) between sub-levels. Recording is serialised by `self._lock`
+        (fast, in-memory) while the API calls run concurrently; the per-call 429/5xx backoff is
+        inherited unchanged. Fail-soft per unit (one unit's failure never aborts the pool or run)."""
+        from src.exporters.parallel import parallel_map
+        self._in_parallel = True
+        try:
+            for sublevel in self.sublevels(units):
+                for _item, _result, _error in parallel_map(
+                        sublevel, lambda u: self._process_one_safe(u, existing), threads):
+                    pass   # _process_one_safe records every outcome; nothing escapes a worker
+                # BARRIER: flush so the NEXT sub-level's remaps see a complete id map (the dependency
+                # graph REQUIRES this — it is not an optimisation choice).
+                self.flush_checkpoint()
+                if self.state is not None:
+                    self.state.flush()
+        finally:
+            self._in_parallel = False
 
     def _process_one(self, unit: dict, existing: dict) -> None:
         """Decide and act on ONE unit. Expected API errors are handled here."""
@@ -768,16 +900,17 @@ class BaseImporter(ABC):
         #    rows) in every retry file is noise, and the full-run report already has the whole
         #    picture. Nothing is attempted and no state row changes.
         if not self.in_work_list(unit):
-            self.result.add({
-                "asset_type": asset_type, "natural_key": key, "family": self.component,
-                "source_id": safe_str(unit.get("source_id")), "target_id": "",
-                "import_status": ACTION_SKIPPED,
-                "action_taken": "Not in this retry's work list",
-                "fingerprint": safe_str(unit.get("fingerprint")),
-                "note": f"retry_mode={self.config.imports.retry_mode} narrowed this run to "
-                        f"outstanding units; this one was not outstanding",
-                "failure_category": "", "dry_run": self.dry_run,
-                "retry_out_of_scope": True})
+            with self._lock:   # B6: result mutation is lock-guarded under parallelism
+                self.result.add({
+                    "asset_type": asset_type, "natural_key": key, "family": self.component,
+                    "source_id": safe_str(unit.get("source_id")), "target_id": "",
+                    "import_status": ACTION_SKIPPED,
+                    "action_taken": "Not in this retry's work list",
+                    "fingerprint": safe_str(unit.get("fingerprint")),
+                    "note": f"retry_mode={self.config.imports.retry_mode} narrowed this run to "
+                            f"outstanding units; this one was not outstanding",
+                    "failure_category": "", "dry_run": self.dry_run,
+                    "retry_out_of_scope": True})
             return
 
         # 1. Units the bundle already marked as human work (repos, legacy dashboards, secret
@@ -874,6 +1007,12 @@ class BaseImporter(ABC):
         # CREATE
         try:
             out = self.create_one(unit) or {}
+        except DeferredHome:
+            # B8: the home isn't present yet but MIGHT be (in-roster/unknown owner). Park it for the
+            # end-of-phase re-sweep; DON'T record it (so it doesn't poison the phase or get pinned by
+            # the stale cache). The re-sweep records its final outcome exactly once.
+            self._deferred_units.append(unit)
+            return
         except SkippedNoObject as exc:
             # A declarative unit whose object isn't there — outstanding work, not an error (§6b-i).
             self._record(unit, ACTION_SKIPPED_NO_OBJECT, note=str(exc), category=exc.category)
@@ -948,6 +1087,10 @@ class BaseImporter(ABC):
             return
         try:
             out = self.update_one(unit, target_id) or {}
+        except DeferredHome:
+            # B8: a home-content UPDATE whose home vanished/not-yet-present → defer + re-sweep too.
+            self._deferred_units.append(unit)
+            return
         except Exception as exc:  # noqa: BLE001
             category, message = classify_error(exc)
             self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
@@ -998,37 +1141,54 @@ class BaseImporter(ABC):
             "failure_category": category,
             "dry_run": bool(dry),
         }
-        self.result.add(row)
+        # B6 Scope 2: serialise the in-memory bookkeeping (result counters, state batch, checkpoint
+        # batch) so concurrent workers can't lose a counter increment or corrupt a batch. The API
+        # calls already happened OUTSIDE this lock (in create_one/update_one), so holding it is cheap.
+        need_flush = False
+        with self._lock:
+            self.result.add(row)
+            if self.state is not None:
+                # A FAILED outcome must NOT advance the stored fingerprint. The change never landed on
+                # target, so if we recorded the NEW source fingerprint, `state.decide()` on the next
+                # normal run would see "unchanged" and SKIP/ADOPT — stranding the object at its old
+                # target value forever while the state falsely claims it is current (a permanent silent
+                # staleness; caught live PLAN 11 Run 3 on a failed alert_v2 update). Passing "" keeps
+                # the LAST SUCCESSFUL fingerprint (state.record carries the prior forward), so the
+                # source still reads as "moved" next run and the update is retried.
+                fp_to_store = "" if status == ACTION_FAILED else safe_str(unit.get("fingerprint"))
+                self.state.record(
+                    asset_type, key, action=status, fingerprint=fp_to_store,
+                    source_object_id=safe_str(unit.get("source_id")),
+                    target_object_id=safe_str(target_id),
+                    error=note if status in (ACTION_FAILED, ACTION_CREATED_WITH_WARNING,
+                                             ACTION_MANUAL, "skipped_no_object") else "",
+                    error_raw=error_raw, failure_category=category, source_detail=source_detail)
+            # The checkpoint stores the OUTCOME, not just a done-key: a resumed unit needs its
+            # target_id/status back, and import_results.json (written only at the end) cannot supply
+            # them after a crash. Dry runs are NOT checkpointed — a rehearsal must not make the next
+            # real run think the work is done.
+            if checkpoint and not dry:
+                self._pending_cp.append(key)
+                self._pending_cp_results[key] = {
+                    "import_status": status, "target_id": safe_str(target_id),
+                    "fingerprint": safe_str(unit.get("fingerprint")),
+                    "source_id": safe_str(unit.get("source_id")), "note": note}
+                # In a parallel section the flush is DEFERRED to the sub-level barrier (never flushed
+                # mid-section from a worker — a UC-Volume full-file rewrite from several threads at
+                # once would corrupt the checkpoint). Serial runs flush on batch exactly as before.
+                if len(self._pending_cp) >= CHECKPOINT_BATCH and not self._in_parallel:
+                    need_flush = True
 
-        if self.state is not None:
-            # A FAILED outcome must NOT advance the stored fingerprint. The change never landed on
-            # target, so if we recorded the NEW source fingerprint, `state.decide()` on the next
-            # normal run would see "unchanged" and SKIP/ADOPT — stranding the object at its old
-            # target value forever while the state falsely claims it is current (a permanent silent
-            # staleness; caught live PLAN 11 Run 3 on a failed alert_v2 update). Passing "" keeps the
-            # LAST SUCCESSFUL fingerprint (state.record carries the prior forward), so the source
-            # still reads as "moved" next run and the update is retried — no reliance on
-            # retry_mode=failed_only to eventually heal it.
-            fp_to_store = "" if status == ACTION_FAILED else safe_str(unit.get("fingerprint"))
-            self.state.record(
-                asset_type, key, action=status, fingerprint=fp_to_store,
-                source_object_id=safe_str(unit.get("source_id")), target_object_id=safe_str(target_id),
-                error=note if status in (ACTION_FAILED, ACTION_CREATED_WITH_WARNING,
-                                         ACTION_MANUAL, "skipped_no_object") else "",
-                error_raw=error_raw, failure_category=category, source_detail=source_detail)
+        # B5: a per-object line so progress streams live in the cell ("job-x → created"). Outcomes
+        # that did real work (or failed) are INFO; unchanged/deselected skips are DEBUG to avoid
+        # flooding a re-run. Logged OUTSIDE the lock (the logging handler is itself lock-guarded).
+        _loud = status in (ACTION_CREATED, ACTION_CREATED_WITH_WARNING, ACTION_UPDATED,
+                           ACTION_ADOPTED, ACTION_MANUAL, ACTION_FAILED, ACTION_SKIPPED_NO_OBJECT)
+        (self.log.info if _loud else self.log.debug)(
+            f"{asset_type}/{key} → {status}", target_id=safe_str(target_id))
 
-        # The checkpoint stores the OUTCOME, not just a done-key: a resumed unit needs its
-        # target_id/status back, and import_results.json (written only at the end) cannot supply
-        # them after a crash. Dry runs are deliberately NOT checkpointed — a rehearsal must not
-        # make the next real run think the work is done.
-        if checkpoint and not dry:
-            self._pending_cp.append(key)
-            self._pending_cp_results[key] = {"import_status": status, "target_id": safe_str(target_id),
-                                             "fingerprint": safe_str(unit.get("fingerprint")),
-                                             "source_id": safe_str(unit.get("source_id")),
-                                             "note": note}
-            if len(self._pending_cp) >= CHECKPOINT_BATCH:
-                self.flush_checkpoint()
+        if need_flush:
+            self.flush_checkpoint()
 
     def flush_checkpoint(self) -> None:
         """Write the pending checkpoint batch. Called per batch, at phase end, and in `finally`."""

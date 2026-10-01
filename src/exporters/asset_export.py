@@ -718,7 +718,10 @@ def _sql_units(records: list[dict]) -> list[dict]:
             else:
                 out.append(_make_unit("sql_warehouse", nk, sid, raw, mode="auto"))
         elif st == "legacy_query":
-            out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto"))
+            # B2: carry the SOURCE owner as a top-level unit field (it is stripped from the create
+            # payload — read-only at create — so the importer re-applies it with a verified PATCH).
+            out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto",
+                                  extra={"source_owner": safe_str(raw.get("owner_user_name"))}))
         elif st == "legacy_alert":
             # Legacy alerts are MANUAL, like legacy dashboards (IMP-5). The v1 create API wants the
             # old flat `options{column,op,value}` shape, but the read API only returns the newer
@@ -776,10 +779,23 @@ def _lakeview_units(records: list[dict]) -> list[dict]:
         else:
             # PLAN 8 Bug 7 (Lakeview sibling): carry `parent_path` so a user-created dashboard's
             # `.lvdash.json` is recreated in the SAME user folder on target, not at the API default.
+            # B7: carry the publish facets (publish state / embed-credentials mode / published
+            # warehouse / schedules) in the payload AND fold them into the FINGERPRINT, so a source
+            # publish / unpublish / republish / schedule change is change-detected on incremental runs
+            # (the draft payload alone never moved for a publish-only change).
             payload = {"display_name": name, "warehouse_id": safe_str(r.get("warehouse_id")),
                        "serialized_dashboard": r.get("serialized_dashboard"),
-                       "parent_path": safe_str(r.get("parent_path"))}
-            out.append(_make_unit("lakeview_dashboard", nk, did, payload, mode="auto"))
+                       "parent_path": safe_str(r.get("parent_path")),
+                       "is_published": bool(r.get("is_published")),
+                       "embed_credentials": bool(r.get("embed_credentials")),
+                       "published_warehouse_id": safe_str(r.get("published_warehouse_id")),
+                       "schedules": r.get("schedules") or []}
+            fp_extra = {"is_published": bool(r.get("is_published")),
+                        "embed_credentials": bool(r.get("embed_credentials")),
+                        "published_warehouse_id": safe_str(r.get("published_warehouse_id")),
+                        "schedules": r.get("schedules") or []}
+            out.append(_make_unit("lakeview_dashboard", nk, did, payload, mode="auto",
+                                  fingerprint_extra=fp_extra))
     return out
 
 

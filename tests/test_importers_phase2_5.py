@@ -46,6 +46,11 @@ class RecordingClient:
         self.status_paths = set(status_paths or ())   # workspace paths that "exist"
         self.calls: list[tuple] = []
         self._n = 0
+        # Models workspace-conf as a real backing store so a B4 read-back (GET after PATCH) sees the
+        # value just written — i.e. the "honoured" case. A test can preload drop_conf_keys to
+        # simulate the silent-drop case (PATCH 200 but the value never changes).
+        self._conf: dict = {}
+        self.drop_conf_keys: set = set()
 
     @property
     def base_url(self):
@@ -56,13 +61,17 @@ class RecordingClient:
         if path == "api/2.0/workspace/get-status":
             p = (params or {}).get("path")
             if p in self.status_paths:
-                return {"path": p, "object_type": "DIRECTORY"}
+                # object_id present so an ACL resolve-by-path (directories/notebooks/files) finds it.
+                return {"path": p, "object_type": "DIRECTORY", "object_id": p}
             raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
         # A cluster the test force-started reports RUNNING on the next poll, so the
         # start→poll→install→stop path can be exercised without real sleeps.
         if path == "api/2.0/clusters/get" and getattr(self, "_started_clusters", None):
             if (params or {}).get("cluster_id") in self._started_clusters:
                 return {"state": "RUNNING"}
+        if path == "api/2.0/workspace-conf" and path not in self.get_table:
+            keys = [k for k in str((params or {}).get("keys", "")).split(",") if k]
+            return {k: self._conf[k] for k in keys if k in self._conf}
         entry = self.get_table.get(path, {})
         return entry(params) if callable(entry) else entry
 
@@ -98,6 +107,12 @@ class RecordingClient:
         self.calls.append(("PATCH", path, body, params))
         if path in self.fail_paths:
             raise RuntimeError("INVALID_PARAMETER_VALUE: rejected")
+        if path == "api/2.0/workspace-conf" and isinstance(body, dict):
+            # Honour the write unless the key is in drop_conf_keys (silent-drop simulation): the
+            # PATCH still "succeeds" (200), but the backing value never changes — exactly the B4 bug.
+            for k, v in body.items():
+                if k not in self.drop_conf_keys:
+                    self._conf[k] = v
         return {}
 
     def posts_to(self, path):
