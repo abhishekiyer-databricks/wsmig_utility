@@ -142,26 +142,29 @@ class WorkspaceImporter(BaseImporter):
 
     # ── existence ─────────────────────────────────────────────────────────
     def existing_keys(self) -> dict:
-        """`{path: path}` for the units' paths that already exist on target.
+        """`{source_path: target_path}` for content ALREADY migrated — from the CONTROL TABLE.
 
-        Probed per unit with `workspace/get-status` rather than walking the whole tree, which on a
-        large workspace would be thousands of calls to answer a question we only have for the paths
-        in the bundle. A path we don't probe just takes the create route, where
-        `RESOURCE_ALREADY_EXISTS` adopts it — equivalent outcome, cheaper.
+        The control table is the source of truth here (keyed by (source_ws_id, asset_type,
+        natural_key), storing the target path as `target_object_id`). Deriving existence from it is
+        a pure in-memory read — ZERO live API calls — which is what makes this scale: the old
+        per-object `workspace/get-status` probe was ~2 serial calls PER unit (≈19k on a 9.5k-object
+        bed, re-probing the same absent homes thousands of times), ran before the phase logged a
+        single line, and was not covered by the parallel pool. Correctness is unchanged: a path NOT
+        in the table takes the CREATE route, where `RESOURCE_ALREADY_EXISTS` adopts anything that
+        happens to exist out-of-band (the base importer's safety net). The one thing we give up is
+        auto-detecting an object deleted on target out-of-band since the last run — `allow_deletes`
+        is false by default (the tool never deletes), and `force_full_import` re-evaluates everything.
+
+        The change signal is the source `modified_at` folded into the fingerprint: a re-run whose
+        `modified_at` moved makes `state.decide()` return UPDATE (re-upload); unchanged → SKIP.
         """
-        found: dict = {}
-        for unit in self.load():
-            path = self.natural_key(unit)
-            if not path or safe_str(unit.get("import_action")) in ("manual", "dab_redeploy"):
-                continue
-            # Probe the RESOLVED target path — an SP-home path is remapped to its new appId (IMP-6)
-            # and an orphaned home is diverted to the backup root (PLAN 9), so a re-run ADOPTS the
-            # already-migrated content instead of recreating it. The existence map is keyed by the
-            # SOURCE natural_key, since that is what the base loop matches a unit on.
-            target_path = self._resolve_home_target(path).target_path
-            if self._get_status(target_path):
-                found[path] = target_path
-                self.context.setdefault("workspace_paths", set()).add(target_path)
+        if self.state is None:
+            return {}
+        found = self.state.migrated_keys("directory", "notebook", "workspace_file")
+        # Pre-seed the shared target-path set so the DLT/jobs importers can see paths migrated on a
+        # PRIOR run even when this run SKIPs them (created paths add themselves as they go).
+        if found:
+            self.context.setdefault("workspace_paths", set()).update(found.values())
         return found
 
     # ── create ────────────────────────────────────────────────────────────

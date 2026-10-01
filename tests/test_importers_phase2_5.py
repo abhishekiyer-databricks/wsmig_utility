@@ -604,19 +604,76 @@ def test_backup_subtree_hierarchy_preserved():
     assert mkdirs.index("/Users_Backup/gone@x.com/a") < mkdirs.index("/Users_Backup/gone@x.com/a/b")
 
 
-def test_rerun_adopts_backup_copy_not_duplicated():
-    """existing_keys probes the RESOLVED (backup) path, so a re-run ADOPTS the backup copy rather
-    than re-uploading it — idempotency with natural_key=source path, target_id=backup path."""
-    client = RecordingClient(status_paths={"/Users_Backup/gone@x.com/nb"})
-    imp, st = _make(WorkspaceImporter, [
-        _unit("notebook", "/Users/gone@x.com/nb",
-              {"path": "/Users/gone@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
-    ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
+def test_rerun_skips_already_migrated_content_from_the_control_table():
+    """A re-run derives existence from the CONTROL TABLE (zero `get-status` probes): a unit whose
+    fingerprint matches its prior state row is SKIPped, never re-uploaded — idempotency with
+    natural_key=source path and target_id=the stored (here, backup) path. This replaces the old
+    per-object live-probe adopt: existence is now a pure in-memory read of the state cache."""
+    client = RecordingClient()
+    unit = _unit("notebook", "/Users/gone@x.com/nb",
+                 {"path": "/Users/gone@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py")
+    imp, st = _make(WorkspaceImporter, [unit], client,
+                    staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
     _write_roster(imp.staging, users=[])
+    # A prior run migrated it to the backup path; seed that state row with the SAME fingerprint so
+    # this run sees it as unchanged (modified_at didn't move) → SKIP.
+    st._cache[("notebook", "/Users/gone@x.com/nb")] = {
+        "asset_type": "notebook", "natural_key": "/Users/gone@x.com/nb",
+        "target_object_id": "/Users_Backup/gone@x.com/nb",
+        "last_source_fingerprint": unit["fingerprint"]}
     res = imp.run()
-    assert client.bodies_to("workspace/import") == [], "an existing backup copy must be adopted, not re-uploaded"
-    assert res.adopted == 1
+    assert client.bodies_to("workspace/import") == [], \
+        "an already-migrated, unchanged unit must be SKIPped from the control table, not re-uploaded"
+    assert res.skipped == 1
+    # the stored target path (the backup copy) is preserved, not duplicated
     assert st.row("notebook", "/Users/gone@x.com/nb")["target_object_id"] == "/Users_Backup/gone@x.com/nb"
+
+
+def test_qa2_existing_keys_derives_from_control_table_with_zero_api_calls():
+    """QA-2: `existing_keys()` is a pure in-memory read of the state cache — NO `workspace/get-status`
+    probe (the per-object probe was the ~19k-serial-call silent stall at scale). It returns the
+    stored target paths for already-migrated workspace content."""
+    client = RecordingClient()
+    imp, st = _make(WorkspaceImporter, [
+        _unit("notebook", "/Shared/x", {"path": "/Shared/x", "language": "PYTHON"}),
+    ], client, identity_map={"sp_mapping": {}})
+    st._cache[("notebook", "/Shared/x")] = {
+        "asset_type": "notebook", "natural_key": "/Shared/x",
+        "target_object_id": "/Shared/x", "last_source_fingerprint": "sha256:/Shared/x"}
+    st._cache[("directory", "/Shared")] = {
+        "asset_type": "directory", "natural_key": "/Shared",
+        "target_object_id": "/Shared", "last_source_fingerprint": "sha256:d"}
+    found = imp.existing_keys()
+    assert found == {"/Shared/x": "/Shared/x", "/Shared": "/Shared"}
+    assert [c for c in client.calls if c[1] == "api/2.0/workspace/get-status"] == [], \
+        "existing_keys must NOT probe the live workspace — the control table is the source of truth"
+
+
+def test_qa2_create_skip_update_decided_from_control_table():
+    """QA-2 + modified_at signal end to end: no state row → CREATE; row with matching fingerprint
+    (modified_at unchanged) → SKIP; row with a different fingerprint (modified_at moved) → UPDATE
+    (re-upload). All decided from the control table, no live existence probe."""
+    client = RecordingClient()
+    a = _unit("notebook", "/Shared/a", {"path": "/Shared/a", "language": "PYTHON"},
+              content_ref="c/a.py")
+    b = _unit("notebook", "/Shared/b", {"path": "/Shared/b", "language": "PYTHON"},
+              content_ref="c/b.py")
+    c = _unit("notebook", "/Shared/c", {"path": "/Shared/c", "language": "PYTHON"},
+              content_ref="c/c.py")
+    imp, st = _make(WorkspaceImporter, [a, b, c], client,
+                    staging_files={"c/a.py": b"a", "c/b.py": b"b", "c/c.py": b"c"},
+                    identity_map={"sp_mapping": {}})
+    # b: unchanged (same fingerprint) → SKIP. c: changed (stale stored fingerprint) → UPDATE.
+    st._cache[("notebook", "/Shared/b")] = {
+        "asset_type": "notebook", "natural_key": "/Shared/b",
+        "target_object_id": "/Shared/b", "last_source_fingerprint": b["fingerprint"]}
+    st._cache[("notebook", "/Shared/c")] = {
+        "asset_type": "notebook", "natural_key": "/Shared/c",
+        "target_object_id": "/Shared/c", "last_source_fingerprint": "sha256:STALE"}
+    res = imp.run()
+    assert res.created == 1 and res.skipped == 1 and res.updated == 1
+    uploaded = [bd.get("path") for bd in client.bodies_to("workspace/import")]
+    assert "/Shared/a" in uploaded and "/Shared/c" in uploaded and "/Shared/b" not in uploaded
 
 
 def test_roster_status_indexes_users_by_username_and_email_and_sps_by_appid():

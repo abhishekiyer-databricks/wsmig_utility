@@ -143,6 +143,9 @@ _ACTION_BY_STATUS = {
     # An oversize notebook/file WAS recorded but its bytes never made it into the bundle, so
     # import cannot recreate it — it's a manual copy, not a create_and_upload.
     "skipped_oversize": "manual",
+    # Direct-mode incremental: a unit unchanged since the last migration (its bytes were NOT
+    # re-fetched). There is nothing to upload — import SKIPs it from the control table anyway.
+    "unchanged": "none",
 }
 
 
@@ -564,16 +567,25 @@ def _workspace_units(records: list[dict], native_paths: Optional[dict] = None) -
         path = safe_str(r.get("path"))
         oid = r.get("object_id") or r.get("repo_id")
         if otype == "DIRECTORY":
+            # A directory has no content and no modified_at — it either exists on target or not,
+            # never "updates", so its fingerprint stays metadata-only.
             out.append(_make_unit("directory", path, oid, {"path": path}, mode="auto"))
         elif otype == "NOTEBOOK":
+            # The CHANGE SIGNAL is the source `modified_at` (folded into the fingerprint, NOT the
+            # create payload). It bumps on every content edit (verified live), so an edited notebook
+            # moves the fingerprint → target upsert decides UPDATE — WITHOUT hashing the bytes. This
+            # replaces the old content-sha fingerprint, and lets direct-mode export skip re-fetching
+            # bytes whose fingerprint already matches the control table.
             out.append(_make_unit(
                 "notebook", path, oid,
                 {"path": path, "object_type": "NOTEBOOK", "language": safe_str(r.get("language"))},
-                mode="content", extra={"owner": _owner_of(path)}))
+                mode="content", extra={"owner": _owner_of(path)},
+                fingerprint_extra={"_modified_at": r.get("modified_at")}))
         elif otype == "FILE":
             out.append(_make_unit(
                 "workspace_file", path, oid, {"path": path, "object_type": "FILE"},
-                mode="content", extra={"owner": _owner_of(path)}))
+                mode="content", extra={"owner": _owner_of(path)},
+                fingerprint_extra={"_modified_at": r.get("modified_at")}))
         elif otype == "REPO":
             raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
             src = raw or {"path": path, "url": safe_str(r.get("url")),

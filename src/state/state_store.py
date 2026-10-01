@@ -280,6 +280,21 @@ class StateStore:
         tid = safe_str((r or {}).get("target_object_id"))
         return tid or None
 
+    def migrated_keys(self, *asset_types: str) -> dict:
+        """`{natural_key: target_object_id}` for already-migrated rows of the given asset_types.
+
+        The control table IS the source of truth for "does this already exist on target" — so an
+        importer can build its existence map from this in-memory view with ZERO live API calls
+        (used by the workspace importer to avoid a per-object `get-status` probe at scale)."""
+        wanted = {safe_str(a) for a in asset_types}
+        out: dict = {}
+        for (atype, nkey), r in self._cache.items():
+            if atype in wanted:
+                tid = safe_str((r or {}).get("target_object_id"))
+                if tid:
+                    out[nkey] = tid
+        return out
+
     # ── the decision (master §9 table) ────────────────────────────────────
     def decide(self, asset_type: str, natural_key: str, fingerprint: str,
                exists_on_target: bool) -> UpsertAction:

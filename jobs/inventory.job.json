@@ -27,7 +27,9 @@
           "max_scim": "0",
           "max_workspace_items": "0",
           "max_ws_api_calls": "0",
-          "force_full": "false"
+          "force_full": "false",
+          "parallel_threads": "",
+          "log_level": ""
         }
       }
     }

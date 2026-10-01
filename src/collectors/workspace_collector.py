@@ -118,6 +118,12 @@ class WorkspaceCollector(BaseCollector):
                 "object_type": otype,
                 "language": safe_str(obj.get("language")),
                 "object_id": safe_str(obj.get("object_id")),
+                # The source last-modified timestamp (epoch ms) comes FREE in this bulk list
+                # response for NOTEBOOK/FILE (directories have none). It is the migration change
+                # SIGNAL: import compares it against the control table to decide create/skip/update,
+                # and direct-mode export skips re-fetching bytes whose timestamp hasn't moved — so no
+                # content hashing is needed and the per-object live existence probe is gone.
+                "modified_at": obj.get("modified_at"),
                 # DASHBOARD/ALERT entries carry the owning asset's id, which is how their
                 # on-disk twin is matched to its native unit (paths are unreliable: an Alerts V2
                 # record has parent_path=null even on a detail GET). For a DASHBOARD,

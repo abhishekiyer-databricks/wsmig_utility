@@ -32,6 +32,11 @@ dbutils.widgets.text("source_sp_secret_scope", "", "1e. [direct] Secret scope fo
 dbutils.widgets.text("source_sp_secret_key", "", "1f. [direct] Secret key within that scope")
 dbutils.widgets.text("spn_secret_value", "", "1g. [direct] SP secret (only if no scope/key; redacted)")
 dbutils.widgets.text("staging_location", "", "2a. Staging location (/Volumes/...)")
+# direct-mode ONLY: the shared control table lets export SKIP re-fetching workspace content whose
+# source modified_at hasn't moved since it was migrated (incremental speed-up). Blank / airgap =
+# full export as before. Same shared catalog+schema the import uses.
+dbutils.widgets.text("state_catalog", "", "2b. State catalog (shared, must exist)")
+dbutils.widgets.text("state_schema", "", "2c. State schema (shared, must exist)")
 dbutils.widgets.text("max_scim", "0", "3a. Max SCIM per type (0 = all)")
 dbutils.widgets.text("max_workspace_items", "0", "3b. Max workspace items (0 = all)")
 dbutils.widgets.text("max_ws_api_calls", "0", "3c. Max workspace/list calls (0 = unlimited)")
@@ -93,6 +98,8 @@ from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.bundle_state import resolve_export_run_id
 from src.exporters.export_runner import ExportRunner
+from src.state.sql_backend import build_sql_backend
+from src.state.state_store import StateStore
 from src.utils import logger as _logger
 
 # COMMAND ----------
@@ -143,9 +150,24 @@ _logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_EXPORT_L
 _logger.configure_logging(run_id=cfg.run_id, stage="EXPORT", level=cfg.log_level, capture=False)
 
 _workers = int((dbutils.widgets.get("content_fetch_workers") or "8") or 8)
+
+# DIRECT mode only: build the shared control table so export can SKIP re-fetching unchanged
+# workspace content (its fingerprint — the source modified_at — already matches the migrated row).
+# airgap export runs source-side and must never touch the target table, so state stays None there.
+# force_full_export disables the skip inside the runner. A first run (empty/absent table) just
+# fetches everything, so this is safe before the first import has populated the table.
+_export_state = None
+if cfg.is_direct and cfg.state_enabled:
+    _backend = build_sql_backend(cfg, spark=spark, client=local_client)
+    _export_state = StateStore(_backend, cfg)
+    _export_state.ensure_table()
+    _export_state.load(force=True)
+    print(f"Incremental state : {cfg.state_table_fqn} "
+          f"({len(_export_state._cache)} rows — unchanged content will skip re-fetch)")
+
 result = ExportRunner(client, cfg, aw, dbutils=dbutils,
                       content_fetch_workers=_workers,
-                      force_full_export=_force_full).run()
+                      force_full_export=_force_full, state=_export_state).run()
 
 print("\n=== Export complete ===")
 print(f"  total            {result['total']:>6}")

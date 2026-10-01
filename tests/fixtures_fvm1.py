@@ -1656,6 +1656,340 @@ def phase_acls():
     log(f"secret scope ACLs: {n} grants across {len(scope_names)} scopes")
 
 
+# ───────────────────── SCALE fixtures (B6 parallelism) ──────────────────────
+# These stand up a REAL-scale bed: ~150 assigned account users each with a tree of workspace
+# content, plus a batch of workspace-local SPs/groups, so the parallel ACL-enrichment pass
+# (inventory) and the parallel sub-level import both have thousands of objects to chew through —
+# the only way to prove B6 does the right thing under load rather than on a toy set.
+
+SCALE_USERS = int(os.environ.get("WSMIG_SCALE_USERS", "150"))
+SCALE_OBJS_PER_USER = int(os.environ.get("WSMIG_SCALE_OBJS_PER_USER", "62"))
+SCALE_SP_COUNT = int(os.environ.get("WSMIG_SCALE_SPS", "25"))
+SCALE_GRP_COUNT = int(os.environ.get("WSMIG_SCALE_GRPS", "20"))
+SCALE_SHARED_OBJS = int(os.environ.get("WSMIG_SCALE_SHARED_OBJS", "300"))
+SCALE_USERS_FILE = "/tmp/ai27_scale_users.json"
+SCALE_ROOT = "wsmig_test_scale"   # subfolder under each home / Shared; namespaced + removable
+
+
+def _scim_account_users(limit):
+    """Fetch up to `limit` ACCOUNT users WITH externalId (SCIM list drops it from the CLI table).
+
+    Returns dicts {id,userName,entra} — the account SCIM id is what PermissionAssignments needs.
+    """
+    a = _acct()
+    acct_id = a.config.account_id
+    out, start = [], 1
+    while len(out) < limit:
+        page = a.api_client.do(
+            "GET", f"/api/2.0/accounts/{acct_id}/scim/v2/Users",
+            query={"count": 200, "startIndex": start,
+                   "attributes": "id,userName,externalId,active"}) or {}
+        res = page.get("Resources") or []
+        if not res:
+            break
+        out.extend(res)
+        start += len(res)
+        if start > (page.get("totalResults") or 0):
+            break
+    return out
+
+
+def _pick_scale_users(n):
+    """Pick n assignable real account users, excluding the base TEST_USERS + me."""
+    skip = {e.lower() for e in TEST_USERS} | {ME.lower()}
+    picked = []
+    for u in _scim_account_users(n * 4):
+        if len(picked) >= n:
+            break
+        un = (u.get("userName") or "").lower()
+        if not un.endswith("@databricks.com") or un in skip:
+            continue
+        if u.get("active") is False:
+            continue
+        picked.append({"id": u.get("id"), "userName": u.get("userName"),
+                       "entra": bool(u.get("externalId"))})
+    return picked
+
+
+def _parallel(items, fn, workers=16, label=""):
+    """Run fn over items on a thread pool; return (ok, failed). SDK calls are stateless/thread-safe."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    ok = failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fn, it): it for it in items}
+        for i, f in enumerate(as_completed(futs), 1):
+            try:
+                f.result()
+                ok += 1
+            except Exception:
+                failed += 1
+            if label and i % 500 == 0:
+                log(f"  {label}: {i}/{len(items)} ({failed} failed)")
+    return ok, failed
+
+
+def phase_scale_identity():
+    """Assign ~150 real account users to the source workspace + create workspace-local SPs/groups.
+
+    The users are a mix of Entra-backed (externalId → 'assign, never recreate') and non-Entra;
+    the workspace-local SPs/groups exercise the 'recreate + remap' path at scale.
+    """
+    from databricks.sdk.service import iam
+    print("== scale identity (assign ~%d account users + local SPs/groups) ==" % SCALE_USERS)
+
+    users = _pick_scale_users(SCALE_USERS)
+    entra = sum(1 for u in users if u["entra"])
+    log(f"selected {len(users)} account users ({entra} Entra-backed, {len(users)-entra} non-Entra)")
+
+    def _assign(u):
+        _assign_to_workspace(u["id"])
+    ok, failed = _parallel(users, _assign, workers=12, label="assign")
+    log(f"assigned {ok}/{len(users)} users to source_ws ({failed} failed)")
+
+    # Resolve each assigned user's workspace path (home) for the content phase.
+    assigned = [u for u in users]
+    json.dump(assigned, open(SCALE_USERS_FILE, "w"))
+    log(f"wrote assigned-user roster → {SCALE_USERS_FILE}")
+
+    # Workspace-local SPs (recreated + remapped on import). SP create does NOT dedupe by name.
+    have_sp = {s.display_name for s in w.service_principals.list()}
+    def _mk_sp(i):
+        name = f"ai27_scale_sp_{i:03d}"
+        if name in have_sp:
+            return
+        w.service_principals.create(display_name=name,
+                                    entitlements=[iam.ComplexValue(value="workspace-access")])
+    ok, failed = _parallel(range(SCALE_SP_COUNT), _mk_sp, workers=8, label="scale-sp")
+    log(f"workspace-local SPs: {ok} ok, {failed} failed (target {SCALE_SP_COUNT})")
+
+    # Workspace-local groups, every 5th nested into the previous (nested-first remap at scale).
+    prev_gid = None
+    made = 0
+    for i in range(SCALE_GRP_COUNT):
+        name = f"ai27_scale_grp_{i:03d}"
+        existing = next(iter(w.groups.list(filter=f'displayName eq "{name}"')), None)
+        if existing:
+            prev_gid = existing.id
+            continue
+        members = [iam.ComplexValue(value=prev_gid)] if (prev_gid and i % 5 == 0) else []
+        try:
+            g = w.groups.create(display_name=name,
+                                entitlements=[iam.ComplexValue(value="databricks-sql-access")],
+                                members=members)
+            prev_gid = g.id
+            made += 1
+        except Exception as e:
+            log(f"  scale grp {name}: {str(e)[:70]}")
+    log(f"workspace-local groups: {made} created (target {SCALE_GRP_COUNT}, every 5th nested)")
+
+
+def _scale_user_paths():
+    """The assigned-user roster written by phase_scale_identity (or just me as a fallback)."""
+    try:
+        return json.load(open(SCALE_USERS_FILE))
+    except Exception:
+        return [{"userName": ME, "entra": True}]
+
+
+def phase_scale_content():
+    """Create ~10K workspace objects spread across the assigned users' home trees + /Shared.
+
+    Each user gets a `/Users/<email>/wsmig_test_scale/` subtree (notebooks + files + a nested
+    dir), namespaced so it is trivially removable and never touches their real content. Creation
+    is parallel; a per-user failure is logged and skipped (a home that will not accept writes is
+    reported, not guessed around).
+    """
+    from databricks.sdk.service import workspace
+    print("== scale content (~%d objects across homes + Shared) ==" %
+          (SCALE_USERS * SCALE_OBJS_PER_USER + SCALE_SHARED_OBJS))
+    users = _scale_user_paths()
+
+    # Pre-check: can we write under another user's home at all? Test the first few; if NONE take
+    # a write, STOP (don't silently build nothing) — that is a real prerequisite surprise.
+    probe_ok = 0
+    for u in users[:3]:
+        root = f"/Users/{u['userName']}/{SCALE_ROOT}"
+        try:
+            w.workspace.mkdirs(root)
+            w.workspace.get_status(root)
+            probe_ok += 1
+        except Exception as e:
+            log(f"  probe write {root}: {str(e)[:80]}")
+    if probe_ok == 0:
+        log("!! STOP: could not write under ANY probed user home — not building scale content")
+        return
+    log(f"home-write probe: {probe_ok}/3 writable — proceeding")
+
+    nb_src = ("# Databricks notebook source\n"
+              "# wsmig scale fixture notebook\nprint('scale')\n")
+    nb_b64 = base64.b64encode(nb_src.encode()).decode()
+    file_bytes = b"col1,col2,col3\n1,2,3\n4,5,6\n"
+
+    def _mk_one(args):
+        base, idx = args
+        if idx % 10 < 7:   # ~70% notebooks
+            w.workspace.import_(path=f"{base}/nb/nb_{idx:04d}",
+                                language=workspace.Language.PYTHON,
+                                format=workspace.ImportFormat.SOURCE,
+                                content=nb_b64, overwrite=True)
+        else:              # ~30% workspace files
+            w.workspace.upload(path=f"{base}/files/file_{idx:04d}.csv",
+                               content=file_bytes,
+                               format=workspace.ImportFormat.RAW, overwrite=True)
+
+    # Build the full work list first (dirs created up front so parallel imports don't race mkdir).
+    worklist = []
+    for u in users:
+        base = f"/Users/{u['userName']}/{SCALE_ROOT}"
+        for sub in ("", "/nb", "/files", "/nested", "/nested/deep"):
+            try:
+                w.workspace.mkdirs(base + sub)
+            except Exception:
+                pass
+        for idx in range(SCALE_OBJS_PER_USER):
+            worklist.append((base, idx))
+        # a couple of deep-nested objects per user
+        worklist.append((base + "/nested/deep", 9000))
+        worklist.append((base + "/nested", 9001))
+    # Shared tree
+    shared_base = f"/Shared/{SCALE_ROOT}"
+    for sub in ("", "/nb", "/files"):
+        try:
+            w.workspace.mkdirs(shared_base + sub)
+        except Exception:
+            pass
+    for idx in range(SCALE_SHARED_OBJS):
+        worklist.append((shared_base, idx))
+
+    log(f"creating {len(worklist)} workspace objects across {len(users)} homes + Shared…")
+    ok, failed = _parallel(worklist, _mk_one, workers=16, label="content")
+    log(f"scale content: {ok} created, {failed} failed")
+
+
+def phase_scale_acls():
+    """Grant ACLs on each scale user's home-tree root dir to the workspace-local scale principals.
+
+    Keeps the grant count bounded (one per user dir) while making those directories' ACLs
+    non-trivial, so the import-side principal remap has real scale-group/SP grants to carry over.
+    The 10K objects' *default* ACLs are what the parallel enrichment pass fetches regardless.
+    """
+    print("== scale ACLs (per-user home-tree dir grants to scale groups/SPs) ==")
+    users = _scale_user_paths()
+    # scale principals to rotate across
+    grps = [g for g in w.groups.list(filter='displayName sw "ai27_scale_grp"')]
+    sps = [s for s in w.service_principals.list(filter='displayName sw "ai27_scale_sp"')]
+    principals = ([("group_name", g.display_name) for g in grps]
+                  + [("service_principal_name", s.application_id) for s in sps])
+    if not principals:
+        log("no scale principals found — run phase_scale_identity first")
+        return
+    log(f"{len(principals)} scale principals, granting on {len(users)} home dirs")
+
+    def _grant(args):
+        i, u = args
+        root = f"/Users/{u['userName']}/{SCALE_ROOT}"
+        st = w.workspace.get_status(root)
+        oid = st.object_id
+        field, value = principals[i % len(principals)]
+        level = ("CAN_READ", "CAN_RUN", "CAN_MANAGE")[i % 3]
+        w.api_client.do("PATCH", f"/api/2.0/permissions/directories/{oid}",
+                        body={"access_control_list": [{field: value,
+                                                       "permission_level": level}]})
+    ok, failed = _parallel(list(enumerate(users)), _grant, workers=12, label="scale-acl")
+    log(f"scale dir ACLs: {ok} granted, {failed} failed")
+
+
+# ───────────────────── B-scenario gap fixtures (PLAN_13) ────────────────────
+
+def phase_b3_policy_family():
+    """B3: a cluster policy created FROM a policy family (family_id + overrides, NOT a raw def).
+
+    Import must send `policy_family_id` + overrides and DROP `definition` (sending both 400s).
+    """
+    print("== B3: policy-family cluster policy ==")
+    name = "wsmig_test_policy_family"
+    if any((p.name == name) for p in w.cluster_policies.list()):
+        log(f"policy exists: {name}")
+        return
+    try:
+        fams = list(w.policy_families.list())
+        if not fams:
+            log("no policy families available on this workspace — skipping B3 fixture")
+            return
+        fam = next((f for f in fams if f.policy_family_id in
+                    ("personal-vm", "job-cluster", "shared-compute")), fams[0])
+        overrides = {"autotermination_minutes": {"type": "fixed", "value": 30}}
+        pol = w.cluster_policies.create(name=name, policy_family_id=fam.policy_family_id,
+                                        policy_family_definition_overrides=json.dumps(overrides))
+        log(f"policy-family policy: {name} ({pol.policy_id}) family={fam.policy_family_id}")
+    except Exception as e:
+        log(f"b3 policy family: {str(e)[:140]}")
+
+
+def phase_b7_dashboards():
+    """B7: the AI/BI dashboard publish/schedule matrix.
+
+    Adds, alongside the base draft dashboard:
+      • a PUBLISHED dashboard that EMBEDS credentials (viewers run as the publisher's identity),
+      • a PUBLISHED dashboard WITHOUT embedded credentials (viewers use their own identity),
+      • a dashboard with a SCHEDULE (so schedule migration has something to carry).
+    """
+    print("== B7: dashboard publish/schedule matrix ==")
+    from databricks.sdk.service.dashboards import Dashboard
+    wh = _warehouse_id()
+    serialized = json.dumps({
+        "datasets": [{"name": "ds1", "displayName": "trips",
+                      "queryLines": [f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"]}],
+        "pages": [{"name": "p1", "displayName": "Page 1",
+                   "layout": [{"position": {"x": 0, "y": 0, "width": 6, "height": 6},
+                               "widget": {"name": "w1",
+                                          "queries": [{"name": "q1", "query": {
+                                              "datasetName": "ds1", "fields": [
+                                                  {"name": "zip", "expression": "`zip`"}],
+                                              "disaggregated": True}}],
+                                          "spec": {"version": 1, "widgetType": "table",
+                                                   "encodings": {}}}}]}],
+    })
+    existing = {d.display_name: d.dashboard_id for d in w.lakeview.list()}
+
+    def _ensure(name):
+        if name in existing:
+            log(f"dashboard exists: {name} ({existing[name]})")
+            return existing[name]
+        d = w.lakeview.create(dashboard=Dashboard(display_name=name, warehouse_id=wh,
+                                                  serialized_dashboard=serialized))
+        log(f"dashboard: {name} ({d.dashboard_id})")
+        return d.dashboard_id
+
+    # Published, embedded credentials (viewer runs as publisher).
+    did_embed = _ensure("wsmig_test_dash_published_embed")
+    try:
+        w.lakeview.publish(dashboard_id=did_embed, embed_credentials=True, warehouse_id=wh)
+        log("  published (embed_credentials=True)")
+    except Exception as e:
+        log(f"  publish embed: {str(e)[:110]}")
+
+    # Published, NO embedded credentials (viewer uses own identity).
+    did_noembed = _ensure("wsmig_test_dash_published_noembed")
+    try:
+        w.lakeview.publish(dashboard_id=did_noembed, embed_credentials=False, warehouse_id=wh)
+        log("  published (embed_credentials=False)")
+    except Exception as e:
+        log(f"  publish noembed: {str(e)[:110]}")
+
+    # A dashboard carrying a SCHEDULE.
+    did_sched = _ensure("wsmig_test_dash_scheduled")
+    try:
+        from databricks.sdk.service.dashboards import Schedule, CronSchedule
+        w.lakeview.create_schedule(dashboard_id=did_sched,
+                                   schedule=Schedule(cron_schedule=CronSchedule(
+                                       quartz_cron_expression="0 0 8 * * ?",
+                                       timezone_id="UTC")))
+        log("  schedule created on wsmig_test_dash_scheduled")
+    except Exception as e:
+        log(f"  schedule: {str(e)[:110]}")
+
+
 # Dependency-ordered: identity before ACLs (needs principals), warehouses+uc before anything
 # that references a warehouse or table, compute+workspace before jobs/libraries, and acls LAST
 # so every object it grants on already exists.
@@ -1679,6 +2013,12 @@ PHASES = {
     "bigfiles": phase_bigfiles,
     "libraries": phase_libraries,
     "acls": phase_acls,
+    # PLAN_13 additions: B6 scale bed + B3/B7 scenario gaps.
+    "scale_identity": phase_scale_identity,
+    "scale_content": phase_scale_content,
+    "scale_acls": phase_scale_acls,
+    "b3_policy_family": phase_b3_policy_family,
+    "b7_dashboards": phase_b7_dashboards,
 }
 
 if __name__ == "__main__":

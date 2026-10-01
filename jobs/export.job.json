@@ -39,7 +39,11 @@
           "migrate_dashboards": "true",
           "migrate_serving": "true",
           "migrate_genie": "true",
-          "migrate_misc": "true"
+          "migrate_misc": "true",
+          "parallel_threads": "",
+          "log_level": "",
+          "state_catalog": "",
+          "state_schema": ""
         }
       }
     }

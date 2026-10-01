@@ -56,6 +56,10 @@ dbutils.widgets.dropdown("retry_mode", "off",
 
 dbutils.widgets.dropdown("preflight_enforce", "true", ["true", "false"],
                          "4d. Fail the run on a preflight NO-GO")
+# NOTE (direct mode): if you set this true, also set `force_full_export=true` on the export task —
+# a direct-mode incremental export omits the bytes of unchanged workspace content, so a force-full
+# import that re-evaluates those units would otherwise have no bytes to re-upload (it fails loud with
+# "no exported content" rather than corrupting, but the pair keeps the bundle complete).
 dbutils.widgets.dropdown("force_full_import", "false", ["true", "false"],
                          "4e. Ignore the checkpoint and re-evaluate every unit")
 dbutils.widgets.dropdown("allow_deletes", "false", ["true", "false"],

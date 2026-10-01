@@ -1,6 +1,6 @@
 {
   "name": "wsmig - airgap source (inventory + export)",
-  "description": "Workspace Migration: SOURCE side for airgap mode — 01_Inventory -> 02_Export. Writes the bundle for ops to move.",
+  "description": "Workspace Migration: SOURCE side for airgap mode \u2014 01_Inventory -> 02_Export. Writes the bundle for ops to move.",
   "run_as": {
     "service_principal_name": "{{RUN_AS_SP}}"
   },
@@ -27,7 +27,9 @@
           "max_scim": "0",
           "max_workspace_items": "0",
           "max_ws_api_calls": "0",
-          "force_full": "false"
+          "force_full": "false",
+          "parallel_threads": "",
+          "log_level": ""
         }
       }
     },
@@ -61,7 +63,9 @@
           "migrate_dashboards": "true",
           "migrate_serving": "true",
           "migrate_genie": "true",
-          "migrate_misc": "true"
+          "migrate_misc": "true",
+          "parallel_threads": "",
+          "log_level": ""
         }
       },
       "depends_on": [

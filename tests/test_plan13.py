@@ -1288,13 +1288,17 @@ def test_b12_every_widget_label_keeps_original_text_with_only_a_numeric_prefix()
 
 def test_b12_prefix_text_matches_the_original_display_name():
     """The text AFTER the `<N><letter>. ` prefix equals the ORIGINAL widget label (prefix-only
-    change) — proven against git HEAD for a representative sample."""
+    change) — proven against the PRE-B12 baseline for a representative sample.
+
+    Pinned to the initial commit (pre-B12), not HEAD: once the B12 branch is committed, HEAD
+    already carries the numeric prefixes, so HEAD is no longer the unprefixed "original" to diff
+    against. `924d4f8` is the root commit that still has the bare labels."""
     import os
     import re
     import subprocess
     nb_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "notebooks")
     cur = _widget_defs(os.path.join(nb_dir, "01_Inventory.py"))
-    head = subprocess.run(["git", "show", "HEAD:notebooks/01_Inventory.py"],
+    head = subprocess.run(["git", "show", "924d4f8:notebooks/01_Inventory.py"],
                           capture_output=True, text=True, cwd=os.path.dirname(nb_dir)).stdout
     orig = {}
     import re as _re
@@ -1337,3 +1341,30 @@ def test_b12_widget_names_and_defaults_unchanged_only_labels():
     assert imp['"catalog_mapping_json"'][0] == '""'
     inv = _widget_defs(os.path.join(nb_dir, "01_Inventory.py"))
     assert inv['"parallel_threads"'][0] == '"1"' and inv['"log_level"'][0] == '"DEBUG"'
+
+
+def test_qa1_installer_and_job_templates_carry_parallel_threads_and_log_level():
+    """QA-1: `parallel_threads` + `log_level` must be exposed by the installer AND present in every
+    job template's task base_parameters — otherwise the deployed jobs always run serial at the
+    notebook defaults and B6 parallelism can never be enabled through the shipped jobs."""
+    import os
+    import json
+    import glob
+    root = os.path.dirname(os.path.dirname(__file__))
+    inst = _widget_defs(os.path.join(root, "notebooks", "00_Install_Jobs.py"))
+    assert inst['"parallel_threads"'][0] == '"1"'
+    assert inst['"log_level"'][0] == '"DEBUG"'
+    installer_src = open(os.path.join(root, "notebooks", "00_Install_Jobs.py")).read()
+    # projected into the config the installer writes into each job
+    assert '"parallel_threads": _w("parallel_threads"' in installer_src
+    assert '"log_level": _w("log_level"' in installer_src
+    # every notebook task in every job template declares both keys so the installer fills them
+    for f in glob.glob(os.path.join(root, "jobs", "*.job.json")):
+        d = json.load(open(f))
+        for t in d.get("tasks", []):
+            nt = t.get("notebook_task")
+            if nt is None:
+                continue
+            bp = nt.get("base_parameters", {})
+            assert "parallel_threads" in bp, f"{os.path.basename(f)}/{t['task_key']} missing parallel_threads"
+            assert "log_level" in bp, f"{os.path.basename(f)}/{t['task_key']} missing log_level"

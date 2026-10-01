@@ -34,59 +34,110 @@ def _cfg(staging, **over):
     return Config.from_dict(d)
 
 
-def _inventory_with_notebook(code: bytes):
-    """A one-notebook inventory plus the client that serves `code` as its bytes."""
+def _inventory_with_notebook(code: bytes, modified_at=None):
+    """A one-notebook inventory plus the client that serves `code` as its bytes.
+
+    `modified_at` is the source last-modified timestamp (epoch ms) — the CHANGE SIGNAL. It is what
+    the fingerprint is built from now; the content bytes are migrated but no longer hashed into the
+    fingerprint (modified_at bumps on every edit, verified live, so it stands in for "content
+    changed" without a byte hash — and lets direct-mode export skip re-fetching unchanged bytes)."""
     objects = {
         "workspace_object": [
             {"object_type": "NOTEBOOK", "path": "/Shared/nb", "object_id": "n1",
-             "language": "PYTHON"},
+             "language": "PYTHON", "modified_at": modified_at},
         ],
     }
     client = FakeClient(download_table={"api/2.0/workspace/export": code})
     return objects, client
 
 
-def _export_once(staging, objects, client, run_id="r1"):
-    """Run only the unit-building + content pass, returning the export index by natural_key."""
+def _export_once(staging, objects, client, run_id="r1", state=None):
+    """Run only the unit-building + content pass, returning the export index by natural_key.
+
+    `state` (optional) is the control table — when passed, export skips re-fetching unchanged
+    workspace content (Edit E, direct-mode incremental)."""
     cfg = _cfg(staging, run_id=run_id)
     aw = ArtifactWriter(cfg)
     aw.ensure_output_path()
     aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": objects})
-    ExportRunner(client, cfg, aw, content_fetch_workers=2).run()
+    ExportRunner(client, cfg, aw, content_fetch_workers=2, state=state).run()
     index = aw.read_json(BP.EXPORT_INDEX_JSON) or {}
     return {(u["asset_type"], u["natural_key"]): u for u in index.get("units", [])}
 
 
+def test_direct_mode_export_skips_refetch_of_unchanged_content():
+    """Edit E: with the control table available, export does NOT re-fetch workspace content whose
+    fingerprint (source modified_at) matches its migrated row — the bytes aren't needed because
+    import SKIPs it from the same table. A changed unit (newer modified_at) IS re-fetched."""
+    from src.state.state_store import StateStore
+    from tests.test_state_store import FakeBackend
+
+    # Baseline export (no state) → the notebook is fetched; capture its modified_at fingerprint.
+    objects, client = _inventory_with_notebook(b"print('x')", modified_at=1000)
+    with tempfile.TemporaryDirectory() as d0:
+        fp = _export_once(d0, objects, client)[("notebook", "/Shared/nb")]["fingerprint"]
+
+    # Seed the control table as if a prior run migrated it at that exact fingerprint.
+    def _state_with(stored_fp):
+        st = StateStore(FakeBackend(), _cfg(tempfile.mkdtemp()))
+        st._cache[("notebook", "/Shared/nb")] = {
+            "asset_type": "notebook", "natural_key": "/Shared/nb",
+            "target_object_id": "/Shared/nb", "last_source_fingerprint": stored_fp}
+        return st
+
+    # Unchanged (same modified_at ⇒ same fingerprint) → NOT re-fetched.
+    objs_same, c_same = _inventory_with_notebook(b"print('x')", modified_at=1000)
+    with tempfile.TemporaryDirectory() as d1:
+        u = _export_once(d1, objs_same, c_same, run_id="r2",
+                         state=_state_with(fp))[("notebook", "/Shared/nb")]
+        assert u["export_status"] == "unchanged", "unchanged content should not be re-fetched"
+        assert not u.get("content_ref"), "an unchanged (not re-fetched) unit carries no content_ref"
+
+    # Edited (newer modified_at ⇒ different fingerprint) → re-fetched (success).
+    objs_edit, c_edit = _inventory_with_notebook(b"print('EDITED')", modified_at=2000)
+    with tempfile.TemporaryDirectory() as d2:
+        u2 = _export_once(d2, objs_edit, c_edit, run_id="r3",
+                          state=_state_with(fp))[("notebook", "/Shared/nb")]
+        assert u2["export_status"] == "success" and u2.get("content_ref"), \
+            "an edited notebook (newer modified_at) must be re-fetched"
+
+
 # ── GAP 1 — notebook CONTENT must be fingerprinted ─────────────────────────
 
-def test_notebook_content_change_moves_the_fingerprint():
-    """THE regression test for GAP 1: same path, different bytes ⇒ different fingerprint.
+def test_notebook_edit_moves_the_fingerprint_via_modified_at():
+    """GAP 1, modified_at era: an edited notebook has a NEWER source `modified_at`, which moves the
+    fingerprint ⇒ the target upsert decides UPDATE (re-upload) instead of SKIP.
 
-    Pre-fix this asserted equal hashes, which is precisely why an edited notebook was SKIPped on
-    import and the target silently kept the old code.
+    The change signal is `modified_at` (not a content hash): it bumps on every edit — verified live
+    against the workspace API — so it detects edits WITHOUT fetching+hashing the bytes, and it lets
+    direct-mode export skip re-fetching unchanged content. The bytes differ here too, but it is the
+    timestamp that drives the fingerprint now.
     """
-    objects, client_v1 = _inventory_with_notebook(b"print('version one')")
+    objects, client_v1 = _inventory_with_notebook(b"print('version one')", modified_at=1000)
     with tempfile.TemporaryDirectory() as d1:
         units_v1 = _export_once(d1, objects, client_v1)
-    objects, client_v2 = _inventory_with_notebook(b"print('version two - edited')")
+    objects, client_v2 = _inventory_with_notebook(b"print('version two - edited')",
+                                                   modified_at=2000)
     with tempfile.TemporaryDirectory() as d2:
         units_v2 = _export_once(d2, objects, client_v2)
 
     fp1 = units_v1[("notebook", "/Shared/nb")]["fingerprint"]
     fp2 = units_v2[("notebook", "/Shared/nb")]["fingerprint"]
     assert fp1.startswith("sha256:") and fp2.startswith("sha256:")
-    assert fp1 != fp2, ("editing a notebook's CONTENT did not move its fingerprint — the target's "
-                        "upsert will SKIP it and keep the OLD code (GAP 1)")
+    assert fp1 != fp2, ("a newer modified_at did not move the notebook's fingerprint — the target's "
+                        "upsert will SKIP an edited notebook and keep the OLD code (GAP 1)")
 
 
-def test_notebook_content_fingerprint_is_stable_when_unchanged():
-    """The other half: identical bytes ⇒ identical fingerprint, so an unchanged notebook SKIPs
-    rather than being pointlessly re-uploaded on every run."""
-    code = b"print('stable')"
-    objects, c1 = _inventory_with_notebook(code)
+def test_notebook_fingerprint_is_stable_when_modified_at_unchanged():
+    """The other half: same `modified_at` ⇒ identical fingerprint, so an unchanged notebook SKIPs
+    rather than being pointlessly re-uploaded (and direct-mode export can skip re-fetching it).
+
+    Note the bytes DIFFER between the two runs but the timestamp does not — proving the fingerprint
+    now tracks modified_at, not the content hash (that is the whole point of the cheaper signal)."""
+    objects, c1 = _inventory_with_notebook(b"print('one')", modified_at=5000)
     with tempfile.TemporaryDirectory() as d1:
         units_a = _export_once(d1, objects, c1)
-    objects, c2 = _inventory_with_notebook(code)
+    objects, c2 = _inventory_with_notebook(b"print('two - but same mtime')", modified_at=5000)
     with tempfile.TemporaryDirectory() as d2:
         units_b = _export_once(d2, objects, c2)
     assert (units_a[("notebook", "/Shared/nb")]["fingerprint"]

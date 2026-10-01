@@ -33,7 +33,7 @@ from src.exporters import bundle_paths as BP
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
 from src.transform.transforms import fingerprint
-from src.utils.helpers import now_iso
+from src.utils.helpers import now_iso, safe_str
 from src.utils.logger import get_logger
 
 _LOG = get_logger("export")
@@ -48,36 +48,53 @@ CHECKPOINT_BATCH = 200
 
 
 def _apply_content_fingerprint(unit: dict, content_sha256: str) -> None:
-    """Re-fingerprint a content unit over `payload + the content hash` (§7c-audit GAP 1).
+    """Record the fetched content hash as METADATA — it no longer drives the fingerprint.
 
-    A notebook/workspace-file unit's payload is only `{path, object_type, language}`, so the
-    fingerprint built at unit-construction time is blind to the file's actual CONTENT. Editing a
-    notebook's code on source therefore produced an IDENTICAL fingerprint, the target's upsert
-    decided SKIP, and the target kept the old code — on a fully green report. Hashing the bytes
-    alongside the payload is what makes "the source changed" detectable for the assets this tool
-    exists to move.
+    The change SIGNAL for a notebook/workspace-file is now the source `modified_at`, folded into
+    the fingerprint at unit-construction time (`asset_export._workspace_units`). `modified_at` bumps
+    on every content edit (verified live), so an edited notebook already moves the fingerprint →
+    the target upsert decides UPDATE — WITHOUT fetching+hashing the bytes just to detect a change.
+    This is what lets direct-mode export SKIP re-fetching unchanged bytes (the fingerprint is known
+    before the fetch), and it keeps the whole decision a cheap control-table comparison.
 
-    `_content_sha256` is a FINGERPRINT INPUT ONLY — it is deliberately not added to `payload`,
-    which must stay a valid create body (the workspace import API would reject the extra field).
-    A blank hash leaves the fingerprint untouched, so a failed/oversize unit (no bytes fetched)
-    keeps its metadata-only hash rather than silently hashing the empty string.
+    We still keep `content_sha256` on the unit as bookkeeping metadata (useful for the manifest /
+    debugging), but it is deliberately NOT mixed back into `fingerprint` — doing so would make the
+    fingerprint depend on bytes we may have skipped fetching, breaking the skip optimisation.
     """
     if not content_sha256:
         return
     unit["content_sha256"] = content_sha256
-    unit["fingerprint"] = fingerprint({**(unit.get("payload") or {}),
-                                       "_content_sha256": content_sha256})
 
 
 class ExportRunner:
     def __init__(self, client, config, artifact_writer, dbutils=None,
-                 content_fetch_workers: int = 8, force_full_export: bool = False) -> None:
+                 content_fetch_workers: int = 8, force_full_export: bool = False,
+                 state=None) -> None:
         self.client = client
         self.config = config
         self.aw = artifact_writer
         self.dbutils = dbutils
         self.workers = int(content_fetch_workers or 1)
         self.force_full = bool(force_full_export)
+        # Optional migration state store (DIRECT mode only — it is target-side, reachable there).
+        # When present, an incremental export skips re-fetching workspace content whose fingerprint
+        # (source modified_at) already matches the control table: the bytes aren't needed because
+        # import will SKIP that unit from the same control table. force_full_export disables it.
+        self.state = state
+
+    def _unchanged_in_state(self, unit: dict) -> bool:
+        """True if this content unit is already migrated AND unchanged per the control table.
+
+        The fingerprint is the source `modified_at` (folded in at unit construction), so a match
+        means the file has not been edited since the run that migrated it — no need to re-download
+        its bytes. A force-full export always re-fetches (never trusts the table)."""
+        if self.state is None or self.force_full:
+            return False
+        row = self.state.row(safe_str(unit.get("asset_type")), safe_str(unit.get("natural_key")))
+        if not row or not safe_str(row.get("target_object_id")):
+            return False
+        return safe_str(row.get("last_source_fingerprint")) == safe_str(unit.get("fingerprint")) \
+            and bool(unit.get("fingerprint"))
 
     # ── inventory input ────────────────────────────────────────────────────
     def _load_inventory(self) -> dict:
@@ -196,7 +213,20 @@ class ExportRunner:
 
         # Split into resumable (already done) vs to-fetch.
         to_fetch = []
+        n_unchanged = 0
         for u in content_units:
+            # DIRECT-mode incremental skip (control table is the source of truth): a unit whose
+            # fingerprint (source modified_at) already matches its migrated state row is UNCHANGED,
+            # so we do NOT re-download its bytes — import will SKIP it from the same table. A
+            # per-object line is logged so progress is visible when monitoring the running job.
+            if self._unchanged_in_state(u):
+                u["export_status"] = "unchanged"
+                u["content_ref"] = None
+                u["note"] = ("unchanged since the last migration (modified_at unmoved) — bytes not "
+                             "re-fetched")
+                n_unchanged += 1
+                _LOG.info("content unchanged → skip fetch", path=u["natural_key"])
+                continue
             done = (not self.force_full) and self.aw.is_done("export:content", u["natural_key"])
             row = cp_results.get(u["natural_key"]) if done else None
             if row is None and done:
@@ -217,8 +247,9 @@ class ExportRunner:
             else:
                 to_fetch.append(u)
 
-        _LOG.info("content pass", to_fetch=len(to_fetch), resumed=len(content_units) - len(to_fetch),
-                  workers=self.workers)
+        _LOG.info("content pass", to_fetch=len(to_fetch),
+                  resumed=len(content_units) - len(to_fetch) - n_unchanged,
+                  unchanged=n_unchanged, workers=self.workers)
 
         # parallel_map YIELDS (item, result, error) as each fetch completes; here item IS the unit
         # and result is the FetchResult (a worker that raised puts the exception in `error`, result
@@ -242,6 +273,7 @@ class ExportRunner:
             unit["export_status"] = res.status
             unit["content_ref"] = res.content_ref
             unit["content_route"] = res.content_route
+            _LOG.info("content fetched", path=unit["natural_key"], status=res.status)
             # Fold the CONTENT hash into the fingerprint — the metadata payload alone cannot
             # detect an edited notebook (§7c-audit GAP 1).
             _apply_content_fingerprint(unit, res.content_sha256)

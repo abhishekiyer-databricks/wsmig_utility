@@ -64,6 +64,11 @@ dbutils.widgets.text("staging_location", "", "2a. Staging location (/Volumes/...
 dbutils.widgets.text("state_catalog", "", "2b. State catalog (shared, must exist)")
 dbutils.widgets.text("state_schema", "", "2c. State schema (shared, must exist)")
 dbutils.widgets.text("account_id", "", "4h. Account id (optional)")
+# Run controls, projected into every task so the deployed jobs actually honour them — without
+# these the notebook widgets fall back to their defaults and parallelism can never be turned on
+# through the installed jobs. parallel_threads=1 is the serial, byte-identical default.
+dbutils.widgets.text("parallel_threads", "1", "5c. Parallel enrichment threads (1 = serial)")
+dbutils.widgets.text("log_level", "DEBUG", "5b. Log level (DEBUG shows every step)")
 
 # COMMAND ----------
 
@@ -151,6 +156,8 @@ _params = {
     "state_catalog": _w("state_catalog"),
     "state_schema": _w("state_schema"),
     "account_id": _w("account_id"),
+    "parallel_threads": _w("parallel_threads", "1"),
+    "log_level": _w("log_level", "DEBUG"),
 }
 
 # Secret handling. The scope pointer is preferred and never puts the secret in a Job param. A raw

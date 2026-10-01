@@ -1342,3 +1342,73 @@ dashboard, with NO duplicate** (UPDATE path via the adopted target id), per B7's
 
 *(The QA agent appends confirmed bugs here — one subsection per bug, with repro + evidence — and reports
 them in its stop-and-ask summary after each run.)*
+
+#### QA-1 (BUG, MED) — B6 `parallel_threads` (and `log_level`) are not exposed by the job templates or `00_Install_Jobs`, so the shipped jobs always run SERIAL
+
+- **Commit under test:** `70c980d` (branch `plan13-backlog-b1-b13`), live on target `ai27-target-ws`.
+- **What:** `parallel_threads` and `log_level` appear in the notebook widgets (`01_Inventory`,
+  `02_Export`, `04_Import` — defaults `"1"` / `"DEBUG"`) and are read by `Config.from_dbutils`, but
+  they are absent from **every** `jobs/*.job.json` task `base_parameters` AND from the installer's
+  `_params` projection in `notebooks/00_Install_Jobs.py`. Verified live:
+  `grep -rn "parallel_threads\|log_level" jobs/*.json notebooks/00_Install_Jobs.py src/utils/job_templates.py`
+  → no matches.
+- **Impact:** a customer who deploys and runs the shipped jobs can NEVER enable B6 parallelism — the
+  inventory/export enrichment and the import always run at `parallel_threads=1` (serial). The entire
+  B6 feature is unreachable through the product's only supported run path (the installed jobs). At the
+  RRL ~1M-asset / ~850K-ACL scale this is the difference between the ~1–2h target and the ~11h serial
+  run B6 was built to fix. `log_level` is likewise pinned to the `DEBUG` default.
+- **Repro:** run `00_Install_Jobs` → inspect any deployed job's import/inventory/export task
+  `base_parameters` → no `parallel_threads` key → notebook falls back to `"1"`.
+- **Fix (suggested):** add `parallel_threads` (and `log_level`) to the installer widgets + `_params`,
+  and to the `base_parameters` of the inventory/export/import tasks in the six `jobs/*.job.json`.
+- **Test workaround (so B6 could still be exercised live):** patched the three deployed jobs via
+  `POST /api/2.2/jobs/reset` to inject `parallel_threads=8` on every notebook task. NOT a product fix —
+  filed here, not applied to source.
+- **RESOLVED 2026-10-01:** `parallel_threads` + `log_level` added to `00_Install_Jobs` widgets +
+  `_params`, and to the `base_parameters` of every notebook task in all six `jobs/*.job.json`. Labels
+  are verbatim the existing notebooks' (no plan tags in widget text). Test:
+  `test_qa1_installer_and_job_templates_carry_parallel_threads_and_log_level`.
+
+#### QA-2 (BUG, HIGH) — `WorkspaceImporter.existing_keys()` is a SERIAL, SILENT, un-parallelized per-unit `get-status` pre-pass that does not scale (B6 does not cover it)
+
+- **Commit under test:** `70c980d` (branch `plan13-backlog-b1-b13`), live on target `ai27-target-ws`,
+  live run_id `133961554258847` (`parallel_threads=8`), source bed ~9,500 workspace objects across 150
+  user homes.
+- **What:** `src/importers/workspace_importer.py:144 existing_keys()` loops over **every** workspace
+  unit and issues a serial `workspace/get-status` per unit (workspace_importer.py:162), AND for each
+  unit first calls `_resolve_home_target(path)` → `base_importer._home_present()` (base_importer.py:636)
+  which, because it deliberately does **not** cache a transient ABSENT home (correct for the B8
+  self-heal re-sweep), re-probes the home root on **every** descendant unit. Net: ≈2 serial
+  `get-status` calls per unit (≈19,000 for this bed; ~9,400 of them redundant re-probes of the same 150
+  absent home roots). B6 Scope-2 parallelism only wraps the per-unit *processing* loop
+  (`_run_parallel`), NOT `existing_keys()` — so this pass runs single-threaded regardless of
+  `parallel_threads`.
+- **Impact (live-observed):** on this first-time migration the import sat in `existing_keys()` for
+  **~20+ minutes with ZERO target writes and ZERO log output** — the phase's `importing |
+  component=workspace …` line prints only *after* `existing_keys()` returns, so the notebook cell froze
+  on `compute phase done` and the run was indistinguishable from a hang. At the RRL ~1M-asset scale this
+  is **hours** of serial existence-probing — the precise failure mode B6 was built to fix, left
+  uncovered. On a FIRST run the whole pass is also wasted: every probe returns absent and the create
+  path's `RESOURCE_ALREADY_EXISTS` adopt would reach the "equivalent outcome, cheaper" the docstring
+  itself cites.
+- **Repro:** direct-mode live import of a bundle with thousands of workspace objects under
+  not-yet-provisioned target homes → long silent stall before the workspace phase logs anything.
+- **Fix (suggested):** (a) parallelize `existing_keys()` with the same bounded pool B6 uses (it is pure
+  independent reads); (b) cache the absent-home result *for the duration of `existing_keys()`* so 150
+  homes are probed once, not 9,400×; (c) emit periodic progress during the pre-pass; and/or (d) on a
+  first run (empty state) skip the probe and rely on the create-path adopt the docstring already
+  endorses. Relates to QA-1 (parallelism not wired into jobs) and PLAN_12 (ACL-enrichment parallelization).
+- **RESOLVED 2026-10-01 (chosen fix — control table IS the source of truth, user-directed):**
+  `WorkspaceImporter.existing_keys()` now derives existence from the in-memory control table
+  (`StateStore.migrated_keys("directory","notebook","workspace_file")`) with **ZERO** live API calls —
+  the per-object `get-status` probe is gone, so the workspace phase starts and logs a per-object line
+  immediately. The CHANGE SIGNAL moved from a content SHA to the source **`modified_at`** (free in the
+  bulk `workspace/list`, verified live to bump on edit), folded into the fingerprint at export; content
+  bytes are still migrated but no longer hashed into the signal. Create-path `RESOURCE_ALREADY_EXISTS`
+  adopt remains the untracked-object safety net; `force_full_import` re-evaluates everything. Direct-mode
+  export additionally **skips re-fetching** unchanged bytes (fingerprint matches the control table) with
+  per-object progress logging (Edit E), guarded so `force_full_import` pairs with `force_full_export`.
+  Tests: `test_qa2_existing_keys_derives_from_control_table_with_zero_api_calls`,
+  `test_qa2_create_skip_update_decided_from_control_table`,
+  `test_direct_mode_export_skips_refetch_of_unchanged_content`, and the modified_at pair in
+  `test_fingerprint_gaps.py`. Full offline suite: 436 passed.
