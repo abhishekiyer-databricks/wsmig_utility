@@ -482,9 +482,11 @@ def test_b8_home_still_absent_at_resweep_is_clean_prerequisite_not_mkdird():
     assert client.posts_to("workspace/mkdirs") == []
 
 
-def test_b8_home_present_cache_does_not_pin_a_transient_absent():
-    """_home_present caches only a settled PRESENT — a later probe of a home that has appeared
-    returns True (the old whole-run 'absent' cache was the endless-failed_only bug)."""
+def test_b8_home_present_caches_within_a_pass_and_resweep_reset_re_detects():
+    """_home_present caches the verdict (present AND absent) WITHIN a pass so a 10K-object content
+    phase makes ~1 probe per owner, not one per unit (the probe explosion that caused a 7h phase).
+    A home that provisions LATER is re-detected because the re-sweep RESETS `_home_present_cache` —
+    not by re-probing on every call within the same pass."""
     h = _import_test_helpers()
     from src.importers.workspace_importer import WorkspaceImporter
     home = "/Users/appears@x.com"
@@ -493,9 +495,11 @@ def test_b8_home_present_cache_does_not_pin_a_transient_absent():
         def __init__(self, **kw):
             super().__init__(**kw)
             self.present = False
+            self.probes = 0
 
         def get(self, path, params=None):
             if path == "api/2.0/workspace/get-status" and (params or {}).get("path") == home:
+                self.probes += 1
                 if self.present:
                     return {"path": home, "object_id": "h1"}
                 raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
@@ -504,8 +508,17 @@ def test_b8_home_present_cache_does_not_pin_a_transient_absent():
     client = _Flip()
     imp, _st = h._make(WorkspaceImporter, [], client, identity_map={"sp_mapping": {}})
     assert imp._home_present(home) is False
+    # Within the SAME pass the absent verdict is cached — repeated checks do NOT re-probe (this is
+    # the fix: ~1 probe per owner, not per unit). Even if the home appears, the cached pass-verdict
+    # stands until the pass ends; the deferred unit is healed by the re-sweep, not mid-pass.
     client.present = True
-    assert imp._home_present(home) is True, "a transient absent must not be pinned in the cache"
+    for _ in range(5):
+        assert imp._home_present(home) is False
+    assert client.probes == 1, "absent must be cached within a pass (one probe, not one per call)"
+    # The end-of-phase re-sweep resets the cache (see _resweep_deferred_homes) → fresh re-detect.
+    imp._home_present_cache = {}
+    assert imp._home_present(home) is True
+    assert client.probes == 2
 
 
 def test_b8_runner_resweeps_home_content_just_before_acls():

@@ -42,6 +42,26 @@ NON_ENTRA_USER = "vivek.ravichandran@databricks.com"
 TEST_USERS = ENTRA_USERS + [NON_ENTRA_USER]
 # The Entra/UMI-backed service principal to assign (must already exist in the account).
 UMI_SP_NAME = "ai27_umi"
+# Genuinely Entra-backed SPs for the fixture. A guest (`#EXT#`) CAN create Entra apps/SPs (only
+# group-create is denied), so these are made as REAL Entra apps (idempotently via `az`), surfaced
+# as ACCOUNT SPs carrying the app's applicationId + objectId(externalId), then assigned to the
+# workspace — the externalId then survives into the workspace SCIM view (verified live), so they
+# classify as Entra-backed, not DB-managed. Entitlements are workspace-scoped, set per SP.
+ENTRA_SP_SPECS = {
+    "ai27_wsmig_entra_sp1": ["allow-cluster-create"],
+    "ai27_wsmig_entra_sp2": ["databricks-sql-access", "allow-instance-pool-create"],
+}
+# Two REAL Entra security groups the customer pre-created for this fixture. Using their genuine
+# objectIds as externalId makes the Databricks account groups TRULY Entra-backed — unlike the old
+# synthetic-uuid groups, which the account console flagged "removed from identity provider".
+REAL_ENTRA_GROUPS = {
+    "ai27entragrp1": "d4208f1a-00f0-4cf3-94b1-58408cf750f3",
+    "ai27entragrp2": "456c4ce2-484b-4b72-9f52-d75d7fa2b42a",
+}
+# Genuine ACCOUNT-level (Databricks-managed, NO externalId) groups → assigned to the workspace.
+# These exercise the "account group: assign to target WS, never recreate" path, distinct from both
+# Entra-backed (externalId) and workspace-local (recreate+remap) groups.
+ACCOUNT_GROUPS = ["ai27_account_grp1"]
 
 w = WorkspaceClient(profile=PROFILE)
 
@@ -120,6 +140,13 @@ def _aad_object_id(name: str) -> tuple[str, str]:
     """
     import uuid
 
+    # Preferred: a REAL Entra security group the customer pre-created for this fixture. Its genuine
+    # objectId makes the Databricks group truly Entra-backed (the account console then shows it as a
+    # provisioned group, not "removed from identity provider"). These are groups made FOR us, so —
+    # unlike borrowing a stranger's group — there is nothing to accidentally hijack.
+    if name in REAL_ENTRA_GROUPS:
+        return REAL_ENTRA_GROUPS[name], "real Entra group (customer-provided objectId)"
+
     r = _az("ad", "group", "show", "--group", name, "-o", "json")
     if not r.returncode:
         return json.loads(r.stdout)["id"], "own AAD group"
@@ -140,8 +167,15 @@ def _entra_group(name: str, members: list[str] | None = None) -> str | None:
     The collector classifies a group as Entra/SCIM-managed by the presence of `externalId`, and
     the WORKSPACE SCIM API silently drops it — so this has to be an ACCOUNT group carrying an
     externalId, then assigned into the workspace.
+
+    HEALS a stale externalId: an older run may have made this group with a *synthetic* uuid (the
+    account console flags those "removed from identity provider"). If the desired objectId is now a
+    REAL Entra group and the existing one differs, the group is deleted + recreated so it becomes
+    genuinely Entra-backed. Members (account ids) are set on create and PATCHed in on re-run.
     """
+    from databricks.sdk.service import iam
     object_id, provenance = _aad_object_id(name)
+    members = list(members or [])
     log(f"entra group {name}: externalId={object_id} ({provenance})")
 
     a = _acct()
@@ -153,13 +187,27 @@ def _entra_group(name: str, members: list[str] | None = None) -> str | None:
         if existing is not None:
             log(f"  found by externalId under a DIFFERENT name: {existing.display_name!r} "
                 f"— a SCIM connector has claimed it")
+    if existing and existing.external_id and existing.external_id != object_id:
+        # stale/synthetic externalId → convert to the real one (recreate; externalId is immutable)
+        log(f"  healing stale externalId {existing.external_id} → {object_id} (recreate)")
+        a.groups.delete(id=existing.id)
+        existing = None
     if existing:
         log(f"account group exists: {existing.display_name!r} "
             f"(id={existing.id}, ext={existing.external_id})")
         gid = existing.id
+        have = {m.value for m in (existing.members or [])}
+        missing = [m for m in members if m not in have]
+        if missing:
+            a.groups.patch(id=gid,
+                           schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+                           operations=[iam.Patch(op=iam.PatchOp.ADD, path="members",
+                                                 value=[{"value": m} for m in missing])])
+            log(f"  +{len(missing)} members added")
     else:
-        g = a.groups.create(display_name=name, external_id=object_id)
-        log(f"account group created: {name} (id={g.id}, ext={object_id})")
+        g = a.groups.create(display_name=name, external_id=object_id,
+                            members=[iam.ComplexValue(value=m) for m in members])
+        log(f"account group created: {name} (id={g.id}, ext={object_id}, members={len(members)})")
         gid = g.id
     try:
         _assign_to_workspace(gid)
@@ -167,6 +215,101 @@ def _entra_group(name: str, members: list[str] | None = None) -> str | None:
     except Exception as e:
         log(f"  assign {name}: {str(e)[:110]}")
     return gid
+
+
+def _entra_backed_sp(name: str, entitlements: list[str] | None = None) -> str | None:
+    """A genuinely Entra-backed service principal.
+
+    A guest (`#EXT#`) CAN create Entra apps/SPs. So: create (idempotently) a REAL Entra app via
+    `az`, then make an ACCOUNT SP carrying its applicationId + objectId(externalId) and assign it
+    to the workspace. The externalId SURVIVES into the workspace SCIM view (verified live) because
+    the SP is account-created + assigned, not workspace-created — so it classifies as Entra-backed.
+    Entitlements are workspace-scoped, PATCHed on the workspace SP once assigned.
+    """
+    from databricks.sdk.service import iam
+    a = _acct()
+    acct_sp = next(iter(a.service_principals.list(filter=f'displayName eq "{name}"')), None)
+    if acct_sp:
+        log(f"entra SP exists: {name} (appId={acct_sp.application_id}, ext={acct_sp.external_id})")
+    else:
+        # Create (or reuse) the Entra app → appId + objectId.
+        r = _az("ad", "app", "show", "--id", name, "-o", "json")  # by displayName fails; create path
+        r = _az("ad", "app", "list", "--filter", f"displayName eq '{name}'", "-o", "json")
+        apps = json.loads(r.stdout) if not r.returncode and r.stdout.strip() else []
+        if apps:
+            app = apps[0]
+        else:
+            r = _az("ad", "app", "create", "--display-name", name, "-o", "json")
+            if r.returncode:
+                log(f"  entra app create {name}: {r.stderr[:120]}")
+                return None
+            app = json.loads(r.stdout)
+        app_id, obj_id = app["appId"], app["id"]
+        acct_sp = a.service_principals.create(display_name=name, application_id=app_id,
+                                              external_id=obj_id, active=True)
+        log(f"entra SP created: {name} (appId={app_id}, ext={obj_id})")
+    try:
+        _assign_to_workspace(acct_sp.id)
+        log(f"  + assigned to workspace: {name}")
+    except Exception as e:
+        log(f"  assign {name}: {str(e)[:110]}")
+    if entitlements:
+        ws_sp = next(iter(w.service_principals.list(filter=f'displayName eq "{name}"')), None)
+        if ws_sp:
+            try:
+                w.service_principals.patch(
+                    id=ws_sp.id,
+                    schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+                    operations=[iam.Patch(op=iam.PatchOp.ADD, path="entitlements",
+                                          value=[{"value": e} for e in entitlements])])
+                log(f"  entitlements on {name}: {', '.join(entitlements)}")
+            except Exception as e:
+                log(f"  entitlements {name}: {str(e)[:90]}")
+    return acct_sp.id
+
+
+def _account_group(name: str, members: list[str] | None = None) -> str | None:
+    """A genuine ACCOUNT-level (Databricks-managed, NO externalId) group assigned to the workspace.
+
+    Distinct from Entra-backed (externalId) and workspace-local (recreate+remap): the importer's
+    job is to ASSIGN it to the target WS, never recreate it. Members are account-level ids.
+    """
+    from databricks.sdk.service import iam
+    members = list(members or [])
+    a = _acct()
+    existing = next(iter(a.groups.list(filter=f'displayName eq "{name}"')), None)
+    if existing:
+        gid = existing.id
+        have = {m.value for m in (existing.members or [])}
+        missing = [m for m in members if m not in have]
+        if missing:
+            a.groups.patch(id=gid,
+                           schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+                           operations=[iam.Patch(op=iam.PatchOp.ADD, path="members",
+                                                 value=[{"value": m} for m in missing])])
+        log(f"account group exists: {name} (id={gid}, +{len(missing)} members)")
+    else:
+        g = a.groups.create(display_name=name,
+                            members=[iam.ComplexValue(value=m) for m in members])
+        gid = g.id
+        log(f"account group created: {name} (id={gid}, no externalId, members={len(members)})")
+    try:
+        _assign_to_workspace(gid)
+        log(f"  + assigned to workspace: {name}")
+    except Exception as e:
+        log(f"  assign {name}: {str(e)[:110]}")
+    return gid
+
+
+def _acct_user_ids(emails: list[str]) -> list[str]:
+    """Resolve account-level user ids for the given emails (members for account/Entra groups)."""
+    a = _acct()
+    ids = []
+    for em in emails:
+        u = next(iter(a.users.list(filter=f'userName eq "{em}"')), None)
+        if u:
+            ids.append(u.id)
+    return ids
 
 
 def phase_identity():
@@ -213,9 +356,20 @@ def phase_identity():
         except Exception as e:
             log(f"  entitlements {email}: {str(e)[:90]}")
 
-    # 2. Entra-backed groups (account group carrying an externalId → assigned to workspace).
-    _entra_group("wsmig_test_entra_grp")
-    _entra_group("wsmig_test_entra_grp2")
+    # 2. Entra-backed groups — REAL Entra security groups (customer-created), carried as account
+    #    groups with the genuine objectId as externalId + real Entra-user members → assigned to WS.
+    #    (Supersedes the old synthetic-uuid `wsmig_test_entra_grp*`, which the account console
+    #    flagged "removed from identity provider"; _entra_group heals those on sight.)
+    _entra_grp_members = _acct_user_ids(ENTRA_USERS[:2])
+    for _eg in REAL_ENTRA_GROUPS:
+        _entra_group(_eg, members=_entra_grp_members)
+
+    # 2b. Genuine ACCOUNT-level groups (Databricks-managed, NO externalId) → assigned to WS. The
+    #     importer must ASSIGN these to the target, never recreate them (distinct from both the
+    #     Entra-backed groups above and the workspace-local groups below).
+    _acct_grp_members = _acct_user_ids([ENTRA_USERS[1], NON_ENTRA_USER])
+    for _ag in ACCOUNT_GROUPS:
+        _account_group(_ag, members=_acct_grp_members)
 
     # 3. Databricks-managed groups (workspace-local, no externalId) + entitlements
     def mk_group(name, entitlements=None, members=None):
@@ -326,6 +480,12 @@ def phase_identity():
             except Exception as e:
                 log(f"  entitlements {UMI_SP_NAME}: {str(e)[:90]}")
 
+    # 5b. Genuinely Entra-backed SPs — real Entra apps surfaced as account SPs (appId + externalId)
+    #     and assigned to the workspace; the externalId survives into the WS SCIM view so they
+    #     classify as Entra-backed (NOT the workspace-local db-managed SPs of section 4).
+    for _sp_name, _ents in ENTRA_SP_SPECS.items():
+        _entra_backed_sp(_sp_name, entitlements=_ents)
+
     # 6. An OAuth secret on a DB-managed SP — the has_secrets flag (values never exported).
     #    Secrets are an ACCOUNT-level sub-resource, so this goes through the account client even
     #    though the SP itself was created workspace-locally.
@@ -348,7 +508,8 @@ def phase_identity():
     # 7. A group mixing all three member kinds — user + SP + Entra-backed group. Runs LAST so the
     #    SPs and the Entra group it references already exist.
     mixed = []
-    ent_grp = next(iter(w.groups.list(filter='displayName eq "wsmig_test_entra_grp"')), None)
+    ent_grp = next(iter(w.groups.list(
+        filter=f'displayName eq "{next(iter(REAL_ENTRA_GROUPS))}"')), None)
     if ent_grp:
         mixed.append(ent_grp.id)
     for sp_name in ("wsmig_test_db_sp", "wsmig_test_db_sp2"):
@@ -734,6 +895,19 @@ def phase_sql():
                                             timezone_id="UTC"))
         r = w.alerts_v2.create_alert(alert=av2)
         log(f"alert_v2: wsmig_test_alert_v2 ({getattr(r,'id',None)})")
+        # A SECOND alert_v2 — different operator + UNSCHEDULED — alerts have been bug-prone
+        # (alert_v2 update-detected-but-never-applied, object-type spellings), so cover >1 shape.
+        ev2 = AlertV2Evaluation(
+            comparison_operator=ComparisonOperator.LESS_THAN,
+            source=AlertV2OperandColumn(name="c"),
+            threshold=AlertV2Operand(value=AlertV2OperandValue(double_value=1000000)))
+        av2b = AlertV2(display_name="wsmig_test_alert_v2_b", warehouse_id=wh,
+                       query_text=f"SELECT count(*) AS c FROM {CATALOG}.{SCHEMA}.zones",
+                       evaluation=ev2,
+                       schedule=CronSchedule(quartz_cron_schedule="0 0 18 * * ?",
+                                             timezone_id="UTC"))
+        rb = w.alerts_v2.create_alert(alert=av2b)
+        log(f"alert_v2: wsmig_test_alert_v2_b ({getattr(rb,'id',None)})")
     except Exception as e:
         log(f"alert_v2: {str(e)[:140]}")
 
@@ -777,7 +951,10 @@ def _legacy_data_source_id(warehouse_id):
 # ─────────────────────────── Genie space ───────────────────────────────────
 
 def phase_genie():
-    print("== genie space ==")
+    """Two Genie spaces, so the bed exercises more than one AND the ACL matrix grants on both
+    (a single space couldn't prove the genie ACL remap repeats across spaces). A DAB-deployed Genie
+    space is added separately by phase_dab (bundle `genie_spaces` resource)."""
+    print("== genie spaces (2 directly-created) ==")
     wh = _warehouse_id()
     serialized = json.dumps({
         "version": 2,
@@ -785,43 +962,76 @@ def phase_genie():
             {"identifier": f"{CATALOG}.{SCHEMA}.trips"},
             {"identifier": f"{CATALOG}.{SCHEMA}.zones"}]},
     })
+    existing = {}
     try:
         for sp in (w.genie.list_spaces().spaces or []):
-            if sp.title == "wsmig_test_genie":
-                log(f"genie space exists: wsmig_test_genie ({sp.space_id})")
-                return
+            if sp.title:
+                existing[sp.title] = sp.space_id
     except Exception as e:
         log(f"genie list: {str(e)[:80]}")
-    try:
-        r = w.genie.create_space(warehouse_id=wh, serialized_space=serialized,
-                                 title="wsmig_test_genie", description="test genie space")
-        log(f"genie space: wsmig_test_genie ({getattr(r,'space_id',None)})")
-    except Exception as e:
-        log(f"genie: {str(e)[:150]}")
+    for title, desc in (("wsmig_test_genie", "test genie space (trips + zones)"),
+                        ("wsmig_test_genie2", "second genie space (multi-space + ACL coverage)")):
+        if title in existing:
+            log(f"genie space exists: {title} ({existing[title]})")
+            continue
+        try:
+            r = w.genie.create_space(warehouse_id=wh, serialized_space=serialized,
+                                     title=title, description=desc)
+            log(f"genie space: {title} ({getattr(r, 'space_id', None)})")
+        except Exception as e:
+            log(f"genie {title}: {str(e)[:150]}")
 
 
 # ─────────────────────────── Lakeview (AI/BI) dashboard ────────────────────
 
+def _active_dashboards() -> dict:
+    """`{display_name: dashboard_id}` for NON-trashed Lakeview dashboards.
+
+    `lakeview.list()` returns TRASHED dashboards too, so a plain name match would treat a trashed
+    dashboard as "exists" and (a) skip recreating it and (b) fail any publish/schedule on the dead
+    id. Filter them out so re-creating after a cleanup works and existence means a live object."""
+    out = {}
+    for d in w.lakeview.list():
+        if "TRASHED" in str(getattr(d, "lifecycle_state", "") or ""):
+            continue
+        if d.display_name:
+            out[d.display_name] = d.dashboard_id
+    return out
+
+
+def _valid_dashboard_serialized() -> str:
+    """A RENDERING AI/BI dashboard draft (lvdash.json): one counter widget over `trips`.
+
+    The renderer binds a widget to a query named **`main_query`** (naming it `main` gave
+    "Missing query 'main_query'"); the counter's `encodings.value.fieldName` must match a field the
+    query produces. Dataset = raw `trips` rows; the counter aggregates `COUNT(zip)` → one number.
+    Kept to a SINGLE counter: the create API accepts structurally-invalid widgets, so render
+    validity cannot be confirmed programmatically — a counter is the lowest-risk rendering widget."""
+    return json.dumps({
+        "datasets": [
+            {"name": "ds_trips", "displayName": "trips",
+             "queryLines": [f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"]},
+        ],
+        "pages": [{"name": "page_main", "displayName": "Overview", "layout": [
+            {"widget": {"name": "counter_trips",
+                        "queries": [{"name": "main_query", "query": {
+                            "datasetName": "ds_trips",
+                            "fields": [{"name": "trip_count", "expression": "COUNT(`zip`)"}],
+                            "disaggregated": False}}],
+                        "spec": {"version": 2, "widgetType": "counter",
+                                 "encodings": {"value": {"fieldName": "trip_count",
+                                                         "displayName": "Trip count"}}}},
+             "position": {"x": 0, "y": 0, "width": 3, "height": 4}}]}],
+    })
+
+
 def phase_dashboards():
     print("== lakeview (AI/BI) dashboard ==")
     wh = _warehouse_id()
-    serialized = json.dumps({
-        "datasets": [{"name": "ds1", "displayName": "trips",
-                      "queryLines": [f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"]}],
-        "pages": [{"name": "p1", "displayName": "Page 1",
-                   "layout": [{"position": {"x": 0, "y": 0, "width": 6, "height": 6},
-                               "widget": {"name": "w1",
-                                          "queries": [{"name": "q1", "query": {
-                                              "datasetName": "ds1", "fields": [
-                                                  {"name": "zip", "expression": "`zip`"}],
-                                              "disaggregated": True}}],
-                                          "spec": {"version": 1, "widgetType": "table",
-                                                   "encodings": {}}}}]}],
-    })
-    for d in w.lakeview.list():
-        if d.display_name == "wsmig_test_dashboard":
-            log(f"lakeview dashboard exists: wsmig_test_dashboard ({d.dashboard_id})")
-            return
+    serialized = _valid_dashboard_serialized()
+    if "wsmig_test_dashboard" in _active_dashboards():
+        log("lakeview dashboard exists: wsmig_test_dashboard")
+        return
     try:
         from databricks.sdk.service.dashboards import Dashboard
         d = w.lakeview.create(dashboard=Dashboard(
@@ -1180,19 +1390,28 @@ def phase_dab():
         return
     cli, env = _bundle_cli(), _bundle_env()
     wh = _warehouse_id()
+    # The CLI's U2M OAuth token-cache collides across multiple profiles/workspaces on one machine
+    # ("Refresh token context does not match the request context"), which breaks `bundle deploy -p`.
+    # The SDK auth works, so mint a bearer token from it and give the deploy DIRECT host+token auth
+    # (no profile), bypassing the broken cache refresh. Fall back to -p if no token can be minted.
+    _bearer = (w.config.authenticate() or {}).get("Authorization", "").replace("Bearer ", "")
+    if _bearer:
+        env = dict(env, DATABRICKS_HOST=w.config.host, DATABRICKS_TOKEN=_bearer)
+        env.pop("DATABRICKS_CONFIG_PROFILE", None)
+        deploy_cmd = [cli, "bundle", "deploy"]
+    else:
+        deploy_cmd = [cli, "bundle", "deploy", "-p", PROFILE]
 
-    dash_serialized = json.dumps({
-        "datasets": [{"name": "ds1", "displayName": "trips",
-                      "queryLines": [f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"]}],
-        "pages": [{"name": "p1", "displayName": "Page 1",
-                   "layout": [{"position": {"x": 0, "y": 0, "width": 6, "height": 6},
-                               "widget": {"name": "w1",
-                                          "queries": [{"name": "q1", "query": {
-                                              "datasetName": "ds1",
-                                              "fields": [{"name": "zip", "expression": "`zip`"}],
-                                              "disaggregated": True}}],
-                                          "spec": {"version": 1, "widgetType": "table",
-                                                   "encodings": {}}}}]}],
+    # Valid, rendering dashboard (shared helper) — the old inline def used an empty-encodings table
+    # over a `zip` field, so the DAB-deployed dashboard rendered "Invalid widget definition" too.
+    dash_serialized = _valid_dashboard_serialized()
+    # A Genie space the bundle deploys (DAB-managed twin of the directly-created ones) — same
+    # trips+zones data sources, so the DAB-detection path is exercised for genie as well.
+    genie_serialized = json.dumps({
+        "version": 2,
+        "data_sources": {"tables": [
+            {"identifier": f"{CATALOG}.{SCHEMA}.trips"},
+            {"identifier": f"{CATALOG}.{SCHEMA}.zones"}]},
     })
 
     for tag, root_path in (("shared", "/Shared/.bundle/wsmig_test_shared"),
@@ -1207,6 +1426,8 @@ def phase_dab():
                     f"    return spark.read.table('{CATALOG}.{SCHEMA}.trips')\n")
         with open(f"{d}/dab_dash.lvdash.json", "w") as f:
             f.write(dash_serialized)
+        with open(f"{d}/dab_genie.json", "w") as f:
+            f.write(genie_serialized)
         bundle = f"""
 bundle:
   name: wsmig_test_{tag}
@@ -1240,11 +1461,15 @@ resources:
       display_name: wsmig_dab_{tag}_dashboard
       warehouse_id: {wh}
       file_path: ./dab_dash.lvdash.json
+  genie_spaces:
+    wsmig_dab_{tag}_genie:
+      title: wsmig_dab_{tag}_genie
+      warehouse_id: {wh}
+      file_path: ./dab_genie.json
 """
         with open(f"{d}/databricks.yml", "w") as f:
             f.write(bundle)
-        r = subprocess.run([cli, "bundle", "deploy", "-p", PROFILE],
-                           cwd=d, capture_output=True, text=True, env=env)
+        r = subprocess.run(deploy_cmd, cwd=d, capture_output=True, text=True, env=env)
         if r.returncode:
             log(f"dab {tag} deploy FAILED: {(r.stderr or r.stdout)[-400:]}")
         else:
@@ -1486,17 +1711,24 @@ def _acl_principals():
     # so the coverage report below counts real principals, not collapsed duplicate labels.
     for gname, kind in (("wsmig_test_parent_grp", "db group (parent)"),
                         ("wsmig_test_child_grp", "db group (child)"),
-                        ("wsmig_test_entra_grp", "entra group"),
+                        (next(iter(REAL_ENTRA_GROUPS)), "entra group"),
+                        ("ai27_account_grp1", "account group"),
                         ("wsmig_test_plain_grp", "db group (plain)")):
         g = next(iter(w.groups.list(filter=f'displayName eq "{gname}"')), None)
         if g:
             out.append(("group_name", gname, kind))
-    # Both SPs, so the SP-remap path gets more than a single grant.
+    # Both db-managed SPs, so the SP-remap path gets more than a single grant.
     for sp_name in ("wsmig_test_db_sp", "wsmig_test_db_sp2"):
         sp = next(iter(w.service_principals.list(
             filter=f'displayName eq "{sp_name}"')), None)
         if sp:
             out.append(("service_principal_name", sp.application_id, f"db SP ({sp_name[-1]})"))
+    # An Entra-backed SP (stable appId, identity preserved on target — NOT remapped), so the ACL
+    # replay covers the "keep the applicationId" principal kind too.
+    esp = next(iter(w.service_principals.list(
+        filter=f'displayName eq "{next(iter(ENTRA_SP_SPECS))}"')), None)
+    if esp:
+        out.append(("service_principal_name", esp.application_id, "entra SP"))
     return out
 
 
@@ -1820,21 +2052,43 @@ def phase_scale_content():
         return
     log(f"home-write probe: {probe_ok}/3 writable — proceeding")
 
-    nb_src = ("# Databricks notebook source\n"
-              "# wsmig scale fixture notebook\nprint('scale')\n")
-    nb_b64 = base64.b64encode(nb_src.encode()).decode()
-    file_bytes = b"col1,col2,col3\n1,2,3\n4,5,6\n"
+    # Varied notebook LANGUAGES + file TYPES so the bed exercises every content kind, not just one.
+    # Each object's content embeds its index, so every object is UNIQUE — exercising per-object
+    # fingerprint / modified_at (identical bytes everywhere would have hidden content-change bugs).
+    _NB_LANGS = [workspace.Language.PYTHON, workspace.Language.SQL,
+                 workspace.Language.SCALA, workspace.Language.R]
+    _FILE_EXTS = ["csv", "json", "txt", "py"]
+
+    def _nb_source(lang, idx) -> str:
+        if lang == workspace.Language.SQL:
+            return f"-- Databricks notebook source\n-- wsmig scale {idx}\nSELECT {idx} AS n;\n"
+        if lang == workspace.Language.SCALA:
+            return f"// Databricks notebook source\n// wsmig scale {idx}\nprintln(\"scale {idx}\")\n"
+        # PYTHON and R both use '#' line comments
+        return f"# Databricks notebook source\n# wsmig scale {idx}\nprint('scale {idx}')\n"
+
+    def _file_body(ext, idx) -> bytes:
+        if ext == "json":
+            return (f'{{"idx": {idx}, "kind": "scale"}}\n').encode()
+        if ext == "txt":
+            return (f"wsmig scale fixture file {idx}\n").encode()
+        if ext == "py":
+            return (f"# plain python workspace file {idx}\nx = {idx}\n").encode()
+        return (f"col1,col2,col3\n{idx},2,3\n{idx + 1},5,6\n").encode()   # csv
 
     def _mk_one(args):
         base, idx = args
-        if idx % 10 < 7:   # ~70% notebooks
+        if idx % 10 < 7:   # ~70% notebooks — rotate across the four languages
+            lang = _NB_LANGS[idx % len(_NB_LANGS)]
+            src = base64.b64encode(_nb_source(lang, idx).encode()).decode()
             w.workspace.import_(path=f"{base}/nb/nb_{idx:04d}",
-                                language=workspace.Language.PYTHON,
+                                language=lang,
                                 format=workspace.ImportFormat.SOURCE,
-                                content=nb_b64, overwrite=True)
-        else:              # ~30% workspace files
-            w.workspace.upload(path=f"{base}/files/file_{idx:04d}.csv",
-                               content=file_bytes,
+                                content=src, overwrite=True)
+        else:              # ~30% workspace files — rotate across the four file types
+            ext = _FILE_EXTS[idx % len(_FILE_EXTS)]
+            w.workspace.upload(path=f"{base}/files/file_{idx:04d}.{ext}",
+                               content=_file_body(ext, idx),
                                format=workspace.ImportFormat.RAW, overwrite=True)
 
     # Build the full work list first (dirs created up front so parallel imports don't race mkdir).
@@ -1937,20 +2191,8 @@ def phase_b7_dashboards():
     print("== B7: dashboard publish/schedule matrix ==")
     from databricks.sdk.service.dashboards import Dashboard
     wh = _warehouse_id()
-    serialized = json.dumps({
-        "datasets": [{"name": "ds1", "displayName": "trips",
-                      "queryLines": [f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"]}],
-        "pages": [{"name": "p1", "displayName": "Page 1",
-                   "layout": [{"position": {"x": 0, "y": 0, "width": 6, "height": 6},
-                               "widget": {"name": "w1",
-                                          "queries": [{"name": "q1", "query": {
-                                              "datasetName": "ds1", "fields": [
-                                                  {"name": "zip", "expression": "`zip`"}],
-                                              "disaggregated": True}}],
-                                          "spec": {"version": 1, "widgetType": "table",
-                                                   "encodings": {}}}}]}],
-    })
-    existing = {d.display_name: d.dashboard_id for d in w.lakeview.list()}
+    serialized = _valid_dashboard_serialized()
+    existing = _active_dashboards()
 
     def _ensure(name):
         if name in existing:
@@ -1977,8 +2219,13 @@ def phase_b7_dashboards():
     except Exception as e:
         log(f"  publish noembed: {str(e)[:110]}")
 
-    # A dashboard carrying a SCHEDULE.
+    # A dashboard carrying a SCHEDULE. A schedule requires the dashboard to be PUBLISHED first
+    # (create_schedule 404s "Unable to find published dashboard" on a draft-only dashboard).
     did_sched = _ensure("wsmig_test_dash_scheduled")
+    try:
+        w.lakeview.publish(dashboard_id=did_sched, embed_credentials=True, warehouse_id=wh)
+    except Exception as e:
+        log(f"  schedule-publish: {str(e)[:110]}")
     try:
         from databricks.sdk.service.dashboards import Schedule, CronSchedule
         w.lakeview.create_schedule(dashboard_id=did_sched,
@@ -2012,13 +2259,17 @@ PHASES = {
     "dab_pathless": phase_dab_pathless,
     "bigfiles": phase_bigfiles,
     "libraries": phase_libraries,
-    "acls": phase_acls,
-    # PLAN_13 additions: B6 scale bed + B3/B7 scenario gaps.
+    # PLAN_13 object-creating additions — MUST run BEFORE the ACL matrices so their objects
+    # (the B7 published/scheduled dashboards, the B3 family policy, the scale bed) are granted on.
+    # (Previously `acls` ran before these, so the B7 dashboards had NO user ACLs — the "dashboards
+    # aren't shared to anyone" gap.)
     "scale_identity": phase_scale_identity,
     "scale_content": phase_scale_content,
-    "scale_acls": phase_scale_acls,
     "b3_policy_family": phase_b3_policy_family,
     "b7_dashboards": phase_b7_dashboards,
+    # ACL matrices LAST — every object they grant on now exists (base + B7 dashboards + scale bed).
+    "acls": phase_acls,
+    "scale_acls": phase_scale_acls,
 }
 
 if __name__ == "__main__":

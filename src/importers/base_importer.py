@@ -636,27 +636,32 @@ class BaseImporter(ABC):
     def _home_present(self, home_root: str) -> bool:
         """Does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?
 
-        B8: caches only a genuinely-settled PRESENT. A transient ABSENT is NOT pinned — a home may be
-        lazily provisioned LATER in the same run, and the old whole-run "absent" cache was exactly
-        what forced the endless `failed_only` loop (a home that appeared later was never re-probed).
-        So an absent reading re-probes each time (and the end-of-phase re-sweep sees it fresh)."""
+        Caches the result PER PHASE — BOTH present and absent — so a 10K-object content phase makes
+        ONE `get-status` per owner (~150) instead of one per unit (~10K). That probe explosion (I
+        had changed this to cache "present" only, re-probing every absent home for every single
+        unit, AND the serial re-sweep re-probed them all again) was the entire cause of a 7h content
+        phase at scale — ~21K serial probes × ~1.2s. Caching an absent verdict within a pass is safe:
+        a home does not provision in the sub-second gap between two units of the same pass. A home
+        that provisions LATER is still caught because the end-of-phase re-sweep starts with a FRESH
+        cache (`_resweep_deferred_homes` resets `_home_present_cache`), so an absent reading is never
+        pinned across the provisioning window — only within one pass (exactly `main`'s behaviour,
+        plus the re-sweep). The parallel pool shares this dict; a benign race only costs a couple of
+        redundant probes, never a wrong answer (the verdict is deterministic within a pass)."""
         if not home_root:
             return True
         cache = getattr(self, "_home_present_cache", None)
         if cache is None:
             cache = self._home_present_cache = {}
-        if cache.get(home_root):
-            return True
+        if home_root in cache:
+            return cache[home_root]
         owner = home_owner(home_root)
         sp_map = self.identity_map.get("sp_mapping") or {}
         if sp_map.get(owner):
             cache[home_root] = True   # an SP's home is auto-provisioned at SP-create
             return True
         remapped, _ = self._remap_home_path(home_root)
-        present = bool(self._get_status(remapped))
-        if present:
-            cache[home_root] = True   # settle only POSITIVES; never pin a transient absent
-        return present
+        cache[home_root] = bool(self._get_status(remapped))
+        return cache[home_root]
 
     def _backup_path(self, path: str, owner: str) -> str:
         """`<backup_root>/<owner>/<path-relative-to-/Users/owner>` (PLAN 9 §4.2)."""

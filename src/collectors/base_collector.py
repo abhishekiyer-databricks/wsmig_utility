@@ -21,6 +21,9 @@ class BaseCollector(ABC):
     object_type: str = "unknown"
     # Which field on each raw object is its stable natural key (name/path/appId).
     natural_key_field: str = "name"
+    # map_parallel emits progress lines only when a pass has at least this many items (keeps the
+    # common small-collector case quiet; big passes like the 10K-object ACL fetch get ~20 ticks).
+    _PROGRESS_MIN: int = 50
 
     def __init__(self, client, config, dbutils=None) -> None:
         self.client = client   # auth.ApiClient bound to THIS (source) workspace
@@ -41,12 +44,34 @@ class BaseCollector(ABC):
         `fn` MUST mutate the item in place (or a shared, lock-guarded structure) — results are
         discarded here, so order never matters and the bundle stays identical regardless of
         completion order. A per-item failure is logged (never raised). `parallel_threads=1` runs
-        serially (byte-identical to the old loop)."""
+        serially (byte-identical to the old loop).
+
+        Emits PROGRESS lines so a long enrichment pass — the per-object ACL/permission GETs that
+        dominate inventory at scale (10K+ objects, the ~852K-call customer hotspot) — is
+        monitorable instead of silent: a start line, ~20 "N/total" ticks, and a done line. Quiet
+        for small sets (< _PROGRESS_MIN items) so the common case stays uncluttered."""
         from src.exporters.parallel import parallel_map
-        for item, _result, error in parallel_map(items, fn, self.parallel_threads):
+        items = list(items)
+        total = len(items)
+        if total == 0:
+            return
+        noisy = total >= self._PROGRESS_MIN
+        step = max(1, total // 20)   # ~20 progress ticks over the whole pass
+        if noisy:
+            self.log.info("enriching", object_type=self.object_type, total=total,
+                          threads=self.parallel_threads)
+        done = failed = 0
+        for _item, _result, error in parallel_map(items, fn, self.parallel_threads):
+            done += 1
             if error is not None:
+                failed += 1
                 self.log.warning("parallel enrichment failed", object_type=self.object_type,
                                  error=str(error)[:200])
+            if noisy and (done % step == 0 or done == total):
+                self.log.info("enrich progress", object_type=self.object_type,
+                              done=done, total=total, failed=failed)
+        if noisy:
+            self.log.info("enriched", object_type=self.object_type, total=total, failed=failed)
 
     # ── abstract interface ────────────────────────────────────────────────
     @abstractmethod
