@@ -1412,3 +1412,70 @@ them in its stop-and-ask summary after each run.)*
   `test_qa2_create_skip_update_decided_from_control_table`,
   `test_direct_mode_export_skips_refetch_of_unchanged_content`, and the modified_at pair in
   `test_fingerprint_gaps.py`. Full offline suite: 436 passed.
+
+#### QA-3 (BUG, CRITICAL) — B8's premise is FALSE: a user home IS created by importing content into it; the defer logic skips that write, so blank-target home content migrates 0% and NEVER heals
+
+- **Commit under test:** `dc94fae` (branch `plan13-backlog-b1-b13`), live on target `ai27-target-ws-3`
+  (`adb-7405616024522912.12`), live run_id `406713219208188` (`parallel_threads=4`, direct mode),
+  source bed 10,555 workspace objects across ~150 freshly-assigned Entra user homes.
+- **What B8 assumed (line 715 premise, and the live tests behind it):** "`/Users/<user>` is a protected,
+  system-managed folder; `mkdir` always returns `DIRECTORY_PROTECTED`; the tool CANNOT make a home exist;
+  homes are provisioned lazily on first login, outside the tool's control." The 100-user test that
+  "settled" this only ever tried **`mkdir`** (and `get-status`). **It never tested `workspace/import` of
+  real content** — which is what `main` actually did and what provisions a home.
+- **What is actually true (proven live 2026-10-02, two independent identities):** importing a notebook
+  into a non-existent home **creates the home**. `mkdir` is protected; `workspace/import` is not.
+  - As workspace admin (abhishek.iyer): `/Users/aaziz.ikhmir@databricks.com` → `Path doesn't exist`;
+    `workspace/import .../wsmig_home_probe` → **home now `DIRECTORY 102621185048350` + notebook
+    `102621185048353`**.
+  - As the **run-as SP** `0baffec3…` via OAuth M2M (the job's exact identity):
+    `/Users/alex.hsieh@databricks.com` → `RESOURCE_DOES_NOT_EXIST`; SP `workspace/import
+    .../wsmig_sp_probe` → `{"object_id":102621185048357}`; **home now `DIRECTORY 102621185048354` +
+    notebook present.** Neither user had logged in; no lazy provisioning involved.
+- **Root cause (in code):** `base_importer._resolve_home_target()` (lines ~731–745) returns `kind="defer"`
+  for any in-roster/unknown owner whose home is not *already* present (gated by `_home_present()` →
+  `get-status`). `WorkspaceImporter._create_*` raises `DeferredHome` instead of attempting the write; the
+  `and not is_user_home(parent)` guard added at the parent-mkdir site also suppresses the write. So on a
+  blank target the content write — **the only thing that creates the home** — is never issued. `main` had
+  no such gate: it wrote optimistically (`if parent and not is_skippable_path(parent): mkdir(parent)` then
+  import), the import created the home, and >90% landed on pass 1 (<10% retried).
+- **Why it never heals:** the end-of-phase re-sweep (`_resweep_deferred_homes`) and `retry_mode=failed_only`
+  only **re-check presence** via a fresh `get-status`; they never retry the deferred write. Nothing ever
+  provisions the home, so every subsequent run re-defers → permanent `prerequisite_missing`. Blank-target
+  home-content migration is therefore **completely broken on this branch** (this run: 10,001 of 10,555
+  workspace objects deferred → re-swept → `prerequisite_missing`, 0 user homes created; only `/Shared`,
+  SP-uuid homes, and the already-provisioned admin home imported).
+- **Impact:** this is the customer's primary scenario (migrate user home content to a new workspace).
+  `main` worked (>90%/pass-1); B8 regressed it to 0%/never-heals. Separate from and more severe than the
+  7h timing regression (which is independently fixed).
+- **Repro:** direct-mode live import of a bundle with content under not-yet-provisioned target homes →
+  `home re-sweep (pre-ACL): deferred=N` → every `/Users/<email>/…` unit `→ failed category=prerequisite_missing`
+  "USER HOME directory, which cannot be created"; target `/Users` stays empty of those homes across retries.
+- **Fix (suggested, for the dev — NOT applied; tester role):** drop the `_home_present`/defer gate for
+  in-roster/unknown owners and restore `main`'s optimistic write (the content `workspace/import` creates
+  the home); keep a clean `prerequisite_missing`/backup path only for genuinely-absent (deleted-in-source)
+  owners, and only when the write *actually* fails. The whole B8 defer + re-sweep machinery can be removed
+  once the write is attempted again. Note the related `.db_internal → created` FALSE POSITIVE: `mkdirs` of
+  `/Users/<email>/.db_internal` under an unprovisioned home returns success but persists nothing
+  (verified `NOT FOUND` after a reported `created`), so the report over-counts `created`; `.db_internal`
+  is also still being attempted at content import despite B10's skip intent — audit both against B4
+  (report = verified read-back).
+- **Test setup note:** left probe artifacts on target (`/Users/aaziz.ikhmir@databricks.com/wsmig_home_probe`,
+  `/Users/alex.hsieh@databricks.com/wsmig_sp_probe`, `/Users/april.song@databricks.com/wsmig_mkdir_probe`)
+  and a run-as-SP OAuth secret minted for the probe — moot once the target is recreated for the re-test.
+- **RESOLVED 2026-10-03** (user authorised the code change). `base_importer._resolve_home_target` no longer
+  returns `defer`: an in-roster/unknown **USER** home resolves to `normal_home` (descendant) / `skip_root`
+  (root) so the content write is attempted — the write provisions the home. Order is now: SP-remap →
+  **present-home wins** (`_home_present`, cached ~1/owner — keeps re-runs + "home already there") →
+  deleted-in-source owner → backup/prerequisite → **SP appId not in `sp_mapping`** → prerequisite (a write
+  can't provision a non-existent SP's home) → **USER** → write. A home ROOT is a no-op `skip_root`
+  (recorded `skipped`, never mkdir'd). Separately, no-op "creates" (workspace roots, Trash,
+  `.db_internal`/`.ide`, home roots) now return `{"skipped": True}` and record as `skipped`, fixing the
+  phantom `.db_internal → created` (B10 was already skipping the mkdir; only the LABEL was wrong). The B8
+  defer/re-sweep machinery (`DeferredHome`, `_resweep_deferred_homes`, runner `_resweep_home_content`) is
+  now **vestigial** — the resolver never returns `defer` — and can be deleted in a follow-up. Tests:
+  `test_b8_home_content_is_written_optimistically_not_deferred_no_root_mkdir`,
+  `test_b8_home_descendant_dir_is_mkdird_at_its_own_path_not_the_root`,
+  `test_b8_home_root_unit_is_skipped_not_a_phantom_create`, `test_qa3_db_internal_directory_is_skipped_not_created`,
+  `test_b8_runner_imports_home_content_in_the_workspace_phase_before_acls`, plus updated
+  `test_importers_phase2_5` home tests. Full offline suite: **437 passed**. UNCOMMITTED (user pushes).

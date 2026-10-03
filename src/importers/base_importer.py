@@ -695,15 +695,19 @@ class BaseImporter(ABC):
         Folds the home logic (SP remap IMP-6, presence guard, orphaned-home divert) into ONE
         decision (PLAN 9 §4.1; lifted to the base class in PLAN 11 Finding-8). Order:
           1. owner is a recreated SP (`sp_mapping`) → remap to /Users/<newAppId>/… (IMP-6).
-          2. else owner's real home is present on target → use it as-is.
-          3. else owner absent on target:
-             - owner ABSENT from the source roster (deleted in source):
-                 • `workspace_home_backup` on (default) → divert to the backup root.
-                 • off → prerequisite (the pre-PLAN-9 behaviour); won't appear, so NOT deferred.
-             - owner in-roster / unknown → `defer` (B8): the home may be lazily provisioned, so the
-               unit is parked for the end-of-phase re-sweep (fresh re-check), then recovers into the
-               REAL home on `retry_mode=failed_only` — never a silent divert, never a stale-cache
-               `failed_only` loop, never a `mkdir` of the protected home.
+          2. owner's real home is ALREADY on target → use it (present beats roster): a re-run, etc.
+          3. else owner ABSENT from the source roster (deleted in source) → no home to make:
+                 • `workspace_home_backup` on → divert to the backup root.
+                 • off → prerequisite.
+          4. else owner is an SP appId NOT in sp_mapping (never migrated) → `prerequisite` — its home
+             can't be provisioned by a write (there's no target SP; a write would orphan content).
+          5. else owner is a USER (or unknown non-appId): WRITE at the real `/Users/<owner>` home —
+             it need NOT pre-exist. A descendant write (notebook/file import, or `mkdirs` of a
+             descendant dir) CREATES the home; only `mkdir` of the ROOT itself (and `.db_internal`)
+             is protected. Proven live 2026-10-02 as both a workspace admin AND the run-as SP. So the
+             ROOT unit is a no-op skip (`skip_root`, provisioned by its first descendant write) and
+             every descendant is `normal_home`. This is main's optimistic behaviour; B8's `defer`
+             (built on the false "the tool cannot create a home" premise) is GONE — see PLAN_13 QA-3.
         """
         norm = normalize_ws_path(path)
         owner = home_owner(norm)
@@ -722,13 +726,14 @@ class BaseImporter(ABC):
                     if note else "SP home root — auto-provisioned when the SP was created")
             return HomeResolution(remapped, "remapped_sp", note)
 
+        # The owner's real home is ALREADY on target → use it as-is (present beats roster): a re-run,
+        # or the owner has been provisioned / signed in since. Cached per pass (~1 probe per owner).
         if self._home_present(home_root):
             if is_root:
-                return HomeResolution(norm, "skip_root",
-                                      "user home directory — already provisioned")
+                return HomeResolution(norm, "skip_root", "user home directory — already provisioned")
             return HomeResolution(norm, "normal_home", "")
 
-        # Home not present. A genuinely-absent (deleted-in-source) owner has no home to wait for.
+        # Home not present. A genuinely-absent (deleted-in-source) owner has no home to make.
         if self._roster_status(owner) == "absent":
             backup_on = bool(getattr(self.config.imports, "workspace_home_backup", False))
             if backup_on:
@@ -739,10 +744,24 @@ class BaseImporter(ABC):
                         f"`{backup_path}`. Reassign to the intended owner if needed.")
                 return HomeResolution(backup_path, "backup", note)
             return HomeResolution(norm, "prerequisite", "")
-        # in-roster / unknown owner → the home MAY still provision lazily → DEFER (B8). The caller
-        # (workspace content) parks it for the end-of-phase re-sweep; folder-placed callers treat it
-        # like a missing parent (keeps the source path → clean missing_parent_prerequisite).
-        return HomeResolution(norm, "defer", "")
+
+        # An SP applicationId NOT in sp_mapping was not migrated — it has no target principal, so its
+        # `/Users/<appId>` home cannot be provisioned by a write (that would orphan content under a
+        # non-existent SP). Keep the clear prerequisite; the caller crafts the SP-specific message.
+        if looks_like_app_id(owner):
+            return HomeResolution(norm, "prerequisite", "")
+
+        # In-roster / unknown USER whose home isn't present yet → WRITE at the real home: the content
+        # write PROVISIONS the home (importing a notebook/file, or mkdir'ing a descendant dir, into a
+        # non-existent `/Users/<user>` creates it — proven live 2026-10-02 as a workspace admin AND the
+        # run-as SP, PLAN_13 QA-3). The ROOT itself is never mkdir'd (protected) — a no-op skip,
+        # provisioned by its first descendant write. This restores main's optimistic write that B8's
+        # `defer` (built on the false "the tool cannot create a home" premise) wrongly replaced.
+        if is_root:
+            return HomeResolution(
+                norm, "skip_root",
+                "user home root — provisioned by its first content write, never mkdir'd")
+        return HomeResolution(norm, "normal_home", "")
 
     def require_remap(self, ref_type: str, source_id: str, referenced_by: str = "") -> str:
         """Resolve a SOURCE object id to the TARGET object THIS TOOL created for it — exact or fail
@@ -1048,6 +1067,15 @@ class BaseImporter(ABC):
             self._record(unit, ACTION_FAILED, note=message, error_raw=str(exc), category=category)
             self.log.warning("create failed", component=self.component, natural_key=key,
                              category=category, error=str(exc)[:300])
+            return
+        if out.get("skipped"):
+            # A no-op "create": a path that exists by construction — a workspace root, Trash, a
+            # platform-internal `.db_internal`/`.ide` dir, or a `/Users/<owner>` home ROOT (provisioned
+            # by its first content write). No API call was made, so record it as SKIPPED, not a phantom
+            # `created` — the old code over-counted creations and logged `.db_internal → created` for
+            # things that never persisted (PLAN_13 QA-3).
+            self._record(unit, ACTION_SKIPPED, target_id=safe_str(out.get("target_id")),
+                         note=safe_str(out.get("note")))
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,

@@ -416,116 +416,98 @@ def test_b9_manifest_missing_names_latest_export(tmp_path):
         runner.verify_bundle()
 
 
-# ─────────────────────── B8 — home provisioning (defer + re-sweep) ──────────────────────────
+# ─────────────────── B8/QA-3 — home provisioning (OPTIMISTIC WRITE; defer removed) ───────────
+# CORRECTED 2026-10-02 (PLAN_13 QA-3). Proven live (admin AND run-as SP): importing a notebook/file,
+# or mkdir'ing a DESCENDANT dir, into a non-existent `/Users/<owner>` CREATES the home. Only the home
+# ROOT mkdir and the `.db_internal` segment are protected. So the importer WRITES home content
+# optimistically (main's behaviour) rather than deferring it; the old defer/re-sweep is now vestigial.
 
-def test_b8_home_content_that_appears_at_resweep_is_imported_no_mkdir_of_home():
-    """A home-content unit whose home is ABSENT during the main loop is DEFERRED (not failed), then
-    imported by the end-of-phase re-sweep once the home has lazily appeared — and the tool NEVER
-    mkdirs the protected `/Users/<owner>` home."""
+def test_b8_home_content_is_written_optimistically_not_deferred_no_root_mkdir():
+    """A notebook under an ABSENT in-roster home is IMPORTED immediately (the write provisions the
+    home) — never parked/deferred — and the protected `/Users/<owner>` ROOT is NEVER mkdir'd."""
     h = _import_test_helpers()
     from src.importers.workspace_importer import WorkspaceImporter
-    home = "/Users/late@x.com"
-
-    class _LazyHomeClient(h.RecordingClient):
-        """The home 'provisions' lazily: get-status on it is absent during the main loop and present
-        only once the importer is in its re-sweep (checked via the importer's _in_resweep flag)."""
-        def __init__(self, **kw):
-            super().__init__(**kw)
-            self.importer = None
-
-        def get(self, path, params=None):
-            if path == "api/2.0/workspace/get-status" and (params or {}).get("path") == home:
-                self.calls.append(("GET", path, params))
-                if self.importer is not None and self.importer._in_resweep:
-                    return {"path": home, "object_type": "DIRECTORY", "object_id": "home-1"}
-                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
-            return super().get(path, params)
-
-    client = _LazyHomeClient()
+    from src.exporters import bundle_paths as BP
+    home = "/Users/live@x.com"
+    client = h.RecordingClient()   # get-status absent → the home does NOT pre-exist
     imp, st = h._make(WorkspaceImporter, [
         h._unit("notebook", f"{home}/nb", {"path": f"{home}/nb", "language": "PYTHON"},
                 content_ref="c/nb.py")], client, staging_files={"c/nb.py": b"print(1)"},
         identity_map={"sp_mapping": {}})
-    # owner IS in the source roster → the resolver DEFERS rather than diverts to backup
-    imp.staging.write_json(__import__("src.exporters.bundle_paths", fromlist=["x"])
-                           .IDENTITY_CLASSIFICATION_JSON,
-                           {"identities": [{"identity_type": "user", "userName": "late@x.com",
-                                            "email": "late@x.com"}]})
-    client.importer = imp
-    res = imp.run()
-    assert res.failed == 0, "the deferred unit must heal in the re-sweep once the home appears"
-    assert (res.created + res.warned + res.updated + res.adopted) == 1
-    imported = [b["path"] for b in client.bodies_to("workspace/import")]
-    assert f"{home}/nb" in imported
-    assert all(b.get("path") != home for b in client.bodies_to("workspace/mkdirs")), \
-        "must NEVER mkdir a protected /Users/<owner> home"
-
-
-def test_b8_home_still_absent_at_resweep_is_clean_prerequisite_not_mkdird():
-    """A home that never appears → the deferred unit becomes ONE clean prerequisite_missing (healed
-    later by failed_only), and the home is never mkdir'd."""
-    h = _import_test_helpers()
-    from src.importers.workspace_importer import WorkspaceImporter
-    client = h.RecordingClient()   # get-status always raises → home never appears
-    imp, st = h._make(WorkspaceImporter, [
-        h._unit("notebook", "/Users/live@x.com/nb",
-                {"path": "/Users/live@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py")],
-        client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
-    imp.staging.write_json(__import__("src.exporters.bundle_paths", fromlist=["x"])
-                           .IDENTITY_CLASSIFICATION_JSON,
+    imp.staging.write_json(BP.IDENTITY_CLASSIFICATION_JSON,
                            {"identities": [{"identity_type": "user", "userName": "live@x.com",
                                             "email": "live@x.com"}]})
     res = imp.run()
-    assert res.failed == 1
-    row = st.row("notebook", "/Users/live@x.com/nb")
-    assert row["failure_category"] == "prerequisite_missing"
-    assert client.posts_to("workspace/mkdirs") == []
+    assert res.failed == 0 and imp._deferred_units == [], "home content must be written, not deferred"
+    assert res.created == 1
+    assert f"{home}/nb" in [b["path"] for b in client.bodies_to("workspace/import")]
+    assert all(b.get("path") != home for b in client.bodies_to("workspace/mkdirs")), \
+        "must NEVER mkdir the protected /Users/<owner> home ROOT"
 
 
-def test_b8_home_present_caches_within_a_pass_and_resweep_reset_re_detects():
-    """_home_present caches the verdict (present AND absent) WITHIN a pass so a 10K-object content
-    phase makes ~1 probe per owner, not one per unit (the probe explosion that caused a 7h phase).
-    A home that provisions LATER is re-detected because the re-sweep RESETS `_home_present_cache` —
-    not by re-probing on every call within the same pass."""
+def test_b8_home_descendant_dir_is_mkdird_at_its_own_path_not_the_root():
+    """A descendant DIRECTORY under an absent home is mkdir'd at its OWN path (which itself provisions
+    the home); the home ROOT is never mkdir'd."""
     h = _import_test_helpers()
     from src.importers.workspace_importer import WorkspaceImporter
-    home = "/Users/appears@x.com"
-
-    class _Flip(h.RecordingClient):
-        def __init__(self, **kw):
-            super().__init__(**kw)
-            self.present = False
-            self.probes = 0
-
-        def get(self, path, params=None):
-            if path == "api/2.0/workspace/get-status" and (params or {}).get("path") == home:
-                self.probes += 1
-                if self.present:
-                    return {"path": home, "object_id": "h1"}
-                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
-            return super().get(path, params)
-
-    client = _Flip()
-    imp, _st = h._make(WorkspaceImporter, [], client, identity_map={"sp_mapping": {}})
-    assert imp._home_present(home) is False
-    # Within the SAME pass the absent verdict is cached — repeated checks do NOT re-probe (this is
-    # the fix: ~1 probe per owner, not per unit). Even if the home appears, the cached pass-verdict
-    # stands until the pass ends; the deferred unit is healed by the re-sweep, not mid-pass.
-    client.present = True
-    for _ in range(5):
-        assert imp._home_present(home) is False
-    assert client.probes == 1, "absent must be cached within a pass (one probe, not one per call)"
-    # The end-of-phase re-sweep resets the cache (see _resweep_deferred_homes) → fresh re-detect.
-    imp._home_present_cache = {}
-    assert imp._home_present(home) is True
-    assert client.probes == 2
+    from src.exporters import bundle_paths as BP
+    home = "/Users/live@x.com"
+    client = h.RecordingClient()
+    imp, st = h._make(WorkspaceImporter, [
+        h._unit("directory", f"{home}/sub", {"path": f"{home}/sub"})], client,
+        identity_map={"sp_mapping": {}})
+    imp.staging.write_json(BP.IDENTITY_CLASSIFICATION_JSON,
+                           {"identities": [{"identity_type": "user", "userName": "live@x.com",
+                                            "email": "live@x.com"}]})
+    res = imp.run()
+    assert res.failed == 0 and res.created == 1
+    mk = [b["path"] for b in client.bodies_to("workspace/mkdirs")]
+    assert f"{home}/sub" in mk and home not in mk, "mkdir the descendant, never the home ROOT"
 
 
-def test_b8_runner_resweeps_home_content_just_before_acls():
-    """B8 (refined): the ImportRunner defers the home-content re-sweep to just BEFORE the ACL phase
-    (max lazy-provisioning time) rather than at the end of the workspace phase — a home that appears
-    by then is healed, and its content is created before ACLs so permissions still apply."""
-    import os
+def test_b8_home_root_unit_is_skipped_not_a_phantom_create():
+    """The `/Users/<owner>` ROOT directory unit is a no-op SKIP (provisioned by its content), recorded
+    as `skipped` — NOT a phantom `created` — and no mkdir is issued for it."""
+    h = _import_test_helpers()
+    from src.importers.workspace_importer import WorkspaceImporter
+    from src.exporters import bundle_paths as BP
+    home = "/Users/live@x.com"
+    client = h.RecordingClient()
+    imp, st = h._make(WorkspaceImporter, [
+        h._unit("directory", home, {"path": home})], client, identity_map={"sp_mapping": {}})
+    imp.staging.write_json(BP.IDENTITY_CLASSIFICATION_JSON,
+                           {"identities": [{"identity_type": "user", "userName": "live@x.com",
+                                            "email": "live@x.com"}]})
+    res = imp.run()
+    assert res.created == 0 and res.failed == 0 and res.skipped == 1
+    assert client.posts_to("workspace/mkdirs") == [], "the home ROOT is never mkdir'd"
+    assert st.row("directory", home)["last_action"] == "skipped"
+
+
+def test_qa3_db_internal_directory_is_skipped_not_created():
+    """`.db_internal` is NEVER created (B10) AND is recorded as SKIPPED — not the phantom `created`
+    the old code logged for a mkdirs that persisted nothing. No mkdir is issued for it."""
+    h = _import_test_helpers()
+    from src.importers.workspace_importer import WorkspaceImporter
+    from src.exporters import bundle_paths as BP
+    p = "/Users/live@x.com/.db_internal"
+    client = h.RecordingClient()
+    imp, st = h._make(WorkspaceImporter, [
+        h._unit("directory", p, {"path": p})], client, identity_map={"sp_mapping": {}})
+    imp.staging.write_json(BP.IDENTITY_CLASSIFICATION_JSON,
+                           {"identities": [{"identity_type": "user", "userName": "live@x.com",
+                                            "email": "live@x.com"}]})
+    res = imp.run()
+    assert res.created == 0 and res.skipped == 1 and res.failed == 0
+    assert all("/.db_internal" not in b.get("path", "")
+               for b in client.bodies_to("workspace/mkdirs")), ".db_internal must never be mkdir'd"
+    assert st.row("directory", p)["last_action"] == "skipped"
+
+
+def test_b8_runner_imports_home_content_in_the_workspace_phase_before_acls():
+    """With the QA-3 fix the ImportRunner imports home content DURING the workspace phase (the write
+    provisions the home) even though the home never pre-exists — no deferral — and before the ACL
+    phase so permissions still apply."""
     import tempfile
     from src.config.config_manager import Config
     from src.exporters import bundle_paths as BP
@@ -539,7 +521,7 @@ def test_b8_runner_resweeps_home_content_just_before_acls():
     aw = ArtifactWriter(cfg)
     aw.ensure_output_path()
     aw.write_manifest({})
-    # a single home-content unit under a home that is absent during the workspace phase
+    # a single home-content unit under a home that NEVER pre-exists on target
     nb = {"asset_type": "notebook", "natural_key": "/Users/late@x.com/nb", "source_id": "n1",
           "fingerprint": "f1", "import_action": "create", "export_status": "success",
           "content_ref": "c/nb.py", "payload": {"path": "/Users/late@x.com/nb", "language": "PYTHON"}}
@@ -555,17 +537,9 @@ def test_b8_runner_resweeps_home_content_just_before_acls():
     class _Client:
         base_url = "https://t"
 
-        def __init__(self):
-            self.home_live = False
-
         def get(self, path, params=None):
             if path == "api/2.0/workspace/get-status":
-                p = (params or {}).get("path")
-                # Only the HOME ROOT lazily appears (home_live); the notebook itself never pre-exists,
-                # so it is CREATED (not adopted) once its home is present.
-                if p == "/Users/late@x.com" and self.home_live:
-                    return {"path": p, "object_id": "home1"}
-                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")
+                raise RuntimeError("RESOURCE_DOES_NOT_EXIST")   # nothing pre-exists on target
             return {}
 
         def get_paginated(self, *a, **k):
@@ -576,9 +550,6 @@ def test_b8_runner_resweeps_home_content_just_before_acls():
 
         def post(self, path, body):
             order.append(("POST", path))
-            if path == "api/2.0/workspace/mkdirs":
-                # the home provisioned by the time the re-sweep mkdir's content's parent chain
-                self.home_live = True
             return {}
 
         def put(self, path, body):
@@ -590,23 +561,13 @@ def test_b8_runner_resweeps_home_content_just_before_acls():
 
     client = _Client()
     runner = ImportRunner(client, cfg, aw, state=None)
-    # Deterministic lazy-provisioning: the home is ABSENT during the workspace phase (notebook is
-    # deferred), and "appears" exactly when the pre-ACL re-sweep runs — hook the re-sweep to flip it.
-    _real = runner._resweep_home_content
-
-    def _hooked(ubt):
-        order.append(("RESWEEP", "start"))
-        client.home_live = True
-        return _real(ubt)
-    runner._resweep_home_content = _hooked
     runner.run()
 
-    resweep_at = next(i for i, (v, p) in enumerate(order) if v == "RESWEEP")
     imports = [i for i, (verb, p) in enumerate(order) if p == "api/2.0/workspace/import"]
-    assert imports, "the deferred home notebook must be imported by the pre-ACL re-sweep"
-    # the notebook was NOT imported during the workspace phase (it was deferred) — only after the
-    # re-sweep started.
-    assert min(imports) > resweep_at, "home content must be deferred, not created in the workspace phase"
+    assert imports, "home content must be imported (written optimistically), not deferred/failed"
+    acls = [i for i, (verb, p) in enumerate(order) if "permissions" in p]
+    if acls:
+        assert min(imports) < min(acls), "home content imports before the ACL phase"
 
 
 def test_b8_genuinely_absent_owner_backup_off_is_immediate_prerequisite_not_deferred():

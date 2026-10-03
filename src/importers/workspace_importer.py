@@ -225,12 +225,14 @@ class WorkspaceImporter(BaseImporter):
     def _create_directory(self, unit: dict) -> dict:
         path = self.natural_key(unit)
         if is_skippable_path(path):
-            return {"target_id": path,
-                    "note": "workspace root / Trash path — exists by construction, not created"}
+            return {"target_id": path, "skipped": True,
+                    "note": "workspace root / Trash / platform-internal (.db_internal/.ide) path — "
+                            "exists by construction, not created"}
         res = self._resolve_home_target(path)
-        # A home ROOT is never mkdir'd — it is auto-provisioned when its owner is created/assigned.
+        # A home ROOT is never mkdir'd — it is provisioned by its first content write (or, for an SP,
+        # at SP-create). No-op SKIP, not a phantom create (QA-3).
         if res.kind == "skip_root":
-            return {"target_id": res.target_path, "note": res.note}
+            return {"target_id": res.target_path, "skipped": True, "note": res.note}
         # Owner genuinely absent (deleted in source, backup off) → one clean, actionable prerequisite
         # (Bug 8/14 + A2), never a raw DIRECTORY_PROTECTED / parent-missing error.
         if res.kind == "prerequisite":
@@ -263,8 +265,8 @@ class WorkspaceImporter(BaseImporter):
         source_path = self.natural_key(unit)
         if is_skippable_path(source_path):
             # Content inside a platform-internal directory (`.db_internal`, `.ide`) — Databricks owns
-            # these, and the parent cannot be created anyway.
-            return {"target_id": source_path,
+            # these, and the parent cannot be created anyway. No-op SKIP, not a phantom create (QA-3).
+            return {"target_id": source_path, "skipped": True,
                     "note": "inside a platform-internal directory — owned by Databricks, not "
                             "recreated by this tool"}
         res = self._resolve_home_target(source_path)

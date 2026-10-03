@@ -327,19 +327,19 @@ def test_instance_pool_update_sends_the_full_config_with_the_id():
 
 # ═══════════════════════════════ WORKSPACE ══════════════════════════════════
 
-def test_a_user_home_directory_is_reported_as_a_prerequisite_not_mkdird():
-    """`/Users/<email>` appears only when the USER is provisioned — that's why identity is phase 1."""
+def test_a_user_home_root_is_a_noop_skip_never_mkdird():
+    """`/Users/<email>` is never mkdir'd (protected) — the ROOT unit is a no-op SKIP, provisioned by
+    its first content write (QA-3). Recorded `skipped`: not a phantom create, and not a prerequisite
+    failure (there is nothing to fail — descendants carry the actual content)."""
     assert is_user_home("/Users/a@b.com")
     assert not is_user_home("/Users/a@b.com/sub")
     client = RecordingClient()
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", "/Users/missing@corp.com", {"path": "/Users/missing@corp.com"})], client)
     res = imp.run()
-    assert client.posts_to("workspace/mkdirs") == [], "a home directory must never be mkdir'd"
-    assert res.failed == 1
-    row = st.row("directory", "/Users/missing@corp.com")
-    assert row["failure_category"] == "prerequisite_missing"
-    assert "provisioned" in row["last_error"]
+    assert client.posts_to("workspace/mkdirs") == [], "a home ROOT must never be mkdir'd"
+    assert res.failed == 0 and res.created == 0 and res.skipped == 1
+    assert st.row("directory", "/Users/missing@corp.com")["last_action"] == "skipped"
 
 
 _OLD_APP = "9e15fb97-bd21-4abc-9def-0123456789ab"
@@ -388,10 +388,10 @@ def test_an_unmigrated_sp_home_is_a_clear_prerequisite_not_a_bare_failure():
     assert "SERVICE PRINCIPAL home" in row["last_error"]
 
 
-def test_content_under_an_absent_user_home_is_a_clean_prerequisite_not_a_raw_error():
-    """PLAN 8 Bug 8/14: a subdir/notebook under a user home whose owner is ABSENT on target must be
-    ONE clean prerequisite_missing per unit — not the raw DIRECTORY_PROTECTED / parent-missing
-    api_error per descendant that swamped the RIL failure list (≈264 of 297 failures)."""
+def test_content_under_an_absent_user_home_is_written_provisioning_the_home():
+    """QA-3 (corrects PLAN 8 Bug 8/14): a subdir/notebook under a USER home that isn't present yet is
+    WRITTEN at the real path — the write PROVISIONS the home (proven live). NOT a prerequisite and NOT
+    a raw error: the descendant dir is mkdir'd and the notebook imported."""
     client = RecordingClient()   # get-status raises RESOURCE_DOES_NOT_EXIST → home reads as absent
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", "/Users/ghost@x.com/proj", {"path": "/Users/ghost@x.com/proj"}),
@@ -399,11 +399,10 @@ def test_content_under_an_absent_user_home_is_a_clean_prerequisite_not_a_raw_err
               {"path": "/Users/ghost@x.com/proj/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
     ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
     res = imp.run()
-    assert res.failed == 2
-    assert client.posts_to("workspace/mkdirs") == [], "must NOT attempt mkdirs under an absent home"
-    for row in res.units:
-        assert row["failure_category"] == "prerequisite_missing"
-        assert "owner is not present on target" in row["note"]
+    assert res.failed == 0 and res.created == 2
+    assert "/Users/ghost@x.com/proj" in [b["path"] for b in client.bodies_to("workspace/mkdirs")]
+    assert "/Users/ghost@x.com/proj/nb" in [b["path"] for b in client.bodies_to("workspace/import")]
+    assert all("Users_Backup" not in b.get("path", "") for b in client.bodies_to("workspace/import"))
 
 
 def _write_classification(aw, sp_app_ids):
@@ -491,10 +490,10 @@ def test_orphaned_sp_home_content_diverted_to_backup():
     assert client.bodies_to("workspace/import")[0]["path"] == f"/Users_Backup/{_OLD_APP}/f"
 
 
-def test_home_owner_in_roster_but_import_failed_stays_prerequisite():
-    """PLAN 9 §2: an owner PRESENT in the roster whose home is merely absent on target this run
-    (identity import failed/pending) must NOT be diverted — it recovers into the REAL home on
-    retry_mode=failed_only. Diverting it would scatter a live user's files."""
+def test_home_owner_in_roster_absent_home_is_written_to_the_real_home_not_backup():
+    """PLAN 9 §2 (as corrected by QA-3): an owner PRESENT in the roster whose home isn't on target yet
+    has its content WRITTEN at the REAL `/Users/<owner>` path — the write provisions the home — never
+    diverted to the backup root (which would scatter a live user's files)."""
     client = RecordingClient()
     imp, st = _make(WorkspaceImporter, [
         _unit("notebook", "/Users/live@x.com/nb",
@@ -502,11 +501,9 @@ def test_home_owner_in_roster_but_import_failed_stays_prerequisite():
     ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
     _write_roster(imp.staging, users=["live@x.com"])   # owner IS in the roster
     res = imp.run()
-    assert res.failed == 1 and res.warned == 0
-    assert client.posts_to("workspace/mkdirs") == [], "must not divert an in-roster owner"
-    row = st.row("notebook", "/Users/live@x.com/nb")
-    assert row["failure_category"] == "prerequisite_missing"
-    assert "owner is not present on target" in row["last_error"]
+    assert res.failed == 0 and res.warned == 0 and res.created == 1
+    nb = client.bodies_to("workspace/import")[0]["path"]
+    assert nb == "/Users/live@x.com/nb" and "Users_Backup" not in nb
 
 
 def test_recreated_sp_home_still_remaps_to_new_appid_not_backup():
@@ -556,8 +553,9 @@ def test_workspace_home_backup_false_preserves_current_prerequisite_behaviour():
 
 
 def test_unknown_roster_does_not_silently_divert():
-    """No/garbled classification file → roster 'unknown' → prerequisite, NEVER a silent backup: we
-    must not scatter a possibly-live user's files on a missing roster."""
+    """No/garbled classification file → roster 'unknown'. For a USER home we WRITE at the real path
+    (the write provisions it) — NEVER a silent backup divert that would scatter a possibly-live
+    user's files on a missing roster."""
     client = RecordingClient()
     imp, st = _make(WorkspaceImporter, [
         _unit("notebook", "/Users/ghost@x.com/nb",
@@ -565,9 +563,9 @@ def test_unknown_roster_does_not_silently_divert():
     ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
     # deliberately DO NOT write identity_classification.json
     res = imp.run()
-    assert res.failed == 1 and res.warned == 0
-    assert client.posts_to("workspace/mkdirs") == []
-    assert st.row("notebook", "/Users/ghost@x.com/nb")["failure_category"] == "prerequisite_missing"
+    assert res.failed == 0 and res.warned == 0 and res.created == 1
+    nb = client.bodies_to("workspace/import")[0]["path"]
+    assert nb == "/Users/ghost@x.com/nb" and "Users_Backup" not in nb
 
 
 def test_backup_root_is_configurable_and_normalised():
@@ -699,7 +697,8 @@ def test_workspace_roots_are_skipped_not_created():
     ], client)
     res = imp.run()
     assert client.posts_to("workspace/mkdirs") == []
-    assert res.created == 2 and "exists by construction" in res.units[0]["note"]
+    assert res.skipped == 2 and res.created == 0
+    assert "exists by construction" in res.units[0]["note"]
 
 
 def test_directories_are_created_top_down():
