@@ -40,16 +40,18 @@ ENTRA_USERS = ["aman.bansal@databricks.com", "sanket.kelkar@databricks.com",
                "vivek.ravichandiran@databricks.com", "idris.chakera@databricks.com"]
 NON_ENTRA_USER = "vivek.ravichandran@databricks.com"
 TEST_USERS = ENTRA_USERS + [NON_ENTRA_USER]
-# The Entra/UMI-backed service principal to assign (must already exist in the account).
-UMI_SP_NAME = "ai27_umi"
-# Genuinely Entra-backed SPs for the fixture. A guest (`#EXT#`) CAN create Entra apps/SPs (only
-# group-create is denied), so these are made as REAL Entra apps (idempotently via `az`), surfaced
-# as ACCOUNT SPs carrying the app's applicationId + objectId(externalId), then assigned to the
-# workspace — the externalId then survives into the workspace SCIM view (verified live), so they
-# classify as Entra-backed, not DB-managed. Entitlements are workspace-scoped, set per SP.
-ENTRA_SP_SPECS = {
-    "ai27_wsmig_entra_sp1": ["allow-cluster-create"],
-    "ai27_wsmig_entra_sp2": ["databricks-sql-access", "allow-instance-pool-create"],
+# The customer's SPs are ALL account-level (ZERO workspace-local SPs). An account SP here is a
+# Databricks-managed service principal created at the ACCOUNT (stable applicationId, no Azure/Entra
+# backing, no externalId) that is ASSIGNED into the workspace with the SAME appId — the "account
+# identity → assign to the target, never recreate" path. The fixture create-or-adopts them at the
+# account level (account-admin only — no Azure RBAC, no UMI) and assigns them. Override via
+# WSMIG_ACCOUNT_SPS.
+ACCOUNT_SP_NAMES = [n.strip() for n in
+                    os.environ.get("WSMIG_ACCOUNT_SPS", "ai27_acc_spn_1,ai27_acc_spn_2").split(",")
+                    if n.strip()]
+ACCOUNT_SP_ENTS = {
+    "ai27_acc_spn_1": ["allow-cluster-create"],
+    "ai27_acc_spn_2": ["databricks-sql-access", "allow-instance-pool-create"],
 }
 # Two REAL Entra security groups the customer pre-created for this fixture. Using their genuine
 # objectIds as externalId makes the Databricks account groups TRULY Entra-backed — unlike the old
@@ -58,10 +60,14 @@ REAL_ENTRA_GROUPS = {
     "ai27entragrp1": "d4208f1a-00f0-4cf3-94b1-58408cf750f3",
     "ai27entragrp2": "456c4ce2-484b-4b72-9f52-d75d7fa2b42a",
 }
-# Genuine ACCOUNT-level (Databricks-managed, NO externalId) groups → assigned to the workspace.
-# These exercise the "account group: assign to target WS, never recreate" path, distinct from both
-# Entra-backed (externalId) and workspace-local (recreate+remap) groups.
-ACCOUNT_GROUPS = ["ai27_account_grp1"]
+# The customer has ZERO workspace-local groups — all their groups are ACCOUNT-level. The fixture
+# mirrors that: NO workspace-local groups anywhere; the group bed is the 2 Entra-backed groups above
+# plus these Databricks-managed ACCOUNT groups (no externalId), a NESTED pair, and a mixed-member
+# group. All exercise the "account group → assign to target WS, never recreate" path.
+ACCOUNT_GROUPS = ["ai27_account_grp1", "ai27_account_eng", "ai27_account_analysts"]
+ACCOUNT_NESTED_CHILD = "ai27_account_child_grp"      # nested INTO the parent below
+ACCOUNT_NESTED_PARENT = "ai27_account_parent_grp"    # contains the child group (nested-group path)
+ACCOUNT_MIXED_GROUP = "ai27_account_mixed_grp"       # user + Entra SP + nested group as members
 
 w = WorkspaceClient(profile=PROFILE)
 
@@ -217,37 +223,22 @@ def _entra_group(name: str, members: list[str] | None = None) -> str | None:
     return gid
 
 
-def _entra_backed_sp(name: str, entitlements: list[str] | None = None) -> str | None:
-    """A genuinely Entra-backed service principal.
-
-    A guest (`#EXT#`) CAN create Entra apps/SPs. So: create (idempotently) a REAL Entra app via
-    `az`, then make an ACCOUNT SP carrying its applicationId + objectId(externalId) and assign it
-    to the workspace. The externalId SURVIVES into the workspace SCIM view (verified live) because
-    the SP is account-created + assigned, not workspace-created — so it classifies as Entra-backed.
-    Entitlements are workspace-scoped, PATCHed on the workspace SP once assigned.
+def _account_sp(name: str, entitlements: list[str] | None = None) -> str | None:
+    """A Databricks ACCOUNT-level service principal (stable appId, NO Azure/Entra backing, no
+    externalId) — the customer's SP model. The "account identity → assign to the workspace with the
+    SAME appId, never recreate" path (as opposed to a workspace-local SP, which the tool recreates +
+    remaps). Create-or-adopt at the ACCOUNT level (account-admin only — no Azure RBAC, no UMI), then
+    assign to the workspace + set workspace-scoped entitlements. Fully re-creatable here across a
+    cleanup; the same account SP assigned to BOTH source and target keeps one appId end to end.
     """
     from databricks.sdk.service import iam
     a = _acct()
     acct_sp = next(iter(a.service_principals.list(filter=f'displayName eq "{name}"')), None)
     if acct_sp:
-        log(f"entra SP exists: {name} (appId={acct_sp.application_id}, ext={acct_sp.external_id})")
+        log(f"account SP exists: {name} (appId={acct_sp.application_id})")
     else:
-        # Create (or reuse) the Entra app → appId + objectId.
-        r = _az("ad", "app", "show", "--id", name, "-o", "json")  # by displayName fails; create path
-        r = _az("ad", "app", "list", "--filter", f"displayName eq '{name}'", "-o", "json")
-        apps = json.loads(r.stdout) if not r.returncode and r.stdout.strip() else []
-        if apps:
-            app = apps[0]
-        else:
-            r = _az("ad", "app", "create", "--display-name", name, "-o", "json")
-            if r.returncode:
-                log(f"  entra app create {name}: {r.stderr[:120]}")
-                return None
-            app = json.loads(r.stdout)
-        app_id, obj_id = app["appId"], app["id"]
-        acct_sp = a.service_principals.create(display_name=name, application_id=app_id,
-                                              external_id=obj_id, active=True)
-        log(f"entra SP created: {name} (appId={app_id}, ext={obj_id})")
+        acct_sp = a.service_principals.create(display_name=name, active=True)
+        log(f"account SP created: {name} (appId={acct_sp.application_id})")
     try:
         _assign_to_workspace(acct_sp.id)
         log(f"  + assigned to workspace: {name}")
@@ -365,160 +356,48 @@ def phase_identity():
         _entra_group(_eg, members=_entra_grp_members)
 
     # 2b. Genuine ACCOUNT-level groups (Databricks-managed, NO externalId) → assigned to WS. The
-    #     importer must ASSIGN these to the target, never recreate them (distinct from both the
-    #     Entra-backed groups above and the workspace-local groups below).
+    #     customer has NO workspace-local groups, so these + the Entra-backed groups above ARE the
+    #     whole group bed. The importer must ASSIGN each to the target, never recreate it.
     _acct_grp_members = _acct_user_ids([ENTRA_USERS[1], NON_ENTRA_USER])
     for _ag in ACCOUNT_GROUPS:
         _account_group(_ag, members=_acct_grp_members)
+    # A NESTED account group: child first, then the parent containing the child (+ users) — exercises
+    # the account-group nesting the importer must preserve when it assigns the group to the target.
+    _child_gid = _account_group(ACCOUNT_NESTED_CHILD, members=_acct_user_ids(ENTRA_USERS[:1]))
+    _account_group(ACCOUNT_NESTED_PARENT,
+                   members=([_child_gid] if _child_gid else []) + _acct_user_ids(ENTRA_USERS[1:2]))
 
-    # 3. Databricks-managed groups (workspace-local, no externalId) + entitlements
-    def mk_group(name, entitlements=None, members=None):
-        """Create-or-update a workspace-local group.
+    # 3. (REMOVED) Workspace-local Databricks-managed groups. The customer has ZERO of these, so the
+    #    fixture has none — the group bed is entirely account-level (Entra-backed + DB-managed account
+    #    groups above). The workspace-local SPs below still exercise the recreate+remap path.
 
-        Must converge on re-run: an existing group has to have its members PATCHed in, because on
-        a first run the group is often created before the users it should contain are assigned
-        (or before a nested child group exists), leaving it silently under-populated.
-        """
-        existing = next(iter(w.groups.list(filter=f'displayName eq "{name}"')), None)
-        if existing is None:
-            try:
-                g = w.groups.create(
-                    display_name=name,
-                    entitlements=[iam.ComplexValue(value=e) for e in (entitlements or [])],
-                    members=[iam.ComplexValue(value=m) for m in (members or [])],
-                )
-                log(f"group created: {name} (id={g.id}, members={len(members or [])})")
-                return g.id
-            except Exception as e:
-                log(f"group {name}: {str(e)[:90]}")
-                return None
+    # 4. (REMOVED) Workspace-local Databricks-managed SPs. The customer has ZERO of these, so the
+    #    fixture has none — all SPs are account-level (section 5). The SP recreate+remap path is
+    #    therefore intentionally NOT exercised (user decision: the customer has no workspace-local SPs).
 
-        have = {m.value for m in (existing.members or [])}
-        missing = [m for m in (members or []) if m not in have]
-        if missing:
-            try:
-                w.groups.patch(
-                    id=existing.id,
-                    schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
-                    operations=[iam.Patch(op=iam.PatchOp.ADD, path="members",
-                                          value=[{"value": m} for m in missing])])
-                log(f"group exists: {name} (+{len(missing)} members added)")
-            except Exception as e:
-                log(f"group {name} member patch: {str(e)[:90]}")
-        else:
-            log(f"group exists: {name} (members already correct)")
-        return existing.id
+    # 5. Account-level SPs = the customer's SP model: Databricks account SPs (stable appId, no Azure
+    #    backing, no externalId) ASSIGNED to the workspace with the SAME appId → "assign, never
+    #    recreate". Create-or-adopt at the account level + assign + per-SP entitlements.
+    for _sp in ACCOUNT_SP_NAMES:
+        _account_sp(_sp, entitlements=ACCOUNT_SP_ENTS.get(_sp, ["workspace-access"]))
 
-    # resolve user ids for membership (workspace-local ids, post-assignment)
-    uid = {}
-    for email in [ME] + TEST_USERS:
-        for u in w.users.list(filter=f'userName eq "{email}"'):
-            uid[email] = u.id
-    # A three-level nest: grandchild → child → parent, so nested-first creation ordering on the
-    # import side has to actually be correct (a two-level nest can pass by accident).
-    grandchild = mk_group("wsmig_test_grandchild_grp",
-                          entitlements=["databricks-sql-access"],
-                          members=[uid[e] for e in ENTRA_USERS[:1] if e in uid])
-    child = mk_group("wsmig_test_child_grp",
-                     entitlements=["databricks-sql-access"],
-                     members=([grandchild] if grandchild else [])
-                             + [uid[e] for e in ENTRA_USERS[:2] if e in uid])
-    # parent group with the child nested + cluster-create entitlement + me
-    mk_group("wsmig_test_parent_grp",
-             entitlements=["allow-cluster-create", "workspace-access"],
-             members=([child] if child else []) + ([uid[ME]] if ME in uid else []))
-    # a plain group, no entitlements
-    mk_group("wsmig_test_plain_grp",
-             members=[uid[NON_ENTRA_USER]] if NON_ENTRA_USER in uid else [])
+    # 6. (REMOVED) OAuth secret on a workspace-local SP (the has_secrets fixture). It rode on a
+    #    workspace-local SP, which no longer exists; account SPs here model the customer's SPs and
+    #    the has_secrets/export path is out of scope for this bed.
 
-    # 4. Databricks-managed SPNs (workspace-local; no externalId → DB-managed).
-    #    Different entitlements per SP so the entitlement-apply path is exercised per identity.
-    #    NOTE: unlike groups, SP create does NOT reject a duplicate displayName — it happily makes
-    #    a second SP with a new applicationId — so this must check for an existing one first or
-    #    every re-run silently doubles them.
-    for sp_name, ents in (("wsmig_test_db_sp", ["allow-cluster-create"]),
-                          ("wsmig_test_db_sp2", ["databricks-sql-access",
-                                                 "allow-instance-pool-create"])):
-        found = next(iter(w.service_principals.list(
-            filter=f'displayName eq "{sp_name}"')), None)
-        if found:
-            log(f"db-managed SPN exists: {sp_name} (appId={found.application_id})")
-            continue
-        try:
-            sp = w.service_principals.create(
-                display_name=sp_name,
-                entitlements=[iam.ComplexValue(value=e) for e in ents])
-            log(f"db-managed SPN created: {sp_name} (appId={sp.application_id})")
-        except Exception as e:
-            log(f"db SPN {sp_name}: {str(e)[:70]}")
-
-    # 5. Entra/UMI-backed SP — must be ASSIGNED from the account, never created.
-    #    The workspace SCIM API silently DROPS `externalId` on create (verified live 2026-08-03),
-    #    so a workspace-created SP can never be Entra-backed; only a real account SP carries one.
-    acct_sp = next(iter(a.service_principals.list(
-        filter=f'displayName eq "{UMI_SP_NAME}"')), None)
-    if not acct_sp:
-        log(f"UMI SP {UMI_SP_NAME}: not found in account — skipping")
-    else:
-        try:
-            _assign_to_workspace(acct_sp.id)
-            log(f"UMI SP assigned: {UMI_SP_NAME} (appId={acct_sp.application_id}, "
-                f"ext={acct_sp.external_id})")
-        except Exception as e:
-            log(f"UMI SP assign: {str(e)[:100]}")
-        ws_sp = next(iter(w.service_principals.list(
-            filter=f'displayName eq "{UMI_SP_NAME}"')), None)
-        if ws_sp:
-            try:
-                w.service_principals.patch(
-                    id=ws_sp.id,
-                    schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
-                    operations=[iam.Patch(op=iam.PatchOp.ADD, path="entitlements",
-                                          value=[{"value": "workspace-access"},
-                                                 {"value": "databricks-sql-access"}])])
-                log(f"  entitlements set on {UMI_SP_NAME}")
-            except Exception as e:
-                log(f"  entitlements {UMI_SP_NAME}: {str(e)[:90]}")
-
-    # 5b. Genuinely Entra-backed SPs — real Entra apps surfaced as account SPs (appId + externalId)
-    #     and assigned to the workspace; the externalId survives into the WS SCIM view so they
-    #     classify as Entra-backed (NOT the workspace-local db-managed SPs of section 4).
-    for _sp_name, _ents in ENTRA_SP_SPECS.items():
-        _entra_backed_sp(_sp_name, entitlements=_ents)
-
-    # 6. An OAuth secret on a DB-managed SP — the has_secrets flag (values never exported).
-    #    Secrets are an ACCOUNT-level sub-resource, so this goes through the account client even
-    #    though the SP itself was created workspace-locally.
-    ws_sp = next(iter(w.service_principals.list(
-        filter='displayName eq "wsmig_test_db_sp"')), None)
-    if ws_sp:
-        try:
-            existing = a.api_client.do(
-                "GET", f"/api/2.0/accounts/{a.config.account_id}"
-                       f"/servicePrincipals/{ws_sp.id}/credentials/secrets") or {}
-            if existing.get("secrets"):
-                log("OAuth secret already present on wsmig_test_db_sp (has_secrets=True)")
-            else:
-                a.api_client.do("POST", f"/api/2.0/accounts/{a.config.account_id}"
-                                        f"/servicePrincipals/{ws_sp.id}/credentials/secrets")
-                log("OAuth secret created on wsmig_test_db_sp (has_secrets=True)")
-        except Exception as e:
-            log(f"sp secret: {str(e)[:100]}")
-
-    # 7. A group mixing all three member kinds — user + SP + Entra-backed group. Runs LAST so the
-    #    SPs and the Entra group it references already exist.
-    mixed = []
-    ent_grp = next(iter(w.groups.list(
-        filter=f'displayName eq "{next(iter(REAL_ENTRA_GROUPS))}"')), None)
-    if ent_grp:
-        mixed.append(ent_grp.id)
-    for sp_name in ("wsmig_test_db_sp", "wsmig_test_db_sp2"):
-        sp = next(iter(w.service_principals.list(filter=f'displayName eq "{sp_name}"')), None)
-        if sp:
-            mixed.append(sp.id)
-    if ME in uid:
-        mixed.append(uid[ME])
-    mk_group("wsmig_test_mixed_grp", entitlements=["workspace-access"], members=mixed)
+    # 7. A mixed-member ACCOUNT group — a user + an account SP + the nested account group — created
+    #    LAST so its referenced principals already exist. Account-level, so members are ACCOUNT ids
+    #    (an account group can contain users, SPs and nested groups).
+    mixed = _acct_user_ids([ME])
+    _esp = (next(iter(a.service_principals.list(
+        filter=f'displayName eq "{ACCOUNT_SP_NAMES[0]}"')), None)
+        if ACCOUNT_SP_NAMES else None)
+    if _esp:
+        mixed.append(_esp.id)
+    _child = next(iter(a.groups.list(filter=f'displayName eq "{ACCOUNT_NESTED_CHILD}"')), None)
+    if _child:
+        mixed.append(_child.id)
+    _account_group(ACCOUNT_MIXED_GROUP, members=mixed)
 
 
 # ─────────────────────────── compute ───────────────────────────────────────
@@ -1698,37 +1577,34 @@ SECRET_ACL_LEVELS = ["READ", "WRITE", "MANAGE"]
 
 
 def _acl_principals():
-    """One principal of each KIND, so the importer's principal remapping is fully exercised.
+    """One principal of each KIND, so the importer's principal handling is fully exercised.
 
-    The kinds matter independently: users and Entra groups keep their identity across the
-    migration, while DB-managed groups and SPs get NEW ids on target and so must be remapped.
+    All identities here are ACCOUNT-level (the customer has no workspace-local groups or SPs), so the
+    migration ASSIGNS them to the target and preserves their ids — Entra users, Entra-backed account
+    groups, DB-managed account groups (flat/nested/mixed) and account SPs — none are remapped.
     """
     out = []
     u = next(iter(w.users.list(filter=f'userName eq "{ENTRA_USERS[0]}"')), None)
     if u:
         out.append(("user_name", u.user_name, "entra user"))
-    # Two db-managed groups and one Entra-backed one. The kind labels are DISTINCT per principal
-    # so the coverage report below counts real principals, not collapsed duplicate labels.
-    for gname, kind in (("wsmig_test_parent_grp", "db group (parent)"),
-                        ("wsmig_test_child_grp", "db group (child)"),
-                        (next(iter(REAL_ENTRA_GROUPS)), "entra group"),
+    # Account-level groups ONLY (the customer has no workspace-local groups): both Entra-backed
+    # groups + a DB-managed account group + the nested parent + the mixed group. DISTINCT kind labels
+    # so the coverage report counts real principals, not collapsed duplicate labels.
+    _eg = list(REAL_ENTRA_GROUPS)
+    for gname, kind in ((_eg[0], "entra group"),
+                        (_eg[1] if len(_eg) > 1 else _eg[0], "entra group 2"),
                         ("ai27_account_grp1", "account group"),
-                        ("wsmig_test_plain_grp", "db group (plain)")):
+                        (ACCOUNT_NESTED_PARENT, "account group (nested parent)"),
+                        (ACCOUNT_MIXED_GROUP, "account group (mixed)")):
         g = next(iter(w.groups.list(filter=f'displayName eq "{gname}"')), None)
         if g:
             out.append(("group_name", gname, kind))
-    # Both db-managed SPs, so the SP-remap path gets more than a single grant.
-    for sp_name in ("wsmig_test_db_sp", "wsmig_test_db_sp2"):
-        sp = next(iter(w.service_principals.list(
-            filter=f'displayName eq "{sp_name}"')), None)
+    # Account-level SPs (stable appId, identity preserved on target — assigned, NOT remapped), so the
+    # ACL replay covers the "keep the applicationId" SP principal kind. Both, for more than one grant.
+    for i, sp_name in enumerate(ACCOUNT_SP_NAMES):
+        sp = next(iter(w.service_principals.list(filter=f'displayName eq "{sp_name}"')), None)
         if sp:
-            out.append(("service_principal_name", sp.application_id, f"db SP ({sp_name[-1]})"))
-    # An Entra-backed SP (stable appId, identity preserved on target — NOT remapped), so the ACL
-    # replay covers the "keep the applicationId" principal kind too.
-    esp = next(iter(w.service_principals.list(
-        filter=f'displayName eq "{next(iter(ENTRA_SP_SPECS))}"')), None)
-    if esp:
-        out.append(("service_principal_name", esp.application_id, "entra SP"))
+            out.append(("service_principal_name", sp.application_id, f"account SP ({i + 1})"))
     return out
 
 
@@ -1890,13 +1766,13 @@ def phase_acls():
 
 # ───────────────────── SCALE fixtures (B6 parallelism) ──────────────────────
 # These stand up a REAL-scale bed: ~150 assigned account users each with a tree of workspace
-# content, plus a batch of workspace-local SPs/groups, so the parallel ACL-enrichment pass
-# (inventory) and the parallel sub-level import both have thousands of objects to chew through —
-# the only way to prove B6 does the right thing under load rather than on a toy set.
+# content, plus a batch of account-level groups, so the parallel ACL-enrichment pass (inventory)
+# and the parallel sub-level import both have thousands of objects to chew through — the only way
+# to prove B6 does the right thing under load rather than on a toy set. (No workspace-local SPs/
+# groups: the customer has none.)
 
 SCALE_USERS = int(os.environ.get("WSMIG_SCALE_USERS", "150"))
 SCALE_OBJS_PER_USER = int(os.environ.get("WSMIG_SCALE_OBJS_PER_USER", "62"))
-SCALE_SP_COUNT = int(os.environ.get("WSMIG_SCALE_SPS", "25"))
 SCALE_GRP_COUNT = int(os.environ.get("WSMIG_SCALE_GRPS", "20"))
 SCALE_SHARED_OBJS = int(os.environ.get("WSMIG_SCALE_SHARED_OBJS", "300"))
 SCALE_USERS_FILE = "/tmp/ai27_scale_users.json"
@@ -1961,13 +1837,13 @@ def _parallel(items, fn, workers=16, label=""):
 
 
 def phase_scale_identity():
-    """Assign ~150 real account users to the source workspace + create workspace-local SPs/groups.
+    """Assign ~150 real account users + create account-level groups at scale.
 
-    The users are a mix of Entra-backed (externalId → 'assign, never recreate') and non-Entra;
-    the workspace-local SPs/groups exercise the 'recreate + remap' path at scale.
+    Users are a mix of Entra-backed ('assign, never recreate') and non-Entra. The groups are
+    ACCOUNT-level (the customer has NO workspace-local groups or SPs), exercising 'assign to target,
+    never recreate' at scale. No workspace-local SPs are created (customer has none).
     """
-    from databricks.sdk.service import iam
-    print("== scale identity (assign ~%d account users + local SPs/groups) ==" % SCALE_USERS)
+    print("== scale identity (assign ~%d users + account groups) ==" % SCALE_USERS)
 
     users = _pick_scale_users(SCALE_USERS)
     entra = sum(1 for u in users if u["entra"])
@@ -1983,36 +1859,19 @@ def phase_scale_identity():
     json.dump(assigned, open(SCALE_USERS_FILE, "w"))
     log(f"wrote assigned-user roster → {SCALE_USERS_FILE}")
 
-    # Workspace-local SPs (recreated + remapped on import). SP create does NOT dedupe by name.
-    have_sp = {s.display_name for s in w.service_principals.list()}
-    def _mk_sp(i):
-        name = f"ai27_scale_sp_{i:03d}"
-        if name in have_sp:
-            return
-        w.service_principals.create(display_name=name,
-                                    entitlements=[iam.ComplexValue(value="workspace-access")])
-    ok, failed = _parallel(range(SCALE_SP_COUNT), _mk_sp, workers=8, label="scale-sp")
-    log(f"workspace-local SPs: {ok} ok, {failed} failed (target {SCALE_SP_COUNT})")
-
-    # Workspace-local groups, every 5th nested into the previous (nested-first remap at scale).
+    # ACCOUNT-level groups (Databricks-managed), every 5th nested into the previous. The customer has
+    # NO workspace-local groups, so the scale group bed is account-level too — `_account_group`
+    # creates each at the account level and assigns it to the workspace, idempotently.
     prev_gid = None
     made = 0
     for i in range(SCALE_GRP_COUNT):
         name = f"ai27_scale_grp_{i:03d}"
-        existing = next(iter(w.groups.list(filter=f'displayName eq "{name}"')), None)
-        if existing:
-            prev_gid = existing.id
-            continue
-        members = [iam.ComplexValue(value=prev_gid)] if (prev_gid and i % 5 == 0) else []
-        try:
-            g = w.groups.create(display_name=name,
-                                entitlements=[iam.ComplexValue(value="databricks-sql-access")],
-                                members=members)
-            prev_gid = g.id
+        members = [prev_gid] if (prev_gid and i % 5 == 0) else []
+        gid = _account_group(name, members=members)
+        if gid:
+            prev_gid = gid
             made += 1
-        except Exception as e:
-            log(f"  scale grp {name}: {str(e)[:70]}")
-    log(f"workspace-local groups: {made} created (target {SCALE_GRP_COUNT}, every 5th nested)")
+    log(f"account scale groups: {made} created/assigned (target {SCALE_GRP_COUNT}, every 5th nested)")
 
 
 def _scale_user_paths():
@@ -2121,19 +1980,18 @@ def phase_scale_content():
 
 
 def phase_scale_acls():
-    """Grant ACLs on each scale user's home-tree root dir to the workspace-local scale principals.
+    """Grant ACLs on each scale user's home-tree root dir to the account-level scale groups.
 
     Keeps the grant count bounded (one per user dir) while making those directories' ACLs
-    non-trivial, so the import-side principal remap has real scale-group/SP grants to carry over.
-    The 10K objects' *default* ACLs are what the parallel enrichment pass fetches regardless.
+    non-trivial, so the import side has real scale-group grants to carry over. The 10K objects'
+    *default* ACLs are what the parallel enrichment pass fetches regardless. Principals are the
+    account scale groups only (the customer has no workspace-local SPs/groups).
     """
-    print("== scale ACLs (per-user home-tree dir grants to scale groups/SPs) ==")
+    print("== scale ACLs (per-user home-tree dir grants to account scale groups) ==")
     users = _scale_user_paths()
-    # scale principals to rotate across
+    # scale principals = the account scale groups (assigned to the workspace, so visible here)
     grps = [g for g in w.groups.list(filter='displayName sw "ai27_scale_grp"')]
-    sps = [s for s in w.service_principals.list(filter='displayName sw "ai27_scale_sp"')]
-    principals = ([("group_name", g.display_name) for g in grps]
-                  + [("service_principal_name", s.application_id) for s in sps])
+    principals = [("group_name", g.display_name) for g in grps]
     if not principals:
         log("no scale principals found — run phase_scale_identity first")
         return
@@ -2237,6 +2095,145 @@ def phase_b7_dashboards():
         log(f"  schedule: {str(e)[:110]}")
 
 
+def phase_incremental():
+    """INCREMENTAL Run-2 seed — mutate the EXISTING bed so a re-run exercises change-detection +
+    UPSERT across every axis, plus one deliberate FAILURE that heals via a retry_mode=failed_only
+    import-only run. NOT part of `all` (it would corrupt a clean rebuild); run explicitly:
+    `python3 tests/fixtures_fvm1.py incremental`.
+
+      A. ADD        — new notebooks + new workspace files (no prior state → export fetches, import creates)
+      B. UPDATE     — overwrite existing notebooks + files (bytes change → modified_at bumps → fingerprint
+                      moves → export re-fetches ONLY these; import UPDATES; unchanged content skips)
+      C. DASHBOARD  — a NEW draft dashboard, then PUBLISH it (B7 publish-diff migration)
+      D. POLICY     — edit an existing cluster policy's definition (metadata UPSERT, not a duplicate)
+      E. JOB        — edit an existing job's settings (metadata UPSERT)
+      F. USER       — add a new account user + assign to the workspace (new identity in the roster)
+      G. ENTITLEMENT— add an entitlement to an existing user (entitlement diff applied on import)
+      H. FAILURE    — install a NEW cluster library on a TERMINATED cluster → fails prerequisite_missing
+                      on import; heals via an import-only run with retry_mode=failed_only +
+                      library_force_start_clusters=true.
+    Idempotent: a timestamp stamp makes each run move the fingerprint of the updated items."""
+    from databricks.sdk.service import workspace, iam
+    from databricks.sdk.service import jobs as jobs_svc
+    from databricks.sdk.service.dashboards import Dashboard
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print("== INCREMENTAL seed (Run-2) ==")
+
+    # A. ADDITIONS — new notebooks + files (no prior state row)
+    for path, src in {f"{SHARED}/inc_nb_added_1": f"# Databricks notebook source\nprint('inc add 1 {stamp}')\n",
+                      f"{USERDIR}/inc_nb_added_2": f"# Databricks notebook source\nprint('inc add 2 {stamp}')\n"}.items():
+        try:
+            w.workspace.import_(path=path, language=workspace.Language.PYTHON,
+                                format=workspace.ImportFormat.SOURCE,
+                                content=base64.b64encode(src.encode()).decode(), overwrite=True)
+            log(f"  A add notebook: {path}")
+        except Exception as e:
+            log(f"  A add nb {path}: {str(e)[:70]}")
+    for path, content in {f"{SHARED}/inc_added_file_1.csv": f"a,b\n{stamp},1\n".encode(),
+                          f"{SHARED}/inc_added_file_2.txt": f"added {stamp}\n".encode()}.items():
+        try:
+            w.workspace.upload(path=path, content=content,
+                               format=workspace.ImportFormat.RAW, overwrite=True)
+            log(f"  A add file: {path}")
+        except Exception as e:
+            log(f"  A add file {path}: {str(e)[:70]}")
+
+    # B. UPDATES — overwrite existing content (fingerprint moves; unchanged siblings must skip)
+    for path, lang, src in [
+            (f"{SHARED}/py_nb", workspace.Language.PYTHON, f"# Databricks notebook source\nprint('UPDATED {stamp}')\n"),
+            (f"{SHARED}/sql_nb", workspace.Language.SQL, f"-- Databricks notebook source\nSELECT 2 AS x -- updated {stamp}\n"),
+            (f"{SHARED}/scala_nb", workspace.Language.SCALA, f"// Databricks notebook source\nprintln(\"updated {stamp}\")\n")]:
+        try:
+            w.workspace.import_(path=path, language=lang, format=workspace.ImportFormat.SOURCE,
+                                content=base64.b64encode(src.encode()).decode(), overwrite=True)
+            log(f"  B update notebook: {path}")
+        except Exception as e:
+            log(f"  B update nb {path}: {str(e)[:70]}")
+    for path, content in {f"{SHARED}/config.json": f'{{"key":"value","updated":"{stamp}"}}\n'.encode(),
+                          f"{SHARED}/README.md": f"# wsmig test (updated {stamp})\n".encode()}.items():
+        try:
+            w.workspace.upload(path=path, content=content,
+                               format=workspace.ImportFormat.RAW, overwrite=True)
+            log(f"  B update file: {path}")
+        except Exception as e:
+            log(f"  B update file {path}: {str(e)[:70]}")
+
+    # C. DASHBOARD — new draft, then PUBLISH
+    try:
+        wh = _warehouse_id()
+        name = "wsmig_inc_dash_published"
+        did = _active_dashboards().get(name)
+        if not did:
+            d = w.lakeview.create(dashboard=Dashboard(display_name=name, warehouse_id=wh,
+                                                      serialized_dashboard=_valid_dashboard_serialized()))
+            did = d.dashboard_id
+            log(f"  C dashboard created (draft): {name} ({did})")
+        w.lakeview.publish(dashboard_id=did, embed_credentials=True, warehouse_id=wh)
+        log(f"  C dashboard PUBLISHED: {name}")
+    except Exception as e:
+        log(f"  C dashboard: {str(e)[:110]}")
+
+    # D. POLICY — edit an existing cluster policy definition (metadata UPSERT)
+    try:
+        pol = next((p for p in w.cluster_policies.list() if p.name == "wsmig_test_policy"), None)
+        if pol:
+            d = json.loads(pol.definition)
+            d["autotermination_minutes"] = {"type": "fixed", "value": 30}
+            w.cluster_policies.edit(policy_id=pol.policy_id, name=pol.name, definition=json.dumps(d))
+            log("  D policy updated: wsmig_test_policy (autotermination_minutes=30)")
+    except Exception as e:
+        log(f"  D policy: {str(e)[:90]}")
+
+    # E. JOB — change an existing job's settings (metadata UPSERT)
+    try:
+        job = next((j for j in w.jobs.list() if j.settings.name == "wsmig_test_single_job"), None)
+        if job:
+            w.jobs.update(job_id=job.job_id,
+                          new_settings=jobs_svc.JobSettings(timeout_seconds=5400,
+                                                            tags={"wsmig_incremental": stamp}))
+            log("  E job updated: wsmig_test_single_job (timeout + tag)")
+    except Exception as e:
+        log(f"  E job: {str(e)[:90]}")
+
+    # F. USER — add a new account user + assign to the workspace
+    try:
+        a = _acct()
+        new_email = "ai27.inc.user@databricks.com"
+        u = next(iter(a.users.list(filter=f'userName eq "{new_email}"')), None)
+        if not u:
+            u = a.users.create(user_name=new_email, display_name="AI27 Incremental User", active=True)
+            log(f"  F account user created: {new_email} ({u.id})")
+        _assign_to_workspace(u.id)
+        log(f"  F user assigned to workspace: {new_email}")
+    except Exception as e:
+        log(f"  F add user: {str(e)[:110]}")
+
+    # G. ENTITLEMENT — add an entitlement to an existing user (diff applied on import)
+    try:
+        email = ENTRA_USERS[0]  # had only allow-cluster-create
+        ws_user = next(iter(w.users.list(filter=f'userName eq "{email}"')), None)
+        if ws_user:
+            w.users.patch(id=ws_user.id,
+                          schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+                          operations=[iam.Patch(op=iam.PatchOp.ADD, path="entitlements",
+                                                value=[{"value": "databricks-sql-access"}])])
+            log(f"  G entitlement added to {email}: databricks-sql-access")
+    except Exception as e:
+        log(f"  G entitlement: {str(e)[:90]}")
+
+    # H. FAILURE — new cluster library on a TERMINATED cluster (heals via failed_only + force_start)
+    try:
+        cid = next((c.cluster_id for c in w.clusters.list()
+                    if c.cluster_name == "wsmig_test_cluster_singlenode"), None)
+        if cid:
+            w.api_client.do("POST", "/api/2.0/libraries/install",
+                            body={"cluster_id": cid, "libraries": [{"pypi": {"package": "six==1.16.0"}}]})
+            log("  H failure-seed: pypi six on wsmig_test_cluster_singlenode (will FAIL on terminated "
+                "cluster; heal via retry_mode=failed_only + library_force_start_clusters=true)")
+    except Exception as e:
+        log(f"  H failure library: {str(e)[:90]}")
+
+
 # Dependency-ordered: identity before ACLs (needs principals), warehouses+uc before anything
 # that references a warehouse or table, compute+workspace before jobs/libraries, and acls LAST
 # so every object it grants on already exists.
@@ -2270,12 +2267,14 @@ PHASES = {
     # ACL matrices LAST — every object they grant on now exists (base + B7 dashboards + scale bed).
     "acls": phase_acls,
     "scale_acls": phase_scale_acls,
+    # Incremental Run-2 seed — EXCLUDED from `all` (mutates the baseline); run explicitly.
+    "incremental": phase_incremental,
 }
 
 if __name__ == "__main__":
     requested = sys.argv[1:] or ["all"]
     if requested == ["all"]:
-        requested = list(PHASES)
+        requested = [p for p in PHASES if p != "incremental"]  # incremental mutates the baseline
     unknown = [p for p in requested if p not in PHASES]
     if unknown:
         print("unknown phase(s):", unknown, "| known:", list(PHASES) + ["all"])
