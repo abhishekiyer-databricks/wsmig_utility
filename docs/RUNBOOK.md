@@ -255,6 +255,15 @@ Fix the cause, then re-run only the outstanding units.
 > re-run fixes it — the grant is now in place. No manual grant is needed when that `CAN_USE` existed
 > on the source (it's migrated with the warehouse's ACLs).
 
+> 💥 **If the import job died mid-run** (driver out of memory, node lost, job killed or timed out):
+> just re-run it — with the **same `run_id`** if you can, so it resumes from the checkpoint. The state
+> table is saved every **200 objects or 5 minutes**, whichever comes first, plus at the end of every
+> phase, so at most ~5 minutes / < 200 objects of bookkeeping are lost; the re-run finds those objects
+> on the target and adopts them instead of creating them again. **One exception:** AI/BI dashboards,
+> Genie spaces, SQL alerts and legacy SQL queries created in those last minutes can't be told apart by
+> name, so the re-run may create an **exact duplicate**. After a crashed run, check the dashboards /
+> Genie spaces / alerts / queries it created and delete any duplicate by hand.
+
 ---
 
 ## ♻️ Re-running (incremental migrations)

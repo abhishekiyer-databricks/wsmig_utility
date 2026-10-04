@@ -43,6 +43,7 @@ from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATE
                                    ACTION_SKIPPED, ACTION_SKIPPED_NO_OBJECT, ACTION_UPDATED,
                                    CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_SUPPORTED,
                                    CAT_PERMISSION_DENIED, CAT_PREREQUISITE_MISSING, UpsertAction)
+from src.state import state_store as _state_mod
 from src.utils.helpers import (folder_natural_key, home_owner, looks_like_app_id, normalize_ws_path,
                                safe_str)
 from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
@@ -62,6 +63,8 @@ HomeResolution = namedtuple("HomeResolution", ["target_path", "kind", "note"])
 # Flush the checkpoint every N units. Every write to a UC Volume is a FULL-file rewrite (verified
 # live — memory `uc-volume-file-io-limits`), so per-item flushing is O(n²) bytes; one flush at the
 # end would lose all bookkeeping on a crash. Same batch size and rationale as the export pass.
+# Also flushed once the oldest pending outcome is `state_store.FLUSH_SECONDS` old (PLAN 16.1 §4.4),
+# the same rule as the state table, so after a hard crash the checkpoint is never further behind it.
 CHECKPOINT_BATCH = 200
 
 # API error text → (failure_category, remediation HINT). The hint is only ever APPENDED to the
@@ -300,6 +303,7 @@ class BaseImporter(ABC):
         self.result = ImportResult(self.component)
         self._pending_cp: list[str] = []
         self._pending_cp_results: dict = {}
+        self._cp_since: Optional[float] = None   # when the oldest pending checkpoint entry was queued
         # Phase progress (set by run(); 0 = _record called outside a phase run, e.g. a unit test).
         self._phase_total = 0
         self._phase_done = 0
@@ -1068,11 +1072,20 @@ class BaseImporter(ABC):
         # make the next real run think the work is done.
         if checkpoint and not dry:
             self._pending_cp.append(key)
+            # `asset_type` lets the recovery replay key the row (PLAN 16.1 §4.4): without it the
+            # replay can only infer the type for single-type families, so after a hard crash the
+            # identity/compute/workspace/secrets/sql/misc outcomes were never replayed. Older
+            # checkpoints without it still go through the runner's single-type fallback.
             self._pending_cp_results[key] = {"import_status": status, "target_id": safe_str(target_id),
                                              "fingerprint": safe_str(unit.get("fingerprint")),
                                              "source_id": safe_str(unit.get("source_id")),
+                                             "asset_type": safe_str(unit.get("asset_type")),
                                              "note": note}
-            if len(self._pending_cp) >= CHECKPOINT_BATCH:
+            now = _state_mod.flush_clock()
+            if self._cp_since is None:
+                self._cp_since = now
+            if (len(self._pending_cp) >= CHECKPOINT_BATCH
+                    or now - self._cp_since >= _state_mod.FLUSH_SECONDS):
                 self.flush_checkpoint()
 
     def _log_outcome(self, asset_type: str, key: str, status: str, *, target_id: str = "",
@@ -1102,7 +1115,8 @@ class BaseImporter(ABC):
                               started=self._phase_t0, **self._outcome_counts())
 
     def flush_checkpoint(self) -> None:
-        """Write the pending checkpoint batch. Called per batch, at phase end, and in `finally`."""
+        """Write the pending checkpoint batch. Called per batch / FLUSH_SECONDS, at phase end, and
+        in `finally`."""
         if not self._pending_cp and not self._pending_cp_results:
             return
         try:
@@ -1111,6 +1125,7 @@ class BaseImporter(ABC):
         except Exception as exc:  # noqa: BLE001 — bookkeeping must not break the run
             self.log.warning("checkpoint flush failed", component=self.component, error=str(exc))
         self._pending_cp, self._pending_cp_results = [], {}
+        self._cp_since = None
 
 
 # Human label per status, for the Excel "Action Taken" column. Kept beside the vocabulary so a new

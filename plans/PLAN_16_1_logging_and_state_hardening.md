@@ -275,16 +275,67 @@ and any future read failure would otherwise silently look like an empty table ag
 - `_cache` iteration helpers (`target_ids_for`, `retry_keys`, `has_family`, `outstanding_rows`,
   `summary`) iterate `list(self._cache.items())` (no behaviour change; prepares 16.5).
 
+### 4.4 State write cadence — no commit per failure (Wave 0 finding W0-8, user decision 2026-10-04)
+**Problem (measured live on `main`, Wave 0):** `StateStore.record()` flushes on EVERY `failed` action
+(`if action == ACTION_FAILED or len(self._pending) >= STATE_BATCH`). Each flush = one Delta MERGE on the
+state table (~3–7 s). With 126 failures (120 = user-home delay) the import's workspace phase had **109
+MERGE commits per run** (`DESCRIBE HISTORY`). On Run 2 they also triggered **92 OPTIMIZE** commits (auto
+compaction on many tiny commits), which slowed every later MERGE. So an incremental run that skipped
+313 of 466 units still took 21 min (Run 1: 15 min). The cost scales with the number of FAILURES, not
+with changes. At the customer's scale (~1,566 failures) it is ~2–3 h of commits. The 16.1 branch keeps
+the same line (`state_store.py:410`).
+
+**Why the per-failure flush buys nothing:** its docstring says a failure must not "strand the 199
+successes in front of it". But a recorded failure is not a crash. The phase-end flush and the run-end
+`finally` flush already persist those rows. On a HARD crash (driver OOM / node lost / job killed, where
+`finally` never runs), up to 199 rows are lost today anyway in BOTH the state table and the checkpoint,
+whether or not a failure happened. It only "helps" when a failure happens to land after the successes.
+
+**Change (user decision):** flush when **200 rows are pending (`STATE_BATCH`, unchanged) OR 300 s have
+passed since the last successful state flush, whichever comes first**. Phase-end and run-end (`finally`)
+flushes stay exactly as today. Failures no longer force a flush.
+- `state_store.py`: new `STATE_FLUSH_SECONDS = 300` and `self._last_flush = time.time()` (set at init and
+  after every successful `flush()`). In `record()`: `if len(self._pending) >= STATE_BATCH or
+  time.time() - self._last_flush >= STATE_FLUSH_SECONDS: self.flush()`. `record_identity()` gets the
+  same rule. The check runs only on `record()`; there is no background thread, so an idle phase writes
+  nothing.
+- `base_importer.py`: the checkpoint uses the same rule (`CHECKPOINT_BATCH` 200 OR 300 s since its last
+  flush, per importer), so after a hard crash the checkpoint is never further behind than the state
+  table and the same-`run_id` recovery replay can restore the lost rows.
+- **Replay fix found while implementing (2026-10-04):** checkpoint outcomes did not carry `asset_type`,
+  and `ImportRunner._all_checkpoint_outcomes` can only infer it for single-type families, so the
+  start-of-run recovery replay silently restored NOTHING for identity / compute / workspace / secrets /
+  sql / misc. (A plain same-`run_id` re-run still recovered them through the per-unit resume path; a
+  `retry_mode` re-run, which disables resume, did not.) `base_importer._record` now writes
+  `asset_type` into each checkpoint outcome; checkpoints written by `main` (no `asset_type`) keep the
+  single-type fallback → backward compatible.
+- Update the `record()` docstring and the module comment ("Flushed per STATE_BATCH / 300 s / phase
+  boundary / finally").
+- **Maximum loss on a hard crash:** < 200 rows or 5 minutes of work, whichever is smaller, in each store.
+- **Backward compatible:** no schema, natural-key, `last_action` or fingerprint change. `main`-written
+  state is untouched. Recovery replay unchanged.
+
+**What a lost row means on the next run (documented, accepted by the user):**
+| Lost row | Next run |
+|---|---|
+| created/updated object whose existence check is by a unique key (paths, names of jobs/policies/pools/scopes/warehouses/pipelines, identities) | live existence probe → ADOPT → fingerprint compare; no duplicate |
+| created **AI/BI dashboard, Genie space, alert (V2 + legacy), legacy SQL query** | may be created AGAIN as an exact duplicate (names aren't unique; create APIs don't dedupe). Delete the extra by hand. **User decision: accepted and documented, no per-create flush.** |
+| failed | retried by the next normal run (a failure never advances the fingerprint). `failed_only` sees it only after a normal run re-records it |
+| crash on a same-`run_id` import | checkpoint recovery replay restores what the checkpoint had |
+**Doc:** add the duplicate-after-hard-crash note to the operator runbook / `manual_actions` guidance
+("after a job that died mid-import (OOM / driver lost / killed), check dashboards, Genie spaces, alerts and
+legacy queries created in that run for exact duplicates") and to the NOT-migrated/caveats catalog.
+
 ### 4.3 Not in this wave
 Export reading the state table (16.6); the dry-run twin design (unchanged).
 
 ---
 
 ## 5. Files touched (summary)
-`src/utils/logger.py` (rewrite), `src/auth/token_manager.py` (DEBUG/WARNING lines, `register_secret`), `src/utils/retry.py`, `src/state/sql_backend.py`, `src/state/state_store.py`,
+`src/utils/logger.py` (rewrite), `src/auth/token_manager.py` (DEBUG/WARNING lines, `register_secret`), `src/utils/retry.py`, `src/state/sql_backend.py`, `src/state/state_store.py` (incl. §4.4 write cadence),
 `src/collectors/{base_collector,inventory_runner,workspace_collector,…}.py` (start/end lines),
 `src/exporters/{export_runner,content_fetcher,artifact_writer}.py`,
-`src/importers/{base_importer,import_runner,preflight,identity_importer,workspace_importer}.py`,
+`src/importers/{base_importer (§4.4 checkpoint cadence),import_runner,preflight,identity_importer,workspace_importer}.py`,
 `src/reports/import_report.py`, the three stage notebooks + `00_Install_Jobs.py` + `jobs/*.job.json`
 (`log_level`), the silent-except files in §3.5, tests. Plus copied as-is from the branch for QA:
 `tests/fixtures_fvm1.py` (`plans/qa-testing-agent.md` is already copied over and updated).
@@ -324,6 +375,14 @@ All step-0 research is complete (results in §3.0, §4.0, §10). Nothing remains
 - Regression: the full existing suite passes unchanged except the deliberately-updated log-file tests.
 - A synthetic 25K-row state generator (`tests/gen_state_rows.py`) for the live QA load test.
 
+- **§4.4 write cadence:** (a) a `failed` record does NOT flush (199 failures → 0 MERGEs); (b) 200 pending
+  rows → one MERGE (successes and failures mixed); (c) fake clock: one row + 300 s → next `record()`
+  flushes, 299 s → no flush; `_last_flush` resets after a successful flush and NOT after a failed one;
+  (d) phase-end and `finally` flushes unchanged; (e) checkpoint follows the same 200/300 s rule; (f) hard
+  crash simulation: record N rows, discard the store without flushing, new store + same-`run_id`
+  checkpoint → recovery replay restores them and `decide()` returns SKIP/UPDATE, never CREATE; (g)
+  rewrite `test_state_store.py::test_a_failure_flushes_the_successes_before_it` to the new contract.
+
 ## 8. Live QA (Claude, after the user pushes the branch)
 All runs on a **classic job cluster** (no serverless runs).
 1. **Wave 0 golden baseline on `main`** (master plan) if not already done.
@@ -353,6 +412,18 @@ All runs on a **classic job cluster** (no serverless runs).
 9. **Scale check:** a synthetic run that logs ≥300K objects (fixture or a test-only loop) passes and stays
    exportable; the driver log has every object.
 
+10. **§4.4 write cadence (W0-8):** on Run 2 (incremental) compare with Wave 0 Run 2: `DESCRIBE HISTORY` of
+    the state table shows no per-failure MERGEs (≈ one per 200 rows / 300 s + one per phase), no
+    OPTIMIZE storm, and the workspace phase time drops (Wave 0 Run 2: 12m34s, 109 MERGE + 92 OPTIMIZE).
+11. **Hard-crash drill:** start an import, and during the workspace phase TERMINATE the job cluster
+    (driver dies, no `finally`). Re-run the import with the same `run_id`: the job completes, there are
+    no duplicates of strong-key types, counts reconcile with the state table, and lost rows were
+    restored by replay or adopted. Note any dashboard/Genie/alert/query duplicates (the documented risk).
+12. **`retry_mode=failed_only`** (Run 3): touches ONLY the units whose state row is `failed`. Everything
+    else is untouched (no create/update calls in the target audit log for non-failed units; report
+    shows only the retried units acted on). The user verified the healing itself on the client
+    workspace, so live QA only needs to confirm the "skips everything else" part.
+
 ## 9. Decisions (user, 2026-10-04) — all settled (nothing left to research or decide for dev)
 1. **Cell = INFO by default** (`log_level` widget): phases, progress every 500 objects, warnings and
    errors (capped at 2,000 per stage). **Driver log `stderr` = always DEBUG**: per-object start + success
@@ -362,7 +433,9 @@ All runs on a **classic job cluster** (no serverless runs).
 3. **State load = `count(*)` + `SELECT *`, stop on mismatch** (§4.2), with `load()` creating the tables
    on a first run (§4.2).
 4. Behaviour changes in this wave are limited to: state load fails loud / count check, non-destructive
-   MERGE, failed save turns the job red, no `execution_*.log`. Everything else is logging only.
+   MERGE, failed save turns the job red, no `execution_*.log`.
+5. **State write cadence (§4.4, user 2026-10-04):** 200 rows OR 300 s, no flush per failure; a
+   possible exact duplicate dashboard/Genie/alert/query after a HARD crash is accepted and documented. Everything else is logging only.
 
 **Prerequisites for LIVE QA (not for dev):** the Wave 0 golden baseline run of `main` (master plan), and
 the user's answer on the QA fixture identity question (workspace-local groups/SPs in the source bed, or
@@ -382,3 +455,11 @@ account-level only per the 2026-10-03 decision; see `plans/qa-testing-agent.md`)
   line twice; worker-thread lines reach the cell). Probe artifacts left on `target_ws`: jobs
   `890117039318697`, `146251838020838`, notebooks under `/Users/abhishek.iyer@databricks.com/wsmig_step0/`,
   logs under `/Volumes/catalog_ws2_0cyzw9/wsmig_test/staging/plan16_step0/` (safe to delete).
+- **2026-10-04 Wave 0 (main) W0-8:** every failed unit forces a state MERGE → 109 MERGE commits in the
+  workspace phase per run, + 92 OPTIMIZE on Run 2; incremental Run 2 import 21m17s vs Run 1 15m01s with
+  313/466 units skipped. Root cause `state_store.record` failure-flush; fix = §4.4. Evidence:
+  `~/Desktop/wsmig_runs/plan16_golden/FINDINGS.md` (W0-8), state table history `catalog_ws_xaik9y.wsmig_state_main`.
+- **2026-10-04 §4.4 implemented** (state_store `FLUSH_SECONDS=300` + `flush_clock`, `_maybe_flush`;
+  base_importer checkpoint 200/300 s + `asset_type`; Runbook crash note; CHANGELOG). 11 new tests in
+  `tests/test_plan16_1.py` + rewritten `test_state_store.py` failure test. Mutation-checked: re-adding the
+  per-failure flush fails 5 tests, dropping `asset_type` fails 2. Full offline suite 441 passed.

@@ -10,7 +10,18 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- **Import state writes no longer commit once per failed object** (PLAN 16.1 §4.4). The migration
+  state table and the import checkpoint are now written every 200 objects **or 5 minutes**, whichever
+  comes first, plus at every phase end and run end. Before, every failure forced its own Delta MERGE
+  (~3–7 s each, plus auto-OPTIMIZE churn), so runs with many failures spent most of their time in
+  bookkeeping. A hard crash loses at most < 200 objects / 5 minutes of bookkeeping; the re-run adopts
+  them (dashboards / Genie / alerts / legacy queries may be duplicated — see the Runbook).
+
+### Fixed
+- The import checkpoint now records each outcome's `asset_type`, so the start-of-run recovery replay
+  restores lost rows for multi-type families (identity, compute, workspace, secrets, SQL, misc), not
+  only single-type ones. Older checkpoints still replay as before.
 
 ## [1.0.0] - 2026-09-07
 

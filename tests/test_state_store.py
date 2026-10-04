@@ -2,7 +2,7 @@
 
 This is the component whose failure is worst: losing the source→target id map means the next run
 creates DUPLICATES and silently drops UPDATES. So the tests here focus on the decision table, the
-write cadence (batch / flush-on-failure / recovery replay), and the source_workspace_id filter that
+write cadence (batch / 300 s / recovery replay), and the source_workspace_id filter that
 keeps 100+ workspace pairs from reading each other's target ids.
 
 The SQL is exercised through a tiny in-memory backend that really parses the MERGE — enough to
@@ -159,18 +159,17 @@ def test_writes_are_batched_not_per_object():
     assert len([s for s in backend.statements if s.strip().startswith("MERGE")]) > merges_before
 
 
-def test_a_failure_flushes_the_successes_before_it():
-    """The customer's explicit requirement: a poison asset must never strand the 199 successes
-    queued in front of it."""
+def test_a_failure_no_longer_forces_a_flush_but_the_phase_flush_keeps_the_successes():
+    """PLAN 16.1 §4.4 (W0-8): a MERGE per failure cost minutes per phase. The successes queued
+    around a failure are persisted by the batch / 300 s / phase-end / `finally` flush instead."""
     st, backend = _store()
     for i in range(5):
         st.record("job", f"ok{i}", action=ACTION_CREATED, fingerprint="f", target_object_id=str(i))
-    assert not [s for s in backend.statements if s.strip().startswith("MERGE")], \
-        "nothing should be flushed yet"
     st.record("job", "poison", action=ACTION_FAILED, error="API said no")
-    assert [s for s in backend.statements if s.strip().startswith("MERGE")], \
-        "a failure must force a flush of the preceding successes"
-    assert ("111", "job", "ok3") in backend.state
+    assert not [s for s in backend.statements if s.strip().startswith("MERGE")], \
+        "a failure must NOT force a flush any more"
+    st.flush()                                   # what the phase boundary does
+    assert ("111", "job", "ok3") in backend.state and ("111", "job", "poison") in backend.state
 
 
 def test_flush_never_raises_so_it_is_safe_in_a_finally():

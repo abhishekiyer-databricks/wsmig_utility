@@ -54,6 +54,18 @@ _LOG = get_logger("state_store")
 # hours of pure bookkeeping on a large workspace.
 STATE_BATCH = 200
 
+# ...OR when the OLDEST pending row has waited this long, whichever comes first (PLAN 16.1 §4.4). Bounds
+# what a HARD crash (driver OOM / node lost / job killed — `finally` never runs) can lose to < 200 rows
+# or 5 minutes of work, without a MERGE per failure: `main` flushed on every `failed` row, i.e. one
+# ~3-7 s Delta commit per failure (109 commits + an OPTIMIZE storm per run on the Wave 0 bed).
+# The import checkpoint uses the same rule (`base_importer`), so it is never further behind.
+FLUSH_SECONDS = 300
+
+
+def flush_clock() -> float:
+    """Monotonic clock for the time-based flush (a module function so tests can replace it)."""
+    return time.monotonic()
+
 
 class UpsertAction(str, Enum):
     """What the importer should DO with a unit (the decision), distinct from what happened."""
@@ -172,7 +184,7 @@ class StateStore:
         self.identity_table_fqn = identity_table_fqn or getattr(config, "identity_map_table_fqn", "")
         self.source_ws_id = safe_str(config.source_workspace_id)
         self.run_id = safe_str(config.run_id)
-        # in-memory pending batches (flushed per STATE_BATCH / phase boundary / finally)
+        # in-memory pending batches (flushed per STATE_BATCH / FLUSH_SECONDS / phase boundary / finally)
         self._pending: list[dict] = []
         self._pending_identity: list[dict] = []
         self._cache: dict[tuple, dict] = {}
@@ -183,6 +195,8 @@ class StateStore:
         # True while rows from a FAILED flush are still pending (cleared by a later flush that
         # writes them). The runner turns it into run_status=completed_state_not_saved.
         self.flush_failed = False
+        # When the oldest still-pending row was queued (None = nothing pending) — the 300 s trigger.
+        self._pending_since: Optional[float] = None
 
     @property
     def enabled(self) -> bool:
@@ -363,10 +377,14 @@ class StateStore:
     def record(self, asset_type: str, natural_key: str, *, action: str, fingerprint: str = "",
                source_object_id: str = "", target_object_id: str = "", error: str = "",
                error_raw: str = "", failure_category: str = "", source_detail: str = "") -> None:
-        """Queue one outcome. Flushed per STATE_BATCH / phase boundary / finally (D2).
+        """Queue one outcome. Flushed per STATE_BATCH rows OR FLUSH_SECONDS, at every phase
+        boundary and in the run's `finally` (D2, PLAN 16.1 §4.4).
 
-        A FAILURE forces a flush: the successes queued BEFORE a poison asset are exactly what must
-        not be lost, so a failure never strands the 199 rows in front of it.
+        A FAILURE does NOT force a flush any more: a recorded failure is not a crash — the phase-end
+        and run-end flushes persist the rows queued around it — and a MERGE per failure made runs
+        with many failures (user-home delay) spend minutes per phase in commits. A HARD crash loses
+        at most < STATE_BATCH rows or FLUSH_SECONDS of work; the checkpoint replay (same run_id) and
+        the live existence probe (ADOPT) recover them on the next run.
         """
         if not self.enabled:
             return
@@ -407,8 +425,7 @@ class StateStore:
         }
         self._cache[key] = row
         self._pending.append(row)
-        if action == ACTION_FAILED or len(self._pending) >= STATE_BATCH:
-            self.flush()
+        self._maybe_flush(len(self._pending))
 
     def record_identity(self, entity_type: str, source_key: str, *, target_id: str,
                         target_key: str = "", source_id: str = "", classification: str = "",
@@ -440,7 +457,21 @@ class StateStore:
         }
         self._identity_cache[key] = row
         self._pending_identity.append(row)
-        if len(self._pending_identity) >= STATE_BATCH:
+        self._maybe_flush(len(self._pending_identity))
+
+    def _maybe_flush(self, queued: int) -> None:
+        """Flush when `queued` reaches STATE_BATCH or the oldest pending row is FLUSH_SECONDS old.
+
+        Checked only when a row is recorded (no background thread), so an idle phase writes nothing.
+        After a FAILED flush the rows stay pending and only the timer retries (restarted by the
+        failure), so a broken table costs one MERGE attempt per FLUSH_SECONDS, not one per row; the
+        phase-end and `finally` flushes still retry as before.
+        """
+        now = flush_clock()
+        if self._pending_since is None:
+            self._pending_since = now
+        batch_full = queued >= STATE_BATCH and not self.flush_failed
+        if batch_full or now - self._pending_since >= FLUSH_SECONDS:
             self.flush()
 
     # ── flush (MERGE on the PK) ───────────────────────────────────────────
@@ -475,9 +506,11 @@ class StateStore:
             if written:
                 self.merges += 1
             self.flush_failed = False
+            self._pending_since = None
             _LOG.debug(f"state flushed  rows={written} ({int((time.time() - t0) * 1000)} ms)")
         except Exception as exc:  # noqa: BLE001 — never raises (called from `finally`), but visible
             self.flush_failed = True
+            self._pending_since = flush_clock()   # retry after FLUSH_SECONDS, not on every row
             _LOG.error("state flush FAILED — rows stay pending; the checkpoint recovery replay "
                        "will re-merge them on the next run", error=str(exc),
                        pending=len(self._pending) + len(self._pending_identity))

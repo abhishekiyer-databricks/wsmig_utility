@@ -955,3 +955,179 @@ def test_gen_state_rows_produces_unique_merge_ready_rows():
     assert len(keys) == 25_000
     assert set(rows[0]) == set(StateStore._STATE_COLS)
     assert all(r["source_workspace_id"] == "999" for r in rows)
+
+
+# ═══════════ §4.4 — state write cadence: 200 rows OR 300 s, no flush per failure ═══════════
+# Wave 0 (main) finding W0-8: a MERGE per FAILED unit = 109 commits + an OPTIMIZE storm per run.
+
+from src.state import state_store as _SS
+from src.state.state_store import ACTION_FAILED, STATE_BATCH, FLUSH_SECONDS, UpsertAction
+
+
+class _Clock:
+    """Fake monotonic clock for the time-based flush."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr(_SS, "flush_clock", c)
+    return c
+
+
+def _merges(backend):
+    return [s for s in backend.statements if s.strip().startswith("MERGE")]
+
+
+def _loaded_store(backend=None):
+    st = _store_with(backend or FakeBackend())
+    st.load()
+    return st
+
+
+def test_a_failure_does_not_force_a_flush(clock):
+    st = _loaded_store()
+    for i in range(STATE_BATCH - 1):
+        st.record("notebook", f"/n{i}", action=ACTION_FAILED, error="home not provisioned")
+    assert _merges(st.backend) == [], "199 failures must cost 0 MERGEs (main: 199)"
+    assert len(st._pending) == STATE_BATCH - 1
+
+
+def test_two_hundred_mixed_rows_flush_once(clock):
+    st = _loaded_store()
+    for i in range(STATE_BATCH):
+        st.record("notebook", f"/n{i}", action=ACTION_FAILED if i % 2 else ACTION_CREATED,
+                  target_object_id=str(i))
+    assert len(_merges(st.backend)) == 1 and st._pending == []
+    assert ("111", "notebook", "/n7") in st.backend.state and ("111", "notebook", "/n8") in st.backend.state
+
+
+def test_the_oldest_pending_row_flushes_after_300_seconds(clock):
+    st = _loaded_store()
+    st.record("job", "a", action=ACTION_CREATED, target_object_id="1")
+    clock.t += FLUSH_SECONDS - 1
+    st.record("job", "b", action=ACTION_FAILED)
+    assert _merges(st.backend) == [], "299 s after the oldest row → no flush yet"
+    clock.t += 1
+    st.record("job", "c", action=ACTION_CREATED, target_object_id="3")
+    assert len(_merges(st.backend)) == 1 and st._pending == []
+    # the timer restarts with the NEXT queued row, not at the flush
+    clock.t += 10_000
+    st.record("job", "d", action=ACTION_CREATED, target_object_id="4")
+    assert len(_merges(st.backend)) == 1, "an idle gap with nothing pending must not flush"
+    clock.t += FLUSH_SECONDS
+    st.record("job", "e", action=ACTION_CREATED, target_object_id="5")
+    assert len(_merges(st.backend)) == 2
+
+
+def test_identity_rows_follow_the_same_rule(clock):
+    st = _loaded_store()
+    st.record_identity("user", "u1", target_id="t1")
+    assert _merges(st.backend) == []
+    clock.t += FLUSH_SECONDS
+    st.record_identity("user", "u2", target_id="t2")
+    assert len(_merges(st.backend)) == 1 and st._pending_identity == []
+
+
+def test_after_a_failed_flush_only_the_timer_retries_not_every_row(clock):
+    backend = FailingMergeBackend()
+    st = _loaded_store(backend)
+    for i in range(STATE_BATCH):
+        st.record("job", f"j{i}", action=ACTION_CREATED, target_object_id=str(i))
+    assert len(_merges(backend)) == 1 and st.flush_failed is True
+    for i in range(50):                       # main would retry the MERGE on every one of these
+        st.record("job", f"k{i}", action=ACTION_CREATED, target_object_id=str(i))
+    assert len(_merges(backend)) == 1, "a broken table must not be hammered once per row"
+    backend.fail_merges = False
+    clock.t += FLUSH_SECONDS
+    st.record("job", "last", action=ACTION_CREATED, target_object_id="x")
+    assert len(_merges(backend)) == 2 and st.flush_failed is False and st._pending == []
+
+
+def test_explicit_flush_still_writes_everything_and_resets_the_timer(clock):
+    """Phase-end and run-end (`finally`) flushes are unchanged."""
+    st = _loaded_store()
+    st.record("job", "a", action=ACTION_FAILED)
+    assert st.flush() == 1 and st._pending_since is None
+    clock.t += FLUSH_SECONDS - 1
+    st.record("job", "b", action=ACTION_CREATED, target_object_id="2")
+    assert len(_merges(st.backend)) == 1, "the timer starts at the first row after a flush"
+
+
+# ── checkpoint follows the same rule, and carries asset_type for the replay ──
+
+from tests.test_import_framework import ToyImporter, _setup, _unit   # noqa: E402
+
+
+def _cp(aw, component="import:compute"):
+    return aw.get_results(component) or {}
+
+
+def test_checkpoint_flushes_on_200_or_300_seconds_not_per_unit(clock):
+    imp, aw, _st, _cfg = _setup([_unit(f"c{i}") for i in range(3)])
+    calls = []
+    real = aw.mark_done_bulk
+    aw.mark_done_bulk = lambda *a, **k: (calls.append(len(a[1])), real(*a, **k))
+    imp._phase_t0 = 0
+    for u in imp.load():
+        imp._record(u, "created", target_id="t")
+    assert calls == [], "3 outcomes < 200 and < 300 s → still pending"
+    clock.t += FLUSH_SECONDS
+    imp._record(_unit("c3"), "created", target_id="t")
+    assert calls == [4] and imp._cp_since is None
+    imp._record(_unit("c4"), "failed")
+    imp.flush_checkpoint()                   # phase end unchanged
+    assert calls == [4, 1]
+
+
+def test_checkpoint_outcome_carries_asset_type():
+    imp, aw, _st, _cfg = _setup([_unit("c1")])
+    imp.run()
+    assert _cp(aw)["c1"]["asset_type"] == "cluster"
+
+
+def test_hard_crash_state_batch_lost_is_restored_by_the_replay_for_a_multi_type_family(clock):
+    """Driver dies after the checkpoint was written but before the state batch was MERGEd (no
+    `finally`). `compute` holds 3 asset types, so before §4.4 the replay could not key these rows
+    and dropped them. Now they come back, and the next decision is SKIP — never a duplicate CREATE."""
+    imp, aw, st, cfg = _setup([_unit("c1"), _unit("c2")])
+    imp.run()                                 # phase end flushes the CHECKPOINT (not the state)
+    assert _merges(st.backend) == [] and len(st._pending) == 2   # the batch that dies with the driver
+    backend = st.backend
+    del st                                    # hard crash: pending rows gone
+
+    from src.importers.import_runner import ImportRunner
+    fresh = StateStore(backend, cfg)
+    fresh.ensure_table()
+    fresh.load()
+    runner = ImportRunner.__new__(ImportRunner)
+    runner.aw = aw
+    assert fresh.recovery_replay(runner._all_checkpoint_outcomes()) == 2
+    assert fresh.get_target_id("cluster", "c1") == "tgt-c1"
+    assert fresh.decide("cluster", "c1", "sha256:v1", exists_on_target=True) is UpsertAction.SKIP
+
+
+def test_hard_crash_with_nothing_saved_adopts_instead_of_duplicating(clock):
+    """Both stores lost (crash before either flushed): the live existence probe finds the object
+    the dead run created, so the next run ADOPTs it rather than creating a second one."""
+    imp, _aw, st, _cfg = _setup([_unit("c1")])
+    st._pending.clear()
+    assert st.decide("cluster", "c1", "sha256:v1", exists_on_target=True) is UpsertAction.ADOPT
+
+
+def test_old_checkpoint_rows_without_asset_type_still_replay_for_single_type_families():
+    """Backward compat: a checkpoint written by `main` (no asset_type) keeps the runner's fallback."""
+    from src.importers.import_runner import ImportRunner
+    imp, aw, _st, _cfg = _setup([])
+    aw.mark_done_bulk("import:jobs", ["j1"], {"j1": {"import_status": "created", "target_id": "9",
+                                                     "fingerprint": "f", "source_id": "1",
+                                                     "note": ""}})
+    runner = ImportRunner.__new__(ImportRunner)
+    runner.aw = aw
+    assert "job|j1" in runner._all_checkpoint_outcomes()
