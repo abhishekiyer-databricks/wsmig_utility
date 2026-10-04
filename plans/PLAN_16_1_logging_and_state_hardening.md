@@ -327,8 +327,9 @@ All step-0 research is complete (results in §3.0, §4.0, §10). Nothing remains
 ## 8. Live QA (Claude, after the user pushes the branch)
 All runs on a **classic job cluster** (no serverless runs).
 1. **Wave 0 golden baseline on `main`** (master plan) if not already done.
-2. Branch at the pushed commit: dry-run job → live job → seed incremental edits → live job →
-   `retry_mode=failed_only`.
+2. Branch at the pushed commit, fresh target, state schema `catalog_ws_xaik9y.wsmig_state_16_1`
+   (direct mode, live only — no dry-run job, per master "QA run model"): live job → seed incremental
+   edits → live job → `retry_mode=failed_only`.
 3. **Golden diff:** per-asset-type status counts identical to Wave 0 (expected diff: none).
 4. **Output review**, for each of inventory/export/import:
    - cell: every phase shows `Phase:` + `Phase complete:` and progress lines every 500; the run exports

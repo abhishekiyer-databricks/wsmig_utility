@@ -42,8 +42,19 @@ PLAN_14 and PLAN_15 are folded in (16.1 and 16.5).
 ## Wave 0 — golden baseline (no code; done before 16.1's live QA)
 Fresh target; `main`'s `direct_end_to_end_live` on the full fixture bed, on a **classic job
 cluster**: Run 1 → seed incremental edits → Run 2 → `retry_mode=failed_only`. Save all xlsx + a CSV of
-the state table + per-stage timings to `~/Downloads/wsmig_runs/plan16_golden/`. Add
-`tests/golden_diff.py` (per sheet × status counts + a fixed per-object sample).
+the state table + per-stage timings + downloaded driver logs + `FINDINGS.md` (how `main` behaves) to
+`~/Desktop/wsmig_runs/plan16_golden/`. Add `tests/golden_diff.py` (per sheet × status counts + a fixed
+per-object sample).
+
+**QA run model (user 2026-10-04):** LIVE + DIRECT mode only — **no dry-run jobs**. One identity,
+`ai27_wsmig_runner` (account SP, workspace ADMIN on both sides) = the direct-mode source read SP
+(client id + OAuth secret, target scope `wsmig_runner/client_id|client_secret`) AND every job's run-as —
+exactly how the customer runs it. `tests/runner_sp.py ensure source_ws target_ws` + `scope target_ws`
+on every fresh target (secret saved once at `~/.wsmig/ai27_wsmig_runner.json`, 600, never printed).
+UC lives in the region metastore and SURVIVES a target rebuild → one **state schema per run**
+(`catalog_ws_xaik9y.wsmig_state_main` for Wave 0, `…wsmig_state_16_<n>` per wave), staging volume
+`/Volumes/catalog_ws_xaik9y/wsmig_staging/staging`, with a run-specific subfolder. Reports per wave in
+`~/Desktop/wsmig_runs/plan16_<n>/`. A fresh target per wave (the user recreates it).
 
 ## The waves
 

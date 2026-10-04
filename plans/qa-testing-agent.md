@@ -22,9 +22,17 @@ pass too when the item touches the source-side job or the handoff (B1).
 **Compute (PLAN 16, user decision 2026-10-04): every job run uses a CLASSIC job cluster** — the
 customer's cross-workspace connectivity only works on classic. No serverless runs.
 
+**Run model (PLAN 16, user decision 2026-10-04): LIVE + DIRECT mode only, NO dry-run jobs.** Run
+identity = `ai27_wsmig_runner` (account SP, workspace ADMIN on source AND target) — it is the
+direct-mode source SP (client id + OAuth secret from target scope `wsmig_runner`) AND every job's
+run-as. On a fresh target: `python3 tests/runner_sp.py ensure source_ws target_ws` then
+`python3 tests/runner_sp.py scope target_ws`. One state schema per run (UC survives a target rebuild):
+`catalog_ws_xaik9y.wsmig_state_main` (Wave 0) / `…wsmig_state_16_<n>`; staging
+`/Volumes/catalog_ws_xaik9y/wsmig_staging/staging`. Reports → `~/Desktop/wsmig_runs/plan16_<golden|n>/`.
+
 **Scope per run (PLAN 16):** test ONLY the current wave's sub-plan (its "Live QA" section + acceptance)
-PLUS the **golden-baseline diff** against the Wave 0 `main` run (`~/Downloads/wsmig_runs/plan16_golden/`,
-`tests/golden_diff.py`): per-asset-type status counts must match except the sub-plan's declared
+PLUS the **golden-baseline diff** against the Wave 0 `main` run (`~/Desktop/wsmig_runs/plan16_golden/`,
+`tests/golden_diff.py`; saved under `~/Desktop/wsmig_runs/plan16_golden/`): per-asset-type status counts must match except the sub-plan's declared
 *expected diff*. Any other difference is a regression — file it, stop, ask.
 
 You have **Azure account-admin** and **Databricks account-admin** rights (confirmed with the user), so
@@ -61,8 +69,8 @@ standing up the fixtures — including Azure identities and catalogs on both sid
 5. **Create a git folder on the target (and source, for airgap) workspace** and pull the branch under
    development. Record the exact **commit SHA** under test in your findings.
 6. **Run `00_Install_Jobs`** to deploy the jobs (`direct_end_to_end_live`/`_dry_run`,
-   `inventory`/`export`/`import`, `airgap_source`), then **run the dry-run job first** (rehearsal) and
-   the **end-to-end LIVE job**; wait for completion.
+   `inventory`/`export`/`import`, `airgap_source`), then run the **end-to-end LIVE job** (direct mode;
+   PLAN 16: no dry-run job); wait for completion.
 7. **Validate every Sheet of every report** against the live workspace (not just internal consistency):
    random sampling + "anything that looks off, go check," cross-checked against the **known source truth
    you created**. Cover `inventory.xlsx` (per-type tabs + Summary), `export_status.xlsx`, and
