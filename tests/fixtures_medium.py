@@ -129,6 +129,13 @@ def _acct():
     return AccountClient(profile=ACCT_PROFILE)
 
 
+def _assigned_principal_ids() -> set:
+    """Principal ids currently assigned to this workspace (workspace-scoped read)."""
+    doc = w.api_client.do("GET", "/api/2.0/preview/permissionassignments") or {}
+    return {str((pa.get("principal") or {}).get("principal_id"))
+            for pa in doc.get("permission_assignments", []) or []}
+
+
 def _assign_to_workspace(principal_id, permissions=("USER",)):
     """Assign an account-level identity to this workspace.
 
@@ -380,11 +387,29 @@ def phase_identity():
 
     # 2. UMI-backed SPs (ai27_umi_1, ai27_umi_2) — looked up via az identity list, NOT created.
     #    If missing → FLAG, but don't fail the whole phase.
-    subs = []
-    r = _az("account", "list", "--query", "[].id", "-o", "json")
-    if not r.returncode:
-        subs = json.loads(r.stdout) or []
+    # Preferred (user 2026-10-04): the UMI SPs are already added to the account AND assigned to the
+    # workspace by the user — adopt the ASSIGNED account SP by displayName, no Azure call. (Stale
+    # same-named SPs from a deleted workspace may exist in the account; the assigned one wins.)
+    assigned_ids = _assigned_principal_ids()
+    pending_umis = []
     for umi_name in UMI_SP_NAMES:
+        cands = list(a.service_principals.list(filter=f'displayName eq "{umi_name}"'))
+        pick = next((s for s in cands if str(s.id) in assigned_ids), None)
+        if pick:
+            log(f"UMI SP adopted (already in account + workspace): {umi_name} "
+                f"(appId={pick.application_id})")
+            if len(cands) > 1:
+                flags.append(f"UMI {umi_name}: {len(cands) - 1} stale same-named account SP(s) "
+                             f"not assigned to this workspace (ignored)")
+                log(f"FLAG: {flags[-1]}")
+        else:
+            pending_umis.append(umi_name)
+    subs = []
+    if pending_umis:
+        r = _az("account", "list", "--query", "[].id", "-o", "json")
+        if not r.returncode:
+            subs = json.loads(r.stdout) or []
+    for umi_name in pending_umis:
         umi = None
         for sub in subs or [None]:
             args = ["identity", "list", "--query", f"[?name=='{umi_name}']", "-o", "json"]
@@ -416,6 +441,13 @@ def phase_identity():
     # 3. Entra-backed groups (ai27_entragrp_1, ai27_entragrp_2) — looked up via az ad group show.
     #    If missing → FLAG; provision to account with externalId, assign to workspace.
     for eg in ENTRA_GROUP_NAMES:
+        # Preferred (user 2026-10-04): the user already added the Entra group to the account and
+        # the workspace → adopt it as-is, no Azure call, no membership edits (Entra owns it).
+        pre = next(iter(a.groups.list(filter=f'displayName eq "{eg}"')), None)
+        if pre and str(pre.id) in assigned_ids:
+            log(f"Entra group adopted (already in account + workspace): {eg} "
+                f"(externalId={pre.external_id})")
+            continue
         r = _az("ad", "group", "show", "--group", eg, "-o", "json")
         if r.returncode:
             flags.append(f"Entra group {eg}: NOT found (user must create Azure Entra group)")
@@ -774,9 +806,9 @@ def phase_uc():
         # the schema has to come first — without it every CREATE TABLE below fails
         f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}",
         f"CREATE TABLE IF NOT EXISTS {CATALOG}.{SCHEMA}.trips (zip STRING, trips INT, avg_dist DOUBLE)",
-        f"INSERT INTO {CATALOG}.{SCHEMA}.trips VALUES ('94103', 120, 3.4), ('94107', 88, 2.1)",
+        f"INSERT OVERWRITE {CATALOG}.{SCHEMA}.trips VALUES ('94103', 120, 3.4), ('94107', 88, 2.1)",
         f"CREATE TABLE IF NOT EXISTS {CATALOG}.{SCHEMA}.zones (zip STRING, borough STRING)",
-        f"INSERT INTO {CATALOG}.{SCHEMA}.zones VALUES ('94103','SF'), ('94107','SF')",
+        f"INSERT OVERWRITE {CATALOG}.{SCHEMA}.zones VALUES ('94103','SF'), ('94107','SF')",
     ]
     for s in stmts:
         try:
@@ -839,18 +871,31 @@ def phase_warehouses():
 
 # ─────────────────────────── SQL (queries + all alert types + legacy dash) ─
 
+class _Exists(Exception):
+    """Control flow: the object already exists → skip its create (idempotent re-run)."""
+
+
 def phase_sql():
     print("== sql (queries, legacy alert, alerts v2, legacy dashboard) ==")
     wh = _warehouse_id()
+    # Idempotency: NONE of these creates dedupe by name — a re-run silently makes timestamp-
+    # suffixed duplicate queries/alerts — so look each one up first.
+    have_q = {q.display_name for q in w.queries.list()}
+    have_a2 = {a.display_name for a in w.alerts_v2.list_alerts()}
+    have_la = {a.name for a in w.alerts_legacy.list()}
     # 1. Query via the current /api/2.0/sql/queries API (collector tags this legacy_query).
     qid = None
     try:
         from databricks.sdk.service.sql import CreateQueryRequestQuery
+        if "wsmig_test_query" in have_q:
+            raise _Exists("query exists: wsmig_test_query")
         q = w.queries.create(query=CreateQueryRequestQuery(
             display_name="wsmig_test_query", warehouse_id=wh,
             query_text=f"SELECT * FROM {CATALOG}.{SCHEMA}.trips"))
         qid = q.id
         log(f"query: wsmig_test_query ({qid})")
+    except _Exists as e:
+        log(str(e))
     except Exception as e:
         log(f"query: {str(e)[:90]}")
 
@@ -868,8 +913,11 @@ def phase_sql():
                       evaluation=ev,
                       schedule=CronSchedule(quartz_cron_schedule="0 0 9 * * ?",
                                             timezone_id="UTC"))
-        r = w.alerts_v2.create_alert(alert=av2)
-        log(f"alert_v2: wsmig_test_alert_v2 ({getattr(r,'id',None)})")
+        if "wsmig_test_alert_v2" in have_a2:
+            log("alert_v2 exists: wsmig_test_alert_v2")
+        else:
+            r = w.alerts_v2.create_alert(alert=av2)
+            log(f"alert_v2: wsmig_test_alert_v2 ({getattr(r,'id',None)})")
         # A SECOND alert_v2 — different operator + UNSCHEDULED — alerts have been bug-prone
         # (alert_v2 update-detected-but-never-applied, object-type spellings), so cover >1 shape.
         ev2 = AlertV2Evaluation(
@@ -881,20 +929,27 @@ def phase_sql():
                        evaluation=ev2,
                        schedule=CronSchedule(quartz_cron_schedule="0 0 18 * * ?",
                                              timezone_id="UTC"))
-        rb = w.alerts_v2.create_alert(alert=av2b)
-        log(f"alert_v2: wsmig_test_alert_v2_b ({getattr(rb,'id',None)})")
+        if "wsmig_test_alert_v2_b" in have_a2:
+            log("alert_v2 exists: wsmig_test_alert_v2_b")
+        else:
+            rb = w.alerts_v2.create_alert(alert=av2b)
+            log(f"alert_v2: wsmig_test_alert_v2_b ({getattr(rb,'id',None)})")
     except Exception as e:
         log(f"alert_v2: {str(e)[:140]}")
 
     # 3. Legacy alert (/api/2.0/sql/alerts family via alerts_legacy) — needs a legacy query.
     try:
         from databricks.sdk.service.sql import AlertOptions
+        if "wsmig_test_legacy_alert" in have_la:
+            raise _Exists("legacy_alert exists: wsmig_test_legacy_alert")
         lq = w.queries_legacy.create(name="wsmig_test_legacy_q", query="SELECT 1 AS v",
                                      data_source_id=_legacy_data_source_id(wh))
         la = w.alerts_legacy.create(name="wsmig_test_legacy_alert",
                                     query_id=lq.id,
                                     options=AlertOptions(column="v", op=">", value="0"))
         log(f"legacy_alert: wsmig_test_legacy_alert ({la.id})")
+    except _Exists as e:
+        log(str(e))
     except Exception as e:
         log(f"legacy_alert: {str(e)[:110]}")
 
@@ -1097,38 +1152,31 @@ def phase_jobs():
                          job_cluster_key="shared")],
         parameters=[jobs.JobParameterDefinition(name="run_date", default="2026-01-01")])
 
-    # 7. SQL task — runs a query (requires a warehouse)
-    existing_warehouse = next((w.sql.list_warehouses() for _ in [1] if list(w.sql.list_warehouses())), None)
-    if existing_warehouse:
+    # 7. SQL task — runs a real query on a real warehouse (both are id references to remap).
+    wh_id = next((x.id for x in w.warehouses.list() if x.name == "wsmig_test_wh_pro"), None)
+    q_id = next((q.id for q in w.queries.list() if q.display_name == "wsmig_test_query"), None)
+    if wh_id and q_id:
         specs["wsmig_test_sql_task_job"] = dict(
-            tasks=[jobs.Task(task_key="sql_task", sql_task=jobs.SqlTask(query_id=""),
-                            existing_cluster_id=existing_cluster_id if existing_cluster_id else None)],
-        )
+            tasks=[jobs.Task(task_key="sql_task", sql_task=jobs.SqlTask(
+                query=jobs.SqlTaskQuery(query_id=q_id), warehouse_id=wh_id))])
+    else:
+        log(f"sql_task job skipped: warehouse={wh_id} query={q_id}")
 
-    # 8. dbt_task (dbt run)
+    # 8. dbt_task (workspace-sourced project dir; the job is never run, only migrated)
     specs["wsmig_test_dbt_job"] = dict(
-        tasks=[jobs.Task(task_key="dbt_task", dbt_task=jobs.DbtTask(commands=["dbt run"]),
-                        new_cluster=_job_cluster())],
-    )
+        tasks=[jobs.Task(task_key="dbt_task",
+                         dbt_task=jobs.DbtTask(commands=["dbt deps", "dbt run"],
+                                               project_directory=f"/Workspace{SHARED}/dbt_project",
+                                               source=jobs.Source.WORKSPACE),
+                         new_cluster=_job_cluster())])
 
-    # 9. spark_python_task (Python with Spark context)
+    # 9. spark_python_task on a real workspace .py file (written by phase_users_content)
     specs["wsmig_test_python_job"] = dict(
-        tasks=[jobs.Task(task_key="python", spark_python_task=jobs.SparkPythonTask(python_file="dbfs:/path/to/main.py"),
-                        new_cluster=_job_cluster())],
-    )
-
-    # 10. run_job_task (triggers another job) — will reference a job by ID
-    # This is a placeholder; the actual job ID would be set at runtime if available
-    specs["wsmig_test_run_job_task_job"] = dict(
-        tasks=[jobs.Task(task_key="trigger", run_job_task=jobs.RunJobTask(job_id=0),
-                        new_cluster=_job_cluster())],
-    )
-
-    # 11. pipeline_task (triggers a DLT pipeline) — references a pipeline by ID
-    specs["wsmig_test_pipeline_task_job"] = dict(
-        tasks=[jobs.Task(task_key="pipeline_trig", pipeline_task=jobs.PipelineTask(pipeline_id=""),
-                        new_cluster=_job_cluster())],
-    )
+        tasks=[jobs.Task(task_key="python",
+                         spark_python_task=jobs.SparkPythonTask(
+                             python_file=f"/Workspace/Users/{ME}/wsmig/helpers.py",
+                             source=jobs.Source.WORKSPACE),
+                         new_cluster=_job_cluster())])
 
     for name, spec in specs.items():
         if name in have:
@@ -1140,6 +1188,85 @@ def phase_jobs():
                 f"{' scheduled' if 'schedule' in spec else ''}")
         except Exception as e:
             log(f"job {name}: {str(e)[:120]}")
+
+    # 10. run_job_task → a REAL job id (created above), a job→job id reference to remap.
+    by_name = {j.settings.name: j.job_id for j in w.jobs.list()}
+    if "wsmig_test_run_job_task_job" in by_name:
+        log("job exists: wsmig_test_run_job_task_job")
+    elif by_name.get("wsmig_test_single_job"):
+        try:
+            j = w.jobs.create(name="wsmig_test_run_job_task_job", tasks=[jobs.Task(
+                task_key="trigger",
+                run_job_task=jobs.RunJobTask(job_id=by_name["wsmig_test_single_job"]))])
+            log(f"job: wsmig_test_run_job_task_job ({j.job_id}) → runs "
+                f"wsmig_test_single_job ({by_name['wsmig_test_single_job']})")
+        except Exception as e:
+            log(f"job wsmig_test_run_job_task_job: {str(e)[:120]}")
+    # 11. the pipeline_task job is created at the end of phase_dlt (needs a real pipeline id).
+
+    # 12. run_as an ACCOUNT SP (appId must stay stable on target; the importer keeps it as-is).
+    sp = next(iter(w.service_principals.list(filter=f'displayName eq "{ACCOUNT_SP_NAMES[0]}"')),
+              None)
+    if "wsmig_test_runas_sp_job" in by_name:
+        log("job exists: wsmig_test_runas_sp_job")
+    elif not sp:
+        log(f"FLAG: wsmig_test_runas_sp_job skipped — {ACCOUNT_SP_NAMES[0]} not on the workspace")
+    else:
+        _ensure_sp_user_role(sp.application_id)
+        try:
+            j = w.jobs.create(name="wsmig_test_runas_sp_job",
+                              run_as=jobs.JobRunAs(service_principal_name=sp.application_id),
+                              tasks=[jobs.Task(task_key="t1",
+                                               notebook_task=jobs.NotebookTask(notebook_path=nb),
+                                               new_cluster=_job_cluster())])
+            log(f"job: wsmig_test_runas_sp_job ({j.job_id}) run_as={ACCOUNT_SP_NAMES[0]}")
+        except Exception as e:
+            log(f"job wsmig_test_runas_sp_job: {str(e)[:120]}")
+
+
+def _ensure_sp_user_role(app_id: str) -> None:
+    """Binding a job's run_as to an SP needs `servicePrincipal.user` on that SP for the creator.
+    The SP's creator is its manager, so it can grant itself the role (additive, idempotent)."""
+    acct = _acct().config.account_id
+    name = f"accounts/{acct}/servicePrincipals/{app_id}/ruleSets/default"
+    me = f"users/{ME}"
+    try:
+        rs = w.api_client.do("GET", "/api/2.0/preview/accounts/access-control/rule-sets",
+                             query={"name": name, "etag": ""})
+        rules = rs.get("grant_rules", []) or []
+        r = next((x for x in rules if x.get("role") == "roles/servicePrincipal.user"), None)
+        if r and me in (r.get("principals") or []):
+            return
+        if r:
+            r["principals"] = list(r.get("principals") or []) + [me]
+        else:
+            rules.append({"role": "roles/servicePrincipal.user", "principals": [me]})
+        w.api_client.do("PUT", "/api/2.0/preview/accounts/access-control/rule-sets",
+                        body={"name": name, "rule_set": {"name": name, "grant_rules": rules,
+                                                         "etag": rs.get("etag", "")}})
+        log(f"  servicePrincipal.user granted to {ME} on {app_id}")
+    except Exception as e:
+        log(f"  servicePrincipal.user on {app_id}: {str(e)[:110]}")
+
+
+def _pipeline_task_job():
+    """A job whose task triggers a REAL DLT pipeline (job→pipeline id reference to remap)."""
+    from databricks.sdk.service import jobs
+    name = "wsmig_test_pipeline_task_job"
+    if any(j.settings.name == name for j in w.jobs.list()):
+        log(f"job exists: {name}")
+        return
+    pid = next((p.pipeline_id for p in w.pipelines.list_pipelines()
+                if p.name == "wsmig_test_pipeline"), None)
+    if not pid:
+        log(f"job {name} skipped: pipeline wsmig_test_pipeline not found")
+        return
+    try:
+        j = w.jobs.create(name=name, tasks=[jobs.Task(
+            task_key="pipeline_trig", pipeline_task=jobs.PipelineTask(pipeline_id=pid))])
+        log(f"job: {name} ({j.job_id}) → pipeline {pid}")
+    except Exception as e:
+        log(f"job {name}: {str(e)[:120]}")
 
 
 def _job_cluster():
@@ -1199,6 +1326,7 @@ def phase_dlt():
             log(f"dlt pipeline: {name} ({p.pipeline_id})")
         except Exception as e:
             log(f"dlt pipeline {name}: {str(e)[:120]}")
+    _pipeline_task_job()
 
 
 # ─────────────────────────── misc (GIS, cluster lib, ws conf) ──────────────
@@ -1302,7 +1430,13 @@ def phase_akv():
     secrets/scopes ourselves rather than going through the SDK client.
     """
     print("== akv-backed secret scope ==")
-    vault = f"wsmigtestkv{ME.split('@')[0].replace('.', '')[:8]}"
+    # Vault names are GLOBAL and a deleted vault stays soft-deleted (name unusable) for 90 days, so
+    # derive the name from the workspace id (unique per source bed; 7+16 = 23 ≤ 24 chars).
+    vault = os.environ.get("WSMIG_AKV_NAME") or f"wsmigkv{w.get_workspace_id()}"[:24]
+    have = [s_.name for s_ in w.secrets.list_scopes() if s_.name == "wsmig_test_akv_scope"]
+    if have:
+        log("AKV-backed secret scope exists: wsmig_test_akv_scope")
+        return
     az = _az
 
     # The db_fe management group denies any resource without an `owner` tag, so tag both.
@@ -1665,8 +1799,15 @@ resources:
               openai_config:
                 openai_api_key_plaintext: sk-dummy-not-a-real-key
 """)
-    r = subprocess.run([cli, "bundle", "deploy", "-p", PROFILE],
-                       cwd=d, capture_output=True, text=True, env=env)
+    # Same CLI OAuth-cache workaround as phase_dab: direct host+token auth minted from the SDK.
+    _bearer = (w.config.authenticate() or {}).get("Authorization", "").replace("Bearer ", "")
+    if _bearer:
+        env = dict(env, DATABRICKS_HOST=w.config.host, DATABRICKS_TOKEN=_bearer)
+        env.pop("DATABRICKS_CONFIG_PROFILE", None)
+        deploy_cmd = [cli, "bundle", "deploy"]
+    else:
+        deploy_cmd = [cli, "bundle", "deploy", "-p", PROFILE]
+    r = subprocess.run(deploy_cmd, cwd=d, capture_output=True, text=True, env=env)
     if r.returncode:
         log(f"deploy FAILED: {(r.stderr or r.stdout)[-800:]}")
     else:
@@ -1716,9 +1857,14 @@ def _acl_principals():
     groups, DB-managed account groups (flat/nested/mixed) and account SPs — none are remapped.
     """
     out = []
-    u = next(iter(w.users.list(filter=f'userName eq "{ENTRA_USERS[0]}"')), None)
-    if u:
-        out.append(("user_name", u.user_name, "entra user"))
+    # Users: two NON-runner, non-orphan users. Never ME: the runner OWNS every fixture object, so a
+    # grant to it is invisible, and on jobs/pipelines it demotes the owner ("exactly one owner").
+    # Also not ENTRA_USERS[1]/[3] (they own a job/pipeline/warehouse via phase_cross_acls).
+    for idx, kind in ((2, "entra user"), (5, "entra user 2")):
+        if len(ENTRA_USERS) > idx and ENTRA_USERS[idx] != ME:
+            u = next(iter(w.users.list(filter=f'userName eq "{ENTRA_USERS[idx]}"')), None)
+            if u:
+                out.append(("user_name", u.user_name, kind))
     # Account-level groups ONLY (the customer has no workspace-local groups): both Entra-backed
     # groups + a DB-managed account group + the nested parent + the mixed group. DISTINCT kind labels
     # so the coverage report counts real principals, not collapsed duplicate labels.
@@ -1731,10 +1877,17 @@ def _acl_principals():
             out.append(("group_name", gname, kind))
     # Account-level SPs (stable appId, identity preserved on target — assigned, NOT remapped), so the
     # ACL replay covers the "keep the applicationId" SP principal kind. Both, for more than one grant.
-    for i, sp_name in enumerate(ACCOUNT_SP_NAMES):
+    sp_kinds = ([(n, f"account SP ({i + 1})") for i, n in enumerate(ACCOUNT_SP_NAMES)]
+                + [(n, f"UMI SP ({i + 1})") for i, n in enumerate(UMI_SP_NAMES)])
+    for sp_name, kind in sp_kinds:
+        # WORKSPACE SCIM = only SPs actually assigned here. A missing one is FLAGGED and skipped —
+        # granting to it would fail every object it rotates onto ("principal does not exist").
         sp = next(iter(w.service_principals.list(filter=f'displayName eq "{sp_name}"')), None)
-        if sp:
-            out.append(("service_principal_name", sp.application_id, f"account SP ({i + 1})"))
+        if sp and sp.application_id:
+            out.append(("service_principal_name", sp.application_id, kind))
+        else:
+            log(f"FLAG: {sp_name} is NOT assigned to this workspace — no ACLs granted to it "
+                f"(assign it, then re-run `acls`)")
     return out
 
 
@@ -1812,6 +1965,12 @@ def _acl_targets():
 
     walk(SHARED)
     walk(USERDIR)
+    for email in ENTRA_USERS:            # per-user content (phase_users_content), orphans included
+        base = _user_base(email)
+        oid = _obj_id(base)
+        if oid:
+            t.append(("directories", oid, base))
+        walk(base)
     return t
 
 
@@ -1845,7 +2004,9 @@ def phase_acls():
         # service principal — never receive a single grant, and SP grants are exactly the ones
         # that must be remapped on import.
         acl = []
-        for i, level in enumerate(ladder):
+        n_grants = min(max(len(ladder), 3), len(principals))
+        for i in range(n_grants):
+            level = ladder[i % len(ladder)]
             field, value, kind = principals[(n_obj + i) % len(principals)]
             acl.append({field: value, "permission_level": level})
             pairs_seen.add((kind, level))
@@ -1892,6 +2053,46 @@ def phase_acls():
             except Exception as e:
                 log(f"secret acl {scope}/{level}: {str(e)[:80]}")
     log(f"secret scope ACLs: {n} grants across {len(scope_names)} scopes")
+    _verify_acls(targets, principals)
+
+
+def _verify_acls(targets, principals):
+    """READ-BACK: every target object must carry >=1 DIRECT grant to a fixture principal (not just
+    owner/admins), and every fixture principal must hold grants somewhere. Prints a per-type table
+    + any object without grants, so a silently-thin ACL bed is visible."""
+    want = {v for _f, v, _k in principals}
+    per_type, bare, held = {}, [], {v: 0 for v in want}
+    for obj_type, obj_id, label in targets:
+        if obj_type not in ACL_LADDER or obj_id is None:
+            continue
+        try:
+            doc = w.api_client.do("GET", f"/api/2.0/permissions/{obj_type}/{obj_id}") or {}
+        except Exception as e:
+            bare.append(f"{obj_type} {label}: read failed {str(e)[:60]}")
+            continue
+        hits = 0
+        for ace in doc.get("access_control_list", []) or []:
+            who = ace.get("user_name") or ace.get("group_name") or ace.get("service_principal_name")
+            direct = [pm for pm in ace.get("all_permissions", []) or [] if not pm.get("inherited")]
+            if who in want and direct:
+                hits += 1
+                held[who] += 1
+        t = per_type.setdefault(obj_type, [0, 0])
+        t[0] += 1
+        t[1] += 1 if hits else 0
+        if not hits:
+            bare.append(f"{obj_type} {label}")
+    log("ACL read-back (objects with fixture grants / objects):")
+    for ot in sorted(per_type):
+        log(f"  {ot}: {per_type[ot][1]}/{per_type[ot][0]}")
+    for _f, v, k in principals:
+        log(f"  {k} {v}: grants on {held[v]} objects")
+    if bare:
+        log(f"  !! {len(bare)} objects WITHOUT fixture grants:")
+        for b in bare[:40]:
+            log(f"     - {b}")
+    else:
+        log("  ✓ every object carries fixture grants")
 
 
 # ───────────────────── SCALE fixtures (B6 parallelism) ──────────────────────
@@ -2193,11 +2394,13 @@ def phase_check():
     else:
         log(f"Entra users: ✓ ({len(ENTRA_USERS)} present)")
 
-    # 3. UMIs present (looked up via az)
+    # 3. UMIs + Entra groups: present in the ACCOUNT and ASSIGNED to this workspace (the user adds
+    #    them; no Azure call).
+    assigned = _assigned_principal_ids()
     missing_umis = []
     for umi_name in UMI_SP_NAMES:
-        r = _az("identity", "list", "--query", f"[?name=='{umi_name}']", "-o", "json")
-        if r.returncode or not json.loads(r.stdout):
+        cands = list(a.service_principals.list(filter=f'displayName eq "{umi_name}"'))
+        if not any(str(s.id) in assigned for s in cands):
             missing_umis.append(umi_name)
 
     if missing_umis:
@@ -2209,8 +2412,8 @@ def phase_check():
     # 4. Entra groups present (looked up via az ad group show)
     missing_entra_grps = []
     for grp in ENTRA_GROUP_NAMES:
-        r = _az("ad", "group", "show", "--group", grp, "-o", "json")
-        if r.returncode:
+        g = next(iter(a.groups.list(filter=f'displayName eq "{grp}"')), None)
+        if not g or str(g.id) not in assigned or not g.external_id:
             missing_entra_grps.append(grp)
 
     if missing_entra_grps:
@@ -2496,35 +2699,86 @@ def phase_cross_acls():
               [{"service_principal_name": sp.application_id, "permission_level": "CAN_EDIT"}],
               f"{ACCOUNT_SP_NAMES[2]} → CAN_EDIT on {ENTRA_USERS[2]}/py_nb")
     # IS_OWNER held by another user (not the runner) on one job, one pipeline, one warehouse.
+    # An object has exactly ONE owner, so PATCH (additive) fails and warehouses reject owner PATCH
+    # outright → PUT the object's current DIRECT grants minus the old IS_OWNER, plus the new owner.
+    # Named, non-DAB objects so the case is deterministic.
     owner = u2 if u2 != ME else u4
-    j = next((j for j in w.jobs.list() if (j.settings.name or "").startswith("wsmig")), None)
-    p = next((p for p in w.pipelines.list_pipelines() if (p.name or "").startswith("wsmig")), None)
-    wh = next((x for x in w.warehouses.list() if (x.name or "").startswith("wsmig")), None)
-    for obj_type, oid, label in (("jobs", j and j.job_id, "job"),
-                                 ("pipelines", p and p.pipeline_id, "pipeline"),
-                                 ("sql/warehouses", wh and wh.id, "warehouse")):
-        grant(obj_type, oid, [{"user_name": owner, "permission_level": "IS_OWNER"}],
-              f"IS_OWNER {owner} on {label}")
+    j = next((j for j in w.jobs.list() if j.settings.name == "wsmig_test_params_job"), None)
+    p = next((p for p in w.pipelines.list_pipelines() if p.name == "wsmig_test_pipeline_classic"),
+             None)
+    wh = next((x for x in w.warehouses.list() if x.name == "wsmig_test_wh_classic"), None)
+    # A warehouse owner must hold allow-cluster-create (verified live) → ENTRA_USERS[3] has it.
+    wh_owner = ENTRA_USERS[3]
+    for obj_type, oid, label, owner in (
+            ("jobs", j and j.job_id, "job wsmig_test_params_job", owner),
+            ("pipelines", p and p.pipeline_id, "pipeline wsmig_test_pipeline_classic", owner),
+            ("sql/warehouses", wh and wh.id, "warehouse wsmig_test_wh_classic", wh_owner)):
+        if not oid:
+            log(f"  IS_OWNER on {label}: object not found")
+            continue
+        try:
+            doc = w.api_client.do("GET", f"/api/2.0/permissions/{obj_type}/{oid}") or {}
+            keep = []
+            for ace in doc.get("access_control_list", []) or []:
+                direct = [pm["permission_level"] for pm in ace.get("all_permissions", []) or []
+                          if not pm.get("inherited") and pm.get("permission_level") != "IS_OWNER"]
+                who = {k: ace[k] for k in ("user_name", "group_name", "service_principal_name")
+                       if ace.get(k)}
+                if (who.get("user_name") == owner) or not direct or not who:
+                    continue
+                keep.append(dict(who, permission_level=direct[0]))
+            keep.append({"user_name": owner, "permission_level": "IS_OWNER"})
+            w.api_client.do("PUT", f"/api/2.0/permissions/{obj_type}/{oid}",
+                            body={"access_control_list": keep})
+            log(f"  IS_OWNER {owner} on {label} (+{len(keep) - 1} direct grants kept)")
+        except Exception as e:
+            log(f"  IS_OWNER {owner} on {label}: {str(e)[:140]}")
 
 
 def phase_target_uc_prep():
-    """TARGET side: the same catalog/schema with EMPTY tables (UC is out of the tool's scope; without
-    them dashboards/Genie/DLT don't render on target). Uses WSMIG_TARGET_PROFILE/_CATALOG."""
+    """TARGET side: the SOURCE catalog name + schema with EMPTY tables (UC is out of the tool's
+    scope; without them dashboards/Genie/DLT don't render on target). `main` has no catalog remap,
+    so the target catalog defaults to the SOURCE catalog name. If it is missing it is created with a
+    MANAGED LOCATION next to the target's default catalog storage (a metastore without root storage
+    rejects a plain CREATE CATALOG), or at WSMIG_TARGET_CATALOG_LOCATION. Every statement is checked.
+    Env: WSMIG_TARGET_PROFILE, WSMIG_TARGET_CATALOG (default = source catalog)."""
     print("== target UC prep ==")
     tw = WorkspaceClient(profile=TARGET_PROFILE)
-    cat = os.environ.get("WSMIG_TARGET_CATALOG") or tw.metastores.current().default_catalog_name
+    cat = os.environ.get("WSMIG_TARGET_CATALOG") or CATALOG
     whs = list(tw.warehouses.list())
     if not whs:
         log("FLAG: no SQL warehouse on target to run the DDL — create one first")
         return
     wh = next((x.id for x in whs if getattr(x, "enable_serverless_compute", False)), whs[0].id)
+
+    def run(st):
+        r = tw.statement_execution.execute_statement(warehouse_id=wh, statement=st,
+                                                     wait_timeout="50s")
+        while r.status.state.value in ("PENDING", "RUNNING"):
+            time.sleep(3)
+            r = tw.statement_execution.get_statement(r.statement_id)
+        ok = r.status.state.value == "SUCCEEDED"
+        log(f"  target {r.status.state.value}: {st[:90]}"
+            + ("" if ok else f" — {(r.status.error.message if r.status.error else '')[:200]}"))
+        return ok
+
+    if not any(c.name == cat for c in tw.catalogs.list()):
+        loc = os.environ.get("WSMIG_TARGET_CATALOG_LOCATION")
+        if not loc:
+            default = tw.catalogs.get(tw.metastores.current().default_catalog_name)
+            root = (default.storage_root or "").rstrip("/")
+            loc = f"{root.rsplit('/', 1)[0]}/{cat}" if root else ""
+        if not loc:
+            log("FLAG: cannot derive a managed location — set WSMIG_TARGET_CATALOG_LOCATION")
+            return
+        if not run(f"CREATE CATALOG IF NOT EXISTS {cat} MANAGED LOCATION '{loc}'"):
+            return
     for st in (f"CREATE SCHEMA IF NOT EXISTS {cat}.{SCHEMA}",
                f"CREATE TABLE IF NOT EXISTS {cat}.{SCHEMA}.trips (zip STRING, trips INT, avg_dist DOUBLE)",
                f"CREATE TABLE IF NOT EXISTS {cat}.{SCHEMA}.zones (zip STRING, borough STRING)"):
-        r = tw.statement_execution.execute_statement(warehouse_id=wh, statement=st, wait_timeout="30s")
-        log(f"  target {r.status.state.value}: {st[:70]}")
-    log(f"target catalog used: {cat} (must equal the source catalog name unless catalog_mapping is set)")
-
+        if not run(st):
+            return
+    log(f"target catalog ready: {cat} (= source catalog {CATALOG})")
 
 PHASES = {
     "identity": phase_identity,
