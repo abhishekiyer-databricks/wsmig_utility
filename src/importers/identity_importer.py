@@ -44,12 +44,16 @@ by source id — source ids are meaningless on the target.
 from __future__ import annotations
 
 import json
+import time
 
 from src.importers.base_importer import (BaseImporter, PrerequisiteMissing, SkippedNoObject,
                                          CAT_NOT_SUPPORTED)
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
                                    ACTION_FAILED)
 from src.utils.helpers import safe_str
+from src.utils.logger import fmt_elapsed, get_logger
+
+_LOG = get_logger("IdentityImporter")
 
 # SCIM create whitelists (master §10a). Sending the whole source object back fails or writes
 # server-derived junk, so only these fields travel; entitlements and roles are applied as
@@ -641,9 +645,13 @@ class IdentityImporter(BaseImporter):
         if self._target_assignments is not None:
             current = self._target_assignments.get(safe_str(principal_id))
             if current is not None and sorted(current) == sorted(wanted):
+                self.log.debug(f"workspace permission {name}: already {sorted(wanted)}")
                 return
+        self.log.debug(f"assigning workspace permission {name} → {wanted}",
+                       principal_id=principal_id)
         try:
             self.client.put(f"{_ASSIGNMENTS}/principals/{principal_id}", {"permissions": wanted})
+            self.log.debug(f"workspace permission {name} → assigned {wanted}")
         except Exception as exc:  # noqa: BLE001 — the identity exists; don't fail it over this
             self.log.warning("could not set workspace permissions", principal=name,
                              error=str(exc)[:200])
@@ -666,9 +674,14 @@ class IdentityImporter(BaseImporter):
     def _apply_deferred_members(self) -> None:
         """PASS 2: patch every deferred group's members, now that all identities exist."""
         if not self._member_pass:
+            self.log.info("group membership pass 2: no groups need members applied")
             return
-        self.log.info("group membership pass 2", groups=len(self._member_pass))
-        for name, target_id, members, unit in self._member_pass:
+        t0 = time.time()
+        total = len(self._member_pass)
+        self.log.info(f"Phase: group membership pass 2 — {total:,} groups")
+        degraded_n = failed_n = 0
+        for i, (name, target_id, members, unit) in enumerate(self._member_pass, 1):
+            self.log.debug(f"applying members to group {name} ({len(members or [])} members)")
             try:
                 note = self._sync_members(target_id, members)
             except Exception as exc:  # noqa: BLE001 — fail-soft per group (D21)
@@ -677,7 +690,10 @@ class IdentityImporter(BaseImporter):
                 self._amend_row(name, "created_with_warning",
                                 f"group created, but its members could not be applied: {message}",
                                 category=category, error_raw=str(exc))
-                self.log.warning("group membership failed", group=name, error=str(exc)[:200])
+                self.log.warning(f"group membership {name} → FAILED {category}: {message}")
+                failed_n += 1
+                self.log.progress("group membership pass 2", i, total, started=t0,
+                                  degraded=degraded_n, failed=failed_n)
                 continue
             # An unresolvable member is a real gap — the group EXISTS but is under-populated — so it
             # is flagged rather than reported clean. `retry_mode=failed_only` picks it up once the
@@ -685,6 +701,16 @@ class IdentityImporter(BaseImporter):
             degraded = "could not resolve" in note
             self._amend_row(name, "created_with_warning" if degraded else "", note,
                             category="prerequisite_missing" if degraded else "")
+            if degraded:
+                degraded_n += 1
+                self.log.warning(f"group membership {name} → under-populated: {note}")
+            else:
+                self.log.debug(f"group membership {name} → {note}")
+            self.log.progress("group membership pass 2", i, total, started=t0,
+                              degraded=degraded_n, failed=failed_n)
+        self.log.info(f"Phase complete: group membership pass 2 — {total:,} groups, "
+                      f"under-populated {degraded_n}, failed {failed_n} "
+                      f"({fmt_elapsed(time.time() - t0)})")
 
     def _amend_row(self, natural_key: str, status: str, note: str, *, category: str = "",
                    error_raw: str = "") -> None:
@@ -876,7 +902,9 @@ class IdentityImporter(BaseImporter):
     def _parse_snapshot(raw) -> dict:
         try:
             return json.loads(raw) if raw else {}
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:   # degraded: no prior snapshot → no change diff
+            _LOG.warning(f"stored source snapshot is not valid JSON — the change diff for this "
+                         f"identity is skipped: {exc}")
             return {}
 
     def _diff_note(self, asset_type: str, unit: dict, payload: dict,

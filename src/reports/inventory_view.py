@@ -740,5 +740,5 @@ def build_counts(data: Dict[str, Any]) -> Dict[str, int]:
 def fmt_epoch_ms(value: Any) -> str:
     try:
         return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M")
-    except Exception:
+    except Exception:   # expected + harmless: show the raw value if it won't format
         return str(value)

@@ -144,5 +144,6 @@ class DltImporter(BaseImporter):
     def _exists_on_target(self, path: str) -> bool:
         try:
             return bool(self.client.get("api/2.0/workspace/get-status", params={"path": path}))
-        except Exception:  # noqa: BLE001 — absent 404s, which is the answer
+        except Exception as exc:  # noqa: BLE001 — expected: absent 404s, which is the answer
+            self.log.debug(f"get-status {path} → absent ({str(exc)[:160]})")
             return False

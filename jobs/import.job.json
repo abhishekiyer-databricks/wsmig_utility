@@ -38,7 +38,8 @@
           "account_id": "",
           "user_domain_mapping": "",
           "user_id_mapping": "",
-          "pause_job_schedules": "true"
+          "pause_job_schedules": "true",
+          "log_level": ""
         }
       }
     }

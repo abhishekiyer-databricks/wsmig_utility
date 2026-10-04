@@ -7,7 +7,7 @@ this role — this is a **tester, not a developer**: find and file bugs, never f
 Styled after the UC governance-migration utility's `plans/qa-testing-agent.md`, but the setup below is
 **specific to THIS tool** — it migrates **non-UC workspace assets** (identities, workspace content,
 compute, jobs, SQL, DLT, dashboards, Genie, secrets, misc), so the fixtures and allowed actions are
-about standing up **those** assets and **both kinds of identities** on the source, not UC catalogs/DDL.
+about standing up **those** assets and **account-level identities** on the source, not UC catalogs/DDL.
 
 ---
 
@@ -41,24 +41,16 @@ standing up the fixtures — including Azure identities and catalogs on both sid
 
 ### Allowed actions (you may do these without asking; nothing else)
 1. **Build the full source fixture bed.** Stand up every asset the scenarios need on the **source**
-   workspace via the Databricks + Azure CLIs and REST. Reuse and EXTEND the existing bed
-   (`tests/fixtures_fvm1.py`, the 19 dependency-ordered idempotent phases) — never fork a new one; add a
-   phase per new scenario so the bed stays the cumulative superset. **Keep ALL of v1's asset types as
-   the base** (PLAN_13 "Fixtures → A"); the B-scenarios add to it.
-2. **Create BOTH kinds of identities (this is the heart of the tool — explicitly allowed):**
-   - **Entra-ID-backed account identities** — create Azure AD **security groups** (`az ad group
-     create`), **app registrations / service principals** or **user-assigned managed identities (UMI)**
-     (`az ad sp create` / `az identity create`), then **provision them into the Databricks ACCOUNT via
-     account SCIM** (`/api/2.0/accounts/{account_id}/scim/v2/{Users,Groups,ServicePrincipals}`, with
-     `externalId` set so they read as Entra-backed) and **assign them to the source workspace**
-     (`PUT /api/2.0/accounts/.../workspaces/.../permissionassignments` or workspace SCIM). These exercise
-     the "account identity → assign, never recreate" path.
-   - **Databricks-managed (workspace-local) identities** — create **workspace-local groups** (incl.
-     **nested**) and **workspace-local service principals** directly via **workspace** SCIM
-     (`/api/2.0/preview/scim/v2/...`, no `externalId`). These exercise the "recreate with a new id +
-     remap (`sp_mapping`/`group_map`)" path — the feature this tool exists for.
-   - Put **both** kinds in the bed (Entra-backed + DB-managed, for users, groups, and SPs) so the
-     identity classifier + importer are tested on each; add the full entitlement ladder + ACL spread.
+   workspace via the Databricks + Azure CLIs and REST. **PLAN 16 uses the medium bed:
+   `tests/fixtures_medium.py`, spec `plans/PLAN_16_0_fixtures.md`** (idempotent phases, writes
+   `fixtures_manifest.json` = the known source truth). Extend it with a phase when a wave needs a new
+   scenario; never fork another bed.
+2. **Identities are ACCOUNT-LEVEL only (user decision 2026-10-03/04)** — exactly as in
+   `PLAN_16_0_fixtures.md`: 15 Entra users, 3 Databricks-managed account SPs (`ai27_acc_spn_1..3`), 2
+   Azure-UMI SPs (`ai27_umi_1/2`), 2 Databricks-managed account groups (nested), 2 Entra groups
+   (`ai27_entragrp_1/2`), assigned to the source workspace, with entitlements + an ACL spread. **No
+   workspace-local groups or SPs** (the customer has none). If an Entra user, an Entra group or a UMI is
+   missing, **FLAG it and ask** — the user creates those in Azure; never create them yourself.
 3. **Create the catalogs / schemas / EMPTY tables on BOTH sides (user-approved).** For dashboards /
    Genie / DLT that reference UC by FQN: create the referenced catalog + schema + **empty** tables on the
    **source** (so the asset is valid) and on the **target** (so it imports without the "renders empty"
@@ -120,9 +112,9 @@ standing up the fixtures — including Azure identities and catalogs on both sid
 ### What to test (scenario coverage)
 Exercise the scenarios of the **current PLAN 16 sub-plan** (its "Live QA" section), on the full fixture
 bed (PLAN_13 "Fixtures"), plus the golden-baseline diff. The B-item scenarios below apply to the wave
-that implements them. Minimum identity coverage: **Entra-backed users + Entra-backed
-account groups + Azure-UMI/Entra SPs + Databricks-managed (nested) groups + Databricks-managed SPs** —
-the migration must assign the account ones and recreate+remap the workspace-local ones. Plus: all job
+that implements them. Identity coverage: **Entra users + Entra groups + Databricks-managed account
+groups (nested) + Databricks account SPs + Azure-UMI SPs** — all account-level; the migration must
+assign them (never recreate) and keep their ids stable. Plus: all job
 types, all compute types (policy-family + custom), workspace content incl. `.db_internal`, the AI/BI
 dashboard matrix (B7, all data-permission modes + published/draft + scheduled), a catalog renamed on
 target (B13), a non-default workspace-conf key (B4), a bulk batch of fresh users for the home-provisioning

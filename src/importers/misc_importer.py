@@ -285,7 +285,8 @@ class MiscImporter(BaseImporter):
         try:
             got = self.client.get("api/2.0/clusters/get", params={"cluster_id": cluster_id}) or {}
             return safe_str(got.get("state"))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — expected: "" = unknown (the caller handles it)
+            self.log.debug(f"cluster {cluster_id}: state unknown ({str(exc)[:160]})")
             return ""
 
     # ── workspace conf ────────────────────────────────────────────────────

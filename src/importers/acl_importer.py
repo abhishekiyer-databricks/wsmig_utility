@@ -277,6 +277,9 @@ class AclImporter(BaseImporter):
                                   "permission": level})
                 applied += 1
             except Exception as exc:  # noqa: BLE001 — one bad grant must not lose the others
+                # Degraded: recorded in the unit's note (→ its WARNING outcome line); detail here.
+                self.log.debug(f"secret-scope ACL {scope}: {target_principal}={level} FAILED: "
+                               f"{str(exc)[:300]}")
                 failed.append(f"{target_principal}={level} ({str(exc)[:90]})")
 
         note = f"{applied} secret-scope ACL(s) applied via secrets/acls/put"
@@ -342,9 +345,11 @@ class AclImporter(BaseImporter):
         return safe_str(self.target_id_map(asset_type).get(object_key, ""))
 
     def _get_status(self, path: str) -> dict:
+        self.log.debug(f"checking {path}")
         try:
             return self.client.get("api/2.0/workspace/get-status", params={"path": path}) or {}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — expected: a 404 means "absent"
+            self.log.debug(f"checked {path} → absent ({str(exc)[:160]})")
             return {}
 
     def _absence_reason(self, object_asset_type: str, object_key: str) -> str:
@@ -517,7 +522,10 @@ class AclImporter(BaseImporter):
             expected = self._normalise_grants(applied["grants"], remap=True)
             try:
                 doc = self.client.get(f"api/2.0/permissions/{perm_type}/{target_id}") or {}
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 — degraded: this object's parity is unverified
+                self.log.warning(f"ACL parity: could not re-read {perm_type}/{target_id} "
+                                 f"({applied['object_natural_key']}) — verdict unverified: "
+                                 f"{str(exc)[:200]}")
                 objects.append({"perm_object_type": perm_type, "target_id": target_id,
                                 "object": applied["object_natural_key"], "verdict": "unverified",
                                 "detail": f"could not re-read the ACL: {str(exc)[:160]}"})

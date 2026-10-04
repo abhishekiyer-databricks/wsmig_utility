@@ -26,6 +26,7 @@ class DashboardsCollector(BaseCollector):
         items = []
         for d in raw:
             did = safe_str(d.get("dashboard_id"))
+            self.log.debug(f"collecting dashboard {did}")
             full = {}
             try:
                 full = self.client.get(f"api/2.0/lakeview/dashboards/{did}") or {}
@@ -47,4 +48,5 @@ class DashboardsCollector(BaseCollector):
                 "acl": self.fetch_acl("dashboards", did),   # ACLs (Plan 1a §1)
                 "_raw": d,
             })
+            self.log.debug(f"collected dashboard {did} ({items[-1]['display_name']})")
         return items

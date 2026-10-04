@@ -30,9 +30,17 @@ Not end-of-run, because a crash at 90% would leave no target ids — that is a *
 (lost updates + duplicates), not a performance one. Not per-object, because a Delta commit per
 object is hours of bookkeeping. The checkpoint JSON is the per-item durability layer that makes
 the batch safe, and the recovery replay is what cashes that in.
+
+READS FAIL LOUD (PLAN 16.1 §4.2). `load()` counts this pair's rows, then selects them, and REFUSES
+to continue if the two disagree or if either read errors (`StateLoadError`). An incomplete load is
+the worst silent failure this tool can have: every missing row looks like "never migrated", so the
+run re-creates/adopts those objects and drops their source edits. A genuine first run is 0/0 and
+continues; `load()` creates the (empty) tables itself first, so the count never runs against a
+table that isn't there.
 """
 from __future__ import annotations
 
+import time
 from enum import Enum
 from typing import Any, Optional
 
@@ -126,6 +134,13 @@ CAT_OVERSIZE = "oversize"
 CAT_UC_BACKED = "uc_backed"
 
 
+class StateLoadError(RuntimeError):
+    """The state table could not be read IN FULL — the run must stop before any decision.
+
+    Raised on any read error and on a count mismatch. Never caught-and-emptied: an empty cache is
+    exactly what made a 21K-row table look like a first run (PLAN_14 QA-7)."""
+
+
 def _q(value: Any) -> str:
     """SQL string literal, escaping quotes/backslashes. NULL for None/''.
 
@@ -163,11 +178,20 @@ class StateStore:
         self._cache: dict[tuple, dict] = {}
         self._identity_cache: dict[tuple, dict] = {}
         self._loaded = False
+        self._ensured = False              # ensure_table() ran → load() needn't issue DDL again
         self.merges = 0                    # flush count, for the report + tests
+        # True while rows from a FAILED flush are still pending (cleared by a later flush that
+        # writes them). The runner turns it into run_status=completed_state_not_saved.
+        self.flush_failed = False
 
     @property
     def enabled(self) -> bool:
         return bool(self.backend and self.table_fqn)
+
+    # ── backend calls (a backend may implement only `sql()`, e.g. a test fake) ──
+    def _query(self, statement: str) -> list:
+        fn = getattr(self.backend, "query", None) or self.backend.sql
+        return fn(statement) or []
 
     # ── DDL ───────────────────────────────────────────────────────────────
     def ensure_table(self) -> None:
@@ -238,6 +262,7 @@ class StateStore:
                 f"  CREATE SCHEMA IF NOT EXISTS {self.config.imports.state_catalog}."
                 f"{self.config.imports.state_schema};\n"
                 f"Underlying error: {exc}") from exc
+        self._ensured = True
         _LOG.info("state tables ready", state=self.table_fqn, identity=self.identity_table_fqn)
 
     # ── load (every read filtered by source_workspace_id — asserted in tests) ────
@@ -247,24 +272,57 @@ class StateStore:
         One table serves all 100+ pairs, so every read is filtered by `source_workspace_id` —
         without that filter a re-run of pair A would see pair B's target ids and try to edit
         another workspace's objects.
+
+        Every load is COUNT-CHECKED (PLAN 16.1 §4.2): `count(*)` then `SELECT *` per table, and a
+        mismatch or any read error raises `StateLoadError` — never an empty/partial cache. Safe
+        because nothing writes the table between the two reads: every load happens before the
+        first phase writes anything. On a first run `ensure_table()` (run here once if no caller
+        did) creates the empty tables, so the check is 0/0 and the run continues.
         """
         if not self.enabled:
             return {}
         if self._loaded and not force:
             return self._cache
-        rows = self.backend.sql(
-            f"SELECT * FROM {self.table_fqn} WHERE source_workspace_id = {_q(self.source_ws_id)}")
+        if not self._ensured:
+            self.ensure_table()
+        rows = self._load_checked(self.table_fqn)
+        idrows = self._load_checked(self.identity_table_fqn)
         self._cache = {(safe_str(r.get("asset_type")), safe_str(r.get("natural_key"))): r
                        for r in rows}
-        idrows = self.backend.sql(
-            f"SELECT * FROM {self.identity_table_fqn} "
-            f"WHERE source_workspace_id = {_q(self.source_ws_id)}")
         self._identity_cache = {(safe_str(r.get("entity_type")), safe_str(r.get("source_key"))): r
                                 for r in idrows}
         self._loaded = True
-        _LOG.info("state loaded", rows=len(self._cache), identity_rows=len(self._identity_cache),
-                  source_workspace_id=self.source_ws_id)
         return self._cache
+
+    def _load_checked(self, table: str) -> list:
+        """`count(*)` + `SELECT *` for this pair from one table; raise unless they agree."""
+        where = f"WHERE source_workspace_id = {_q(self.source_ws_id)}"
+        t0 = time.time()
+        _LOG.debug(f"state load started  table={table} source_workspace_id={self.source_ws_id}")
+        try:
+            counted = self._query(f"SELECT count(*) AS n FROM {table} {where}")
+            expected = int((counted[0] or {}).get("n") or 0) if counted else 0
+            rows = list(self._query(f"SELECT * FROM {table} {where}"))
+        except StateLoadError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — re-raised as a hard stop, never emptied
+            _LOG.error(f"state load FAILED  table={table}", error=str(exc)[:500])
+            raise StateLoadError(
+                f"could not read state table {table} for source workspace {self.source_ws_id} — "
+                f"refusing to continue: an unreadable state table would make every object look "
+                f"never-migrated (re-create/adopt, silently dropping source edits). Check the "
+                f"table / permissions (SELECT) / cluster. Underlying error: {exc}") from exc
+        if len(rows) != expected:
+            _LOG.error(f"state load INCOMPLETE  table={table} rows={len(rows)} "
+                       f"expected={expected}")
+            raise StateLoadError(
+                f"state table {table} has {expected} rows for source workspace "
+                f"{self.source_ws_id} but only {len(rows)} were loaded — refusing to continue: an "
+                f"incomplete state load would re-create/adopt objects and silently drop source "
+                f"edits. Check the table / permissions / cluster.")
+        _LOG.info(f"state loaded  table={table} rows={len(rows)} expected={expected} "
+                  f"({int((time.time() - t0) * 1000)} ms)")
+        return rows
 
     def row(self, asset_type: str, natural_key: str) -> Optional[dict]:
         """The state row for one unit (from the in-memory view, including pending writes)."""
@@ -392,10 +450,19 @@ class StateStore:
         Never raises: the caller is often a `finally` during an abort, and a bookkeeping failure
         must not replace the real error. It logs loudly instead, and the checkpoint's recovery
         replay is what recovers the rows on the next run.
+
+        A failure ALSO sets `flush_failed` (cleared once a later flush writes the pending rows),
+        which the runner turns into `run_status=completed_state_not_saved` so the job goes red
+        instead of finishing green with an unsaved id map.
         """
         if not self.enabled:
             return 0
+        if not self._pending and not self._pending_identity:
+            return 0
         written = 0
+        t0 = time.time()
+        _LOG.debug("state flush started", rows=len(self._pending),
+                   identity_rows=len(self._pending_identity))
         try:
             if self._pending:
                 self._merge_state(self._pending)
@@ -407,7 +474,10 @@ class StateStore:
                 self._pending_identity = []
             if written:
                 self.merges += 1
-        except Exception as exc:  # noqa: BLE001
+            self.flush_failed = False
+            _LOG.debug(f"state flushed  rows={written} ({int((time.time() - t0) * 1000)} ms)")
+        except Exception as exc:  # noqa: BLE001 — never raises (called from `finally`), but visible
+            self.flush_failed = True
             _LOG.error("state flush FAILED — rows stay pending; the checkpoint recovery replay "
                        "will re-merge them on the next run", error=str(exc),
                        pending=len(self._pending) + len(self._pending_identity))
@@ -421,6 +491,18 @@ class StateStore:
     _IDENTITY_COLS = ("source_workspace_id", "entity_type", "source_key", "source_id",
                       "target_key", "target_id", "classification", "action", "last_run_id",
                       "first_seen", "last_seen")
+
+    # Columns a MERGE may never BLANK (PLAN 16.1 §4.2): a blank incoming value keeps the stored one.
+    # `record()` already carries prior values forward from the cache, so this only bites when the
+    # cache is wrong — exactly the case (a partial load) where blanking would lose the target id.
+    _STATE_KEEP_IF_BLANK = ("target_object_id", "source_object_id", "last_source_fingerprint",
+                            "first_seen")
+    _IDENTITY_KEEP_IF_BLANK = ("target_id", "source_id")
+
+    @staticmethod
+    def _set_clause(cols: tuple, keep_if_blank: tuple) -> str:
+        return ", ".join(f"t.{c} = COALESCE(NULLIF(s.{c}, ''), t.{c})" if c in keep_if_blank
+                         else f"t.{c} = s.{c}" for c in cols)
 
     @staticmethod
     def _values_clause(rows: list[dict], cols: tuple) -> str:
@@ -443,7 +525,7 @@ class StateStore:
         for r in rows:
             deduped[(r["asset_type"], r["natural_key"])] = r
         src = self._values_clause(list(deduped.values()), self._STATE_COLS)
-        sets = ", ".join(f"t.{c} = s.{c}" for c in self._STATE_COLS)
+        sets = self._set_clause(self._STATE_COLS, self._STATE_KEEP_IF_BLANK)
         cols = ", ".join(self._STATE_COLS)
         vals = ", ".join(f"s.{c}" for c in self._STATE_COLS)
         self.backend.sql(f"""
@@ -461,7 +543,7 @@ class StateStore:
         for r in rows:
             deduped[(r["entity_type"], r["source_key"])] = r
         src = self._values_clause(list(deduped.values()), self._IDENTITY_COLS)
-        sets = ", ".join(f"t.{c} = s.{c}" for c in self._IDENTITY_COLS)
+        sets = self._set_clause(self._IDENTITY_COLS, self._IDENTITY_KEEP_IF_BLANK)
         cols = ", ".join(self._IDENTITY_COLS)
         vals = ", ".join(f"s.{c}" for c in self._IDENTITY_COLS)
         self.backend.sql(f"""
@@ -547,7 +629,7 @@ class StateStore:
                     "scim_ids": {}, "manual_actions": []}
         self.load()
         sp_mapping, group_map, user_map, scim_ids = {}, {}, {}, {}
-        for (etype, skey), r in self._identity_cache.items():
+        for (etype, skey), r in list(self._identity_cache.items()):
             target_key = safe_str(r.get("target_key")) or skey
             target_id = safe_str(r.get("target_id"))
             if etype == "service_principal":
@@ -574,7 +656,7 @@ class StateStore:
         if not actions:
             return None
         self.load()
-        return {k for k, r in self._cache.items()
+        return {k for k, r in list(self._cache.items())
                 if safe_str(r.get("last_action")) in actions}
 
     def has_family(self, asset_types: tuple) -> bool:
@@ -589,7 +671,7 @@ class StateStore:
         wanted = set(asset_types)
         return any(at in wanted and safe_str(r.get("last_action")) not in (ACTION_FAILED,
                                                                           ACTION_NOT_SELECTED)
-                   for (at, _nk), r in self._cache.items())
+                   for (at, _nk), r in list(self._cache.items()))
 
     def target_ids_for(self, asset_type: str) -> dict:
         """`{natural_key: target_object_id}` for one asset_type — the id map a later phase remaps
@@ -598,7 +680,7 @@ class StateStore:
             return {}
         self.load()
         return {nk: safe_str(r.get("target_object_id"))
-                for (at, nk), r in self._cache.items()
+                for (at, nk), r in list(self._cache.items())
                 if at == asset_type and safe_str(r.get("target_object_id"))}
 
     def outstanding_rows(self) -> list:
@@ -614,13 +696,13 @@ class StateStore:
         if not self.enabled:
             return []
         self.load()
-        return [dict(r) for r in self._cache.values()
+        return [dict(r) for r in list(self._cache.values())
                 if safe_str(r.get("last_action")) in OUTSTANDING_ACTIONS]
 
     def summary(self) -> dict:
         """`{last_action: count}` for this pair — the change report's raw material."""
         out: dict = {}
-        for r in self._cache.values():
+        for r in list(self._cache.values()):
             a = safe_str(r.get("last_action"))
             out[a] = out.get(a, 0) + 1
         return out

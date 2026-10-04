@@ -908,55 +908,43 @@ def test_manifest_excludes_execution_log():
     assert not _excluded_from_manifest("changelog.json")
 
 
-def test_logger_survives_a_filesystem_that_rejects_append():
-    """THE regression test for the truncated log.
-
-    A UC Volume rejects `open(path, "a")` once the file exists. The logger swallowed that (so
-    logging could never break the pipeline), which meant a whole live export produced a ONE-LINE
-    execution log. Simulate that filesystem exactly and require every record to survive.
-    Verified against the pre-fix logger: it writes 1 line here.
-    """
-    import builtins
-    import json as _j
+def test_logging_writes_no_file_into_the_bundle():
+    """PLAN 16.1 §3.6: the run log is the job's run output (cell + driver log) — NOTHING writes an
+    `execution_*.log` any more (the old local-then-copy Volume mirror is gone). A whole logged run
+    plus a manifest build must leave no log file anywhere in the bundle."""
+    import io
     import os
     import tempfile
     from src.utils import logger as lg
+    from src.exporters.artifact_writer import ArtifactWriter
 
-    real_open = builtins.open
-    dest = os.path.join(tempfile.mkdtemp(), "execution_export.log")
+    assert not hasattr(lg, "set_log_file") and not hasattr(lg, "flush_log_file")
+    tmp = tempfile.mkdtemp()
 
-    def hostile_open(file, mode="r", *a, **k):
-        if str(file) == dest and "a" in mode and os.path.exists(str(file)):
-            raise OSError(95, "Operation not supported")   # what the Volume does
-        return real_open(file, mode, *a, **k)
+    class Cfg:
+        run_id = "r"
+        source_workspace_id = "ws"
+        output_path = tmp
+    aw = ArtifactWriter(Cfg())
+    aw.ensure_output_path()
+    lg.configure_logging(run_id="r", stage="export", cell_stream=io.StringIO(),
+                         driver_stream=io.StringIO())
+    log = lg.get_logger("t")
+    for i in range(60):
+        log.info("record", i=i)
+    aw.write_json("export_index.json", {"units": []})
+    aw.write_manifest({"notebook": 0})
+    log.warning("after manifest")
 
-    builtins.open = hostile_open
-    try:
-        lg.set_log_file(dest)
-        log = lg.get_logger("probe")
-        for i in range(120):        # spans several mirror intervals
-            log.info("record", i=i)
-        log.warning("a warning")
-        lg.flush_log_file()
-    finally:
-        builtins.open = real_open
-        lg.set_log_file(None)
-
-    lines = [_j.loads(x) for x in real_open(dest, encoding="utf-8").read().strip().split("\n")]
-    assert len(lines) == 121, f"expected 121 records, got {len(lines)} (append-truncation bug)"
-    assert [r["i"] for r in lines if "i" in r] == list(range(120)), "records lost or reordered"
-    assert lines[-1]["level"] == "WARNING"
+    written = [f for _d, _s, files in os.walk(tmp) for f in files]
+    assert not [f for f in written if f.endswith(".log")], f"a log file was written: {written}"
+    assert aw.verify_manifest()["ok"]
 
 
-def test_logger_survives_append_hostile_dest_and_verifies_manifest():
-    """End-to-end: many log records + a manifest build, then verify_manifest must pass.
-
-    Reproduces the live fvm1 bug two ways — (a) a log truncated to one line, (b) a manifest that
-    mismatches because the log grew after being checksummed.
-    """
+def test_old_bundle_with_an_execution_log_still_verifies():
+    """Bundles produced by `main` carry `misc/execution_*.log` written AFTER the manifest. The
+    manifest exclusion stays, so such a bundle still verifies and imports."""
     import tempfile
-    import os
-    from src.utils import logger as lg
     from src.exporters.artifact_writer import ArtifactWriter
 
     tmp = tempfile.mkdtemp()
@@ -967,32 +955,13 @@ def test_logger_survives_append_hostile_dest_and_verifies_manifest():
         output_path = tmp
     aw = ArtifactWriter(Cfg())
     aw.ensure_output_path()
-
-    dest = os.path.join(tmp, "execution_export.log")
-    lg.set_log_file(dest)
-    log = lg.get_logger("t")
-    try:
-        for i in range(60):          # > _MIRROR_EVERY, so several mirrors happen mid-run
-            log.info("record", i=i)
-        aw.write_json("export_index.json", {"units": []})
-        aw.write_manifest({"notebook": 0})
-        log.info("after manifest")   # the real post-manifest flush case
-        log.warning("and a warning")
-        lg.flush_log_file()
-
-        import json as _j
-        lines = [_j.loads(x) for x in open(dest, encoding="utf-8").read().strip().split("\n")]
-        # 60 numbered records + write_manifest's own "manifest written" + 2 post-manifest records.
-        assert len(lines) == 63, f"expected 63 records, got {len(lines)} (append-truncation bug)"
-        assert [r.get("i") for r in lines if "i" in r] == list(range(60)), "records lost/reordered"
-        assert lines[-1]["level"] == "WARNING" and lines[-2]["msg"] == "after manifest"
-
-        v = aw.verify_manifest()
-        assert v["ok"], f"manifest must verify despite the log growing after it: {v}"
-        assert not any("execution" in p for p in
-                       [f["path"] for f in v["manifest"]["files"]])
-    finally:
-        lg.set_log_file(None)
+    aw.write_json("export_index.json", {"units": []})
+    aw.write_manifest({"notebook": 0})
+    for rel in (BP.EXECUTION_INVENTORY_LOG, BP.EXECUTION_EXPORT_LOG, BP.EXECUTION_IMPORT_LOG):
+        aw.write_bytes(rel, b'{"msg": "from an old run"}\n')
+    v = aw.verify_manifest()
+    assert v["ok"], f"an old bundle with execution logs must still verify: {v}"
+    assert not any("execution" in f["path"] for f in v["manifest"]["files"])
 
 
 # ─────────────────────────── content_fetcher ───────────────────────────────

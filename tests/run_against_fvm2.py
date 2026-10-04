@@ -50,8 +50,11 @@ def main():
     print(f"Staging   : {cfg.output_path}\n")
 
     aw = ArtifactWriter(cfg)
-    _logger.set_log_file(aw.ensure_output_path() + "/execution_inventory.log")
-    result = InventoryRunner(client, cfg, aw).run()
+    aw.ensure_output_path()
+    # PLAN 16.1: no log file — cell-equivalent output on stdout, the full DEBUG log on stderr.
+    _logger.configure_logging(run_id=cfg.run_id, stage="INVENTORY", level="INFO")
+    with _logger.live_run("INVENTORY"):
+        result = InventoryRunner(client, cfg, aw).run()
 
     print("\n=== counts ===")
     for k, v in sorted(result["counts"].items()):
@@ -64,7 +67,6 @@ def main():
         for wmsg in result["warnings"]:
             print("  -", wmsg)
     print(f"\nArtifacts written to: {result['output_path']}")
-    _logger.flush_log_file()   # mirror the log to the staging dir (append there silently fails)
 
 
 if __name__ == "__main__":

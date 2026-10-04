@@ -31,6 +31,7 @@ from __future__ import annotations
 import base64
 import os
 import posixpath
+import time
 
 from src.importers.base_importer import BaseImporter, HomeResolution, PrerequisiteMissing
 from src.utils.helpers import home_owner, looks_like_app_id, safe_str
@@ -105,7 +106,13 @@ class WorkspaceImporter(BaseImporter):
         `RESOURCE_ALREADY_EXISTS` adopts it — equivalent outcome, cheaper.
         """
         found: dict = {}
-        for unit in self.load():
+        units = self.load()
+        t0 = time.time()
+        for i, unit in enumerate(units, 1):
+            # One get-status probe per path (`checking <path>` at DEBUG in _get_status) — on a big
+            # workspace this is the long silent stretch QA-2 hit, so it reports progress.
+            self.log.progress("import workspace: existence check", i, len(units), started=t0,
+                              found=len(found))
             path = self.natural_key(unit)
             if not path or safe_str(unit.get("import_action")) in ("manual", "dab_redeploy"):
                 continue
@@ -237,8 +244,9 @@ class WorkspaceImporter(BaseImporter):
             # family ran alone, would otherwise fail on a missing parent.
             try:
                 self.client.post("api/2.0/workspace/mkdirs", {"path": parent})
-            except Exception:  # noqa: BLE001 — idempotent; a real problem resurfaces on import
-                pass
+            except Exception as exc:  # noqa: BLE001 — idempotent; a real problem resurfaces on import
+                self.log.debug(f"mkdirs {parent} failed (the import will surface any real "
+                               f"problem): {str(exc)[:200]}")
 
         is_notebook = safe_str(unit.get("asset_type")) == "notebook"
 

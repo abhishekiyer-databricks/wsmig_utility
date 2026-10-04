@@ -263,5 +263,6 @@ class JobsImporter(BaseImporter):
         try:
             got = self.client.get("api/2.0/workspace/get-status", params={"path": path})
             return bool(got)
-        except Exception:  # noqa: BLE001 — absent 404s, which is the answer we want
+        except Exception as exc:  # noqa: BLE001 — expected: absent 404s, the answer we want
+            self.log.debug(f"get-status {path} → absent ({str(exc)[:160]})")
             return False

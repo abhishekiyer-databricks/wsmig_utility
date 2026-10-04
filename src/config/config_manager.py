@@ -287,7 +287,7 @@ class Config:
         """Read a widget value; return default if the widget is absent/blank."""
         try:
             val = dbutils.widgets.get(name)
-        except Exception:
+        except Exception:   # expected: the widget is not defined in this notebook → default
             return default
         return val if val not in (None, "") else default
 

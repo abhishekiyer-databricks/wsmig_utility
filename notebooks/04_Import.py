@@ -72,6 +72,9 @@ dbutils.widgets.dropdown("workspace_home_backup", "true", ["true", "false"],
                          "Back up orphaned (deleted-in-source) home content instead of failing it")
 dbutils.widgets.text("workspace_home_backup_root", "/Users_Backup",
                      "Top-level folder for orphaned home backups")
+# Cell output level (the driver log — Compute → Driver logs → Standard error — is ALWAYS DEBUG).
+dbutils.widgets.dropdown("log_level", "INFO", ["DEBUG", "INFO", "WARNING", "ERROR"],
+                         "Cell log level (driver log is always DEBUG)")
 
 # `direct`-mode only — how to reach the SOURCE. The secret is EITHER a scope pointer (preferred:
 # a widget value is visible on the run page and kept in run history) OR spn_secret_value.
@@ -129,16 +132,20 @@ def _add_repo_root_to_syspath() -> str:
 
 
 _REPO_ROOT = _add_repo_root_to_syspath()
-print(f"repo root on sys.path: {_REPO_ROOT}")
 
 from src.auth.token_manager import build_clients
 from src.config.config_manager import ROLE_TARGET, STAGE_IMPORT, Config
 from src.exporters import bundle_paths as BP
-from src.exporters.artifact_writer import ArtifactWriter
-from src.importers.import_runner import ImportRunner, resolve_import_run_id
+from src.exporters.artifact_writer import ArtifactWriter, read_json_or_empty
+from src.importers.import_runner import (RUN_STATUS_STATE_NOT_SAVED, ImportRunner,
+                                         resolve_import_run_id)
 from src.state.sql_backend import build_sql_backend
 from src.state.state_store import StateStore
 from src.utils import logger as _logger
+
+# Every line below goes to BOTH outputs: the cell (at `log_level`) and the driver log (always DEBUG).
+_say = _logger.get_logger("notebook").info
+_say(f"repo root on sys.path: {_REPO_ROOT}")
 
 # COMMAND ----------
 
@@ -159,24 +166,24 @@ if not _widget_run_id:
         _tv = dbutils.jobs.taskValues.get(taskKey="inventory", key="run_id", debugValue="")
         if _tv:
             _widget_run_id = str(_tv).strip()
-            print(f"run_id taken from the inventory task's values: {_widget_run_id}")
-    except Exception:
-        pass   # not a multi-task job — fall through to resume / the pointer
+            _say(f"run_id taken from the inventory task's values: {_widget_run_id}")
+    except Exception as _exc:  # expected: not a multi-task job → resume / the pointer
+        _logger.get_logger("notebook").debug(f"no inventory task value for run_id: {_exc}")
 
 _run_id, _how = resolve_import_run_id(cfg, _widget_run_id)
 cfg.run_id = _run_id
 
 source_client, client = build_clients(cfg, dbutils=dbutils, spark=spark)
 
-print(f"Target workspace : {cfg.ctx.workspace_url}")
-print(f"Source ws id     : {cfg.source_workspace_id}")
-print(f"Run id           : {cfg.run_id}   (resolved via: {_how})")
-print(f"Bundle           : {cfg.output_path}")
-print(f"Connectivity     : {cfg.connectivity_mode}")
-print(f"Mode             : {'DRY RUN — nothing will be written' if cfg.dry_run else 'LIVE'}")
-print(f"Families         : {', '.join(cfg.imports.selected_families)}")
-print(f"Retry mode       : {cfg.imports.retry_mode}")
-print(f"Home backup      : {'ON → ' + cfg.imports.workspace_home_backup_root if cfg.imports.workspace_home_backup else 'OFF (orphaned homes fail as prerequisite)'}")
+_say(f"Target workspace : {cfg.ctx.workspace_url}")
+_say(f"Source ws id     : {cfg.source_workspace_id}")
+_say(f"Run id           : {cfg.run_id}   (resolved via: {_how})")
+_say(f"Bundle           : {cfg.output_path}")
+_say(f"Connectivity     : {cfg.connectivity_mode}")
+_say(f"Mode             : {'DRY RUN — nothing will be written' if cfg.dry_run else 'LIVE'}")
+_say(f"Families         : {', '.join(cfg.imports.selected_families)}")
+_say(f"Retry mode       : {cfg.imports.retry_mode}")
+_say(f"Home backup      : {'ON → ' + cfg.imports.workspace_home_backup_root if cfg.imports.workspace_home_backup else 'OFF (orphaned homes fail as prerequisite)'}")
 
 # COMMAND ----------
 
@@ -186,15 +193,18 @@ print(f"Home backup      : {'ON → ' + cfg.imports.workspace_home_backup_root i
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
 aw.ensure_output_path()
-_logger.set_log_file(os.path.join(aw.root, BP.EXECUTION_IMPORT_LOG))
+# PLAN 16.1: the log is the run output itself — the cell (log_level) + the driver log (always DEBUG).
+# Configured HERE so the bundle summary, state, preflight and the run all log through it. No log file.
+_logger.configure_logging(run_id=cfg.run_id, stage="IMPORT",
+                          level=dbutils.widgets.get("log_level") or "INFO")
 
-_index = aw.read_json(BP.EXPORT_INDEX_JSON) or {}
-_bundle_cfg = aw.read_json(BP.CONFIG_RESOLVED_JSON) or {}
-print(f"Bundle produced in `{_bundle_cfg.get('connectivity_mode', '?')}` mode, "
-      f"tool version {_index.get('tool_version', '?')}, at {_index.get('generated_utc', '?')}")
-print(f"{len(_index.get('units', []))} units in the bundle:")
+_index = read_json_or_empty(aw, BP.EXPORT_INDEX_JSON, "an empty unit summary")
+_bundle_cfg = read_json_or_empty(aw, BP.CONFIG_RESOLVED_JSON, "unknown bundle provenance")
+_say(f"Bundle produced in `{_bundle_cfg.get('connectivity_mode', '?')}` mode, "
+     f"tool version {_index.get('tool_version', '?')}, at {_index.get('generated_utc', '?')}")
+_say(f"{len(_index.get('units', []))} units in the bundle:")
 for _at, _counts in sorted((_index.get("counts") or {}).items()):
-    print(f"  {_at:<24} {_counts}")
+    _say(f"  {_at:<24} {_counts}")
 
 # COMMAND ----------
 
@@ -210,16 +220,16 @@ if cfg.state_enabled:
     state = StateStore(_backend, cfg)
     state.ensure_table()
     state.load(force=True)
-    print(f"State table : {cfg.state_table_fqn}")
-    print(f"Identity map: {cfg.identity_map_table_fqn}")
-    print(f"Existing rows for this workspace pair: {len(state._cache)}")
+    _say(f"State table : {cfg.state_table_fqn}")
+    _say(f"Identity map: {cfg.identity_map_table_fqn}")
+    _say(f"Existing rows for this workspace pair: {len(state._cache)}")
     if state._cache:
-        print("Where this pair is up to:")
+        _say("Where this pair is up to:")
         for _action, _n in sorted(state.summary().items(), key=lambda kv: -kv[1]):
-            print(f"  {_action:<22} {_n}")
+            _say(f"  {_action:<22} {_n}")
 else:
-    print("State store DISABLED (dry run with no state_catalog) — a first-look rehearsal needs no "
-          "UC setup. A LIVE import requires state_catalog + state_schema.")
+    _say("State store DISABLED (dry run with no state_catalog) — a first-look rehearsal needs no "
+         "UC setup. A LIVE import requires state_catalog + state_schema.")
 
 # COMMAND ----------
 
@@ -232,13 +242,17 @@ from src.importers.preflight import Preflight
 _pf = Preflight(client, cfg, aw, state=state, dbutils=dbutils,
                 source_client=source_client if cfg.is_direct else None).run()
 
-print(f"\n=== PREFLIGHT: {_pf['verdict']} ===")
+_say(f"=== PREFLIGHT: {_pf['verdict']} ===")
 for _grade, _key in (("BLOCKING", "blocking"), ("DEGRADING", "degrading"),
                      ("COSMETIC", "cosmetic")):
-    for _item in _pf.get(_key) or []:
-        print(f"  [{_grade}] {_item}")
-print(f"\nGraded verdict printed above; misc/preflight_report.json written to the bundle. "
-      f"{'Import will NOT run.' if _pf['verdict'] == 'NO-GO' and cfg.imports.preflight_enforce else ''}")
+    # One line per finding — capped, because a missing-identity check lists one item per identity.
+    _items = _pf.get(_key) or []
+    for _item in _items[:200]:
+        _say(f"  [{_grade}] {_item}")
+    if len(_items) > 200:
+        _say(f"  … {len(_items) - 200} more {_grade} items in misc/preflight_report.json")
+_say(f"Graded verdict printed above; misc/preflight_report.json written to the bundle. "
+     f"{'Import will NOT run.' if _pf['verdict'] == 'NO-GO' and cfg.imports.preflight_enforce else ''}")
 
 # COMMAND ----------
 
@@ -247,21 +261,22 @@ print(f"\nGraded verdict printed above; misc/preflight_report.json written to th
 # COMMAND ----------
 
 runner = ImportRunner(client, cfg, aw, state=state, dbutils=dbutils, preflight_verdict=_pf)
-result = runner.run()
+with _logger.live_run("IMPORT"):
+    result = runner.run()
 
-print(f"\n=== IMPORT {result['run_status'].upper()} "
-      f"({'DRY RUN' if cfg.dry_run else 'LIVE'}) in {result['elapsed_sec']}s ===")
+_say(f"=== IMPORT {result['run_status'].upper()} "
+     f"({'DRY RUN' if cfg.dry_run else 'LIVE'}) in {result['elapsed_sec']}s ===")
 _totals = result.get("totals", {})
 for _k in ("total", "created", "updated", "adopted", "skipped", "created_with_warning",
            "manual", "not_selected", "skipped_no_object", "failed"):
-    print(f"  {_k:<22} {_totals.get(_k, 0):>6}")
+    _say(f"  {_k:<22} {_totals.get(_k, 0):>6}")
 
-print("\nPer phase:")
+_say("Per phase:")
 for _phase in result.get("per_phase", []):
-    print(f"  {_phase['component']:<12} total={_phase['total']:<5} created={_phase['created']:<5} "
-          f"updated={_phase['updated']:<4} skipped={_phase['skipped']:<5} "
-          f"failed={_phase['failed']:<4} manual={_phase['manual']:<4} "
-          f"({_phase['elapsed_sec']}s)")
+    _say(f"  {_phase['component']:<12} total={_phase['total']:<5} created={_phase['created']:<5} "
+         f"updated={_phase['updated']:<4} skipped={_phase['skipped']:<5} "
+         f"failed={_phase['failed']:<4} manual={_phase['manual']:<4} "
+         f"({_phase['elapsed_sec']}s)")
 
 # COMMAND ----------
 
@@ -274,7 +289,7 @@ for _phase in result.get("per_phase", []):
 # Read back the results file THIS run wrote — a live retry tags it `_retry_<ts>`, a dry run keeps
 # the canonical name; the runner records the actual path under summary["reports"].
 _results_rel = (result.get("reports") or {}).get("json") or BP.IMPORT_RESULTS_JSON
-_results = aw.read_json(_results_rel) or {}
+_results = read_json_or_empty(aw, _results_rel, "no per-unit rows to summarise")
 _units = _results.get("units", [])
 
 _failed = [u for u in _units if u.get("import_status") == "failed"]
@@ -282,30 +297,30 @@ _warned = [u for u in _units if u.get("import_status") == "created_with_warning"
 _manual = [u for u in _units if u.get("import_status") == "manual"]
 _no_obj = [u for u in _units if u.get("import_status") == "skipped_no_object"]
 
-print(f"=== FAILURES ({len(_failed)}) — fix, then retry_mode=failed_only ===")
+_say(f"=== FAILURES ({len(_failed)}) — fix, then retry_mode=failed_only ===")
 for _u in _failed[:40]:
-    print(f"  [{_u.get('failure_category')}] {_u['asset_type']}/{_u['natural_key']}")
-    print(f"      {_u.get('note')}")
+    _say(f"  [{_u.get('failure_category')}] {_u['asset_type']}/{_u['natural_key']}")
+    _say(f"      {_u.get('note')}")
 
-print(f"\n=== CREATED BUT DEGRADED ({len(_warned)}) — they exist, but verify before use ===")
+_say(f"=== CREATED BUT DEGRADED ({len(_warned)}) — they exist, but verify before use ===")
 for _u in _warned[:25]:
-    print(f"  {_u['asset_type']}/{_u['natural_key']}: {str(_u.get('note'))[:180]}")
+    _say(f"  {_u['asset_type']}/{_u['natural_key']}: {str(_u.get('note'))[:180]}")
 
 # PLAN 9: orphaned-home diversions are created_with_warning rows whose note names the backup path.
 _home_backups = [u for u in _warned if "deleted in source" in str(u.get("note", ""))]
 if _home_backups:
-    print(f"\n=== HOME BACKUPS ({len(_home_backups)}) — orphaned (deleted-in-source) content "
-          f"preserved under {cfg.imports.workspace_home_backup_root} ===")
+    _say(f"=== HOME BACKUPS ({len(_home_backups)}) — orphaned (deleted-in-source) content "
+         f"preserved under {cfg.imports.workspace_home_backup_root} ===")
     for _u in _home_backups[:25]:
-        print(f"  {_u['natural_key']}  →  {_u.get('target_id')}")
+        _say(f"  {_u['natural_key']}  →  {_u.get('target_id')}")
 
-print(f"\n=== MANUAL STEPS ({len(_manual)}) ===")
+_say(f"=== MANUAL STEPS ({len(_manual)}) ===")
 for _u in _manual[:25]:
-    print(f"  {_u['asset_type']}/{_u['natural_key']}: {str(_u.get('note'))[:160]}")
+    _say(f"  {_u['asset_type']}/{_u['natural_key']}: {str(_u.get('note'))[:160]}")
 
-print(f"\n=== PERMISSIONS PENDING AN OBJECT ({len(_no_obj)}) — normal for DAB/repos ===")
+_say(f"=== PERMISSIONS PENDING AN OBJECT ({len(_no_obj)}) — normal for DAB/repos ===")
 for _u in _no_obj[:15]:
-    print(f"  [{_u.get('failure_category')}] {_u['natural_key']}")
+    _say(f"  [{_u.get('failure_category')}] {_u['natural_key']}")
 
 # COMMAND ----------
 
@@ -319,17 +334,17 @@ for _u in _no_obj[:15]:
 
 _parity = runner.context.get("acl_parity") or {}
 if _parity:
-    print(f"objects re-read and diffed: {_parity.get('objects_checked', 0)}")
+    _say(f"objects re-read and diffed: {_parity.get('objects_checked', 0)}")
     for _verdict, _n in sorted((_parity.get("counts") or {}).items(), key=lambda kv: -kv[1]):
-        print(f"  {_verdict:<20} {_n}")
+        _say(f"  {_verdict:<20} {_n}")
     _bad = [o for o in _parity.get("objects", []) if o.get("verdict") != "match"]
     for _o in _bad[:25]:
-        print(f"  {_o.get('verdict')}: {_o.get('perm_object_type')}/{_o.get('object')} "
-              f"missing={_o.get('missing_on_target')} extra={_o.get('extra_on_target')}")
-    print(f"\nNOTE: {_parity.get('known_limitation', '')}")
-    print("Full parity table: the 'ACL Parity' sheet of import_status.xlsx.")
+        _say(f"  {_o.get('verdict')}: {_o.get('perm_object_type')}/{_o.get('object')} "
+             f"missing={_o.get('missing_on_target')} extra={_o.get('extra_on_target')}")
+    _say(f"NOTE: {_parity.get('known_limitation', '')}")
+    _say("Full parity table: the 'ACL Parity' sheet of import_status.xlsx.")
 else:
-    print("no ACL parity (the acls family was not selected this run)")
+    _say("no ACL parity (the acls family was not selected this run)")
 
 # COMMAND ----------
 
@@ -341,24 +356,37 @@ else:
 _reports = result.get("reports") or {}
 _status_xlsx = _reports.get("xlsx") or (BP.IMPORT_STATUS_DRYRUN_XLSX if cfg.dry_run
                                         else BP.IMPORT_STATUS_XLSX)
-print(f"Bundle: {aw.root}\n")
+_say(f"Bundle: {aw.root}\n")
 for _name in (_reports.get("json") or BP.IMPORT_RESULTS_JSON, _status_xlsx,
               _reports.get("manual_actions") or BP.MANUAL_ACTIONS_IMPORT_MD,
-              BP.PREFLIGHT_REPORT_JSON, BP.EXECUTION_IMPORT_LOG):
+              BP.PREFLIGHT_REPORT_JSON):
     _p = os.path.join(aw.root, _name)
-    print(f"  {'✓' if os.path.exists(_p) else '·'} {_name}")
+    _say(f"  {'✓' if os.path.exists(_p) else '·'} {_name}")
 
-print("\nNext steps:")
+_say("Next steps:")
 if cfg.dry_run:
-    print(f"  1. Read {_status_xlsx} — every unit's intended action, failures first.")
-    print("  2. Fix anything BLOCKING in the preflight verdict above.")
-    print("  3. Re-run with dry_run=false (state_catalog + state_schema are then required).")
+    _say(f"  1. Read {_status_xlsx} — every unit's intended action, failures first.")
+    _say("  2. Fix anything BLOCKING in the preflight verdict above.")
+    _say("  3. Re-run with dry_run=false (state_catalog + state_schema are then required).")
 else:
-    print(f"  1. Read {_status_xlsx} — the 'ACL Parity' sheet is the source-vs-target diff.")
-    print("  2. Work through manual_actions_import.md (secret values, Git repos, legacy dashboards).")
-    print("  3. Re-run with retry_mode=failed_only once prerequisites are fixed.")
-    print("  4. Re-run with import_assets=acls + retry_mode=skipped_only after a DAB redeploy.")
+    _say(f"  1. Read {_status_xlsx} — the 'ACL Parity' sheet is the source-vs-target diff.")
+    _say("  2. Work through manual_actions_import.md (secret values, Git repos, legacy dashboards).")
+    _say("  3. Re-run with retry_mode=failed_only once prerequisites are fixed.")
+    _say("  4. Re-run with import_assets=acls + retry_mode=skipped_only after a DAB redeploy.")
+_say(_logger.FULL_LOG_HINT)
 
-# The log is appended locally then mirrored: appending straight onto a UC Volume silently fails and
-# used to truncate the log to one line.
-_logger.flush_log_file()
+# COMMAND ----------
+
+# MAGIC %md ## Fail the job if the migration state was not saved
+# MAGIC Every phase ran, but the final MERGE into the state table failed: the target WAS changed and
+# MAGIC the source→target id map was not persisted. The job must go red; the next run's recovery
+# MAGIC replay re-merges the rows from the checkpoint once the state table is fixed.
+
+# COMMAND ----------
+
+if result.get("run_status") == RUN_STATUS_STATE_NOT_SAVED:
+    raise RuntimeError(
+        "Import finished but the migration STATE WAS NOT SAVED (run_status="
+        f"{RUN_STATUS_STATE_NOT_SAVED}). The target was changed; the source→target id map is in the "
+        "checkpoint only. Fix the state table (permissions / cluster), then re-run — the recovery "
+        "replay re-merges the rows. See the driver log (stderr) for the flush error.")

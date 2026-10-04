@@ -58,6 +58,9 @@ class FakeBackend:
             if "WHERE source_workspace_id = " in statement:
                 want = statement.split("WHERE source_workspace_id = ", 1)[1].strip().strip("'")
                 rows = [r for r in rows if r.get("source_workspace_id") == want]
+            # PLAN 16.1: every load is count-checked, so the fake answers `count(*)` like Delta.
+            if "count(*)" in statement.lower():
+                return [{"n": len(rows)}]
             return rows
         return []
 

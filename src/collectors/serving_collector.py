@@ -37,6 +37,7 @@ class ServingCollector(BaseCollector):
                 continue  # platform-managed, not user-owned
             if str(e.get("task") or "").startswith("agent/"):
                 continue  # Agent Bricks agent — not recreatable via workspace REST (see docstring)
+            self.log.debug(f"collecting serving endpoint {name}")
             config = e.get("config", {}) or {}
             migratable, note = self._classify(config)
             items.append({
@@ -48,6 +49,7 @@ class ServingCollector(BaseCollector):
                 "acl": self.fetch_acl("serving-endpoints", e.get("id") or name),
                 "_raw": e,
             })
+            self.log.debug(f"collected serving endpoint {name} (migratable={migratable})")
         return items
 
     @staticmethod

@@ -14,7 +14,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from src.utils.logger import get_logger
+from src.utils.logger import fmt_elapsed, get_logger
 
 
 class BaseCollector(ABC):
@@ -30,6 +30,8 @@ class BaseCollector(ABC):
         self._objects: list[dict] = []
         self._elapsed: float = 0.0
         self._errors: list[str] = []
+        self._acl_fetches = 0          # per-object ACL GETs this run → progress lines
+        self._t0 = time.time()
 
     # ── abstract interface ────────────────────────────────────────────────
     @abstractmethod
@@ -58,19 +60,25 @@ class BaseCollector(ABC):
     # ── pipeline runner (never raises) ────────────────────────────────────
     def run(self) -> list[dict]:
         """discover → enrich → validate → tag natural keys. Records errors; never raises."""
-        t0 = time.time()
+        t0 = self._t0 = time.time()
+        self._acl_fetches = 0
         # The client's `warnings` list is SHARED across all collectors; snapshot its length so
         # this collector only attributes warnings raised DURING its own run (else one truncation
         # warning gets duplicated onto every collector's stats).
         warn_start = len(getattr(self.client, "warnings", []))
+        # START line before the work: a long discovery (the workspace walk) must never be silent.
+        self.log.info(f"Phase: collect {self.object_type}")
         try:
             raw = self.discover()
-            self.log.info("discovered", object_type=self.object_type, count=len(raw))
+            self.log.info(f"collect {self.object_type}: discovered {len(raw):,}",
+                          acl_fetches=self._acl_fetches)
+            self.log.debug(f"enriching {self.object_type}", count=len(raw))
             enriched = self.enrich(raw)
             self.validate(enriched)
             self._objects = self._tag_natural_keys(enriched)
+            self.log.debug(f"enriched {self.object_type}", count=len(self._objects))
         except Exception as exc:  # noqa: BLE001 — a collector must never abort the pipeline
-            self.log.error("collector failed", object_type=self.object_type, error=str(exc))
+            self.log.error(f"collector failed: {self.object_type}: {exc}", exc_info=True)
             self._errors.append(f"{self.object_type}: {exc}")
             self._objects = []
         finally:
@@ -79,6 +87,8 @@ class BaseCollector(ABC):
         for w in getattr(self.client, "warnings", [])[warn_start:]:
             if w not in self._errors:
                 self._errors.append(f"INCOMPLETE — {w}")
+        self.log.info(f"Phase complete: collect {self.object_type} — {len(self._objects):,} "
+                      f"objects, {len(self._errors)} errors ({fmt_elapsed(self._elapsed)})")
         return self._objects
 
     @property
@@ -105,9 +115,31 @@ class BaseCollector(ABC):
         """
         if not object_id:
             return None
+        self._acl_fetches += 1
+        self.log.debug(f"fetching ACL {object_type} {object_id}")
         try:
             data = self.client.get(f"api/2.0/permissions/{object_type}/{object_id}")
-            return data.get("access_control_list") if isinstance(data, dict) else None
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("acl fetch failed", type=object_type, id=object_id, error=str(exc))
+            acl = data.get("access_control_list") if isinstance(data, dict) else None
+            self.log.debug(f"ACL {object_type} {object_id} → {len(acl or [])} grants")
+            return acl
+        except Exception as exc:  # noqa: BLE001 — degraded: the object is kept without its ACL
+            self.log.warning(f"ACL {object_type} {object_id} → FAILED (kept without ACL): {exc}")
             return None
+        finally:
+            # Total is unknown mid-discovery, so a line every PROGRESS_EVERY fetches.
+            self.log.progress(f"collect {self.object_type}: ACLs fetched", self._acl_fetches,
+                              started=self._t0)
+
+    def _detail_get(self, what: str, ident: str, path: str, params: Optional[dict] = None) -> dict:
+        """One GET-by-id enrichment with a start + end line (DEBUG) and a WARNING on failure.
+
+        Returns {} on failure — the object is kept with its list-call fields only (a degraded but
+        visible result; the collector carries on)."""
+        self.log.debug(f"fetching {what} {ident}")
+        try:
+            data = self.client.get(path, params=params) if params else self.client.get(path)
+            self.log.debug(f"fetched {what} {ident}")
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — degraded: list-call fields only
+            self.log.warning(f"{what} {ident} → FAILED (kept with list fields only): {exc}")
+            return {}

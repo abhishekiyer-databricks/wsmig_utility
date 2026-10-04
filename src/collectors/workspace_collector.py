@@ -52,18 +52,27 @@ class WorkspaceCollector(BaseCollector):
 
     def _walk(self, path: str, out: list[dict]) -> None:
         if not self._budget_left():
-            self.client.warnings.append(
-                f"workspace/list: hit max_ws_api_calls={self._max_calls} — tree traversal truncated")
+            msg = (f"workspace/list: hit max_ws_api_calls={self._max_calls} — tree traversal "
+                   f"truncated")
+            if msg not in self.client.warnings:
+                self.log.warning(f"{msg} (at {path})")
+            self.client.warnings.append(msg)
             return
         if self._max_items and len(out) >= self._max_items:
+            self.log.debug(f"max_workspace_items={self._max_items} reached — not listing {path}")
             return
         self._api_calls += 1
+        self.log.debug(f"listing {path}")
         try:
             data = self.client.get("api/2.0/workspace/list", params={"path": path})
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("workspace/list failed", path=path, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 — degraded: this subtree is missing from inventory
+            self.log.warning(f"listing {path} FAILED — its subtree is NOT inventoried: {exc}")
             return
-        for obj in data.get("objects", []) or []:
+        listed = data.get("objects", []) or []
+        self.log.debug(f"listed {path} ({len(listed)} objects)")
+        self.log.progress("collect workspace_object: directories listed", self._api_calls,
+                          started=self._t0, objects=len(out))
+        for obj in listed:
             p = safe_str(obj.get("path"))
             otype = safe_str(obj.get("object_type"))  # DIRECTORY | NOTEBOOK | FILE | REPO | LIBRARY
             if self._is_trash(p):
@@ -166,12 +175,14 @@ class WorkspaceCollector(BaseCollector):
 
         # Primary: per-id detail for git folders discovered during the walk.
         for rid in sorted(self._repo_ids):
+            self.log.debug(f"collecting repo {rid}")
             try:
                 detail = self.client.get(f"api/2.0/repos/{rid}") or {}
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("repo detail failed", repo_id=rid, error=str(exc))
                 detail = {}
             _add(rid, detail if isinstance(detail, dict) else {})
+            self.log.debug(f"collected repo {rid} ({safe_str((detail or {}).get('path'))})")
 
         # Fallback/union: the list API (in case it returns repos the walk didn't reach).
         for extra in ({}, {"path_prefix": "/Workspace"}):

@@ -117,6 +117,7 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     The returned dict carries the ACTUAL paths written, so the notebook reads back the right files.
     """
     rows = _all_rows(results)
+    _LOG.info(f"building import reports from {len(rows):,} unit rows")
     written: dict[str, str] = {}
     # The deleted-in-source finding is discovered by the runner into `context`; fold it into the
     # summary so every renderer below sees one object rather than needing both.

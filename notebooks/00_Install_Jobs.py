@@ -55,6 +55,9 @@ dbutils.widgets.dropdown("allow_secret_in_job_params", "false", ["true", "false"
 dbutils.widgets.text("state_catalog", "", "State catalog (shared, must exist)")
 dbutils.widgets.text("state_schema", "", "State schema (shared, must exist)")
 dbutils.widgets.text("account_id", "", "Account id (optional)")
+# Projected into EVERY task: the CELL output level of 01/02/04 (the driver log is always DEBUG).
+dbutils.widgets.dropdown("log_level", "INFO", ["DEBUG", "INFO", "WARNING", "ERROR"],
+                         "Cell log level for every job task (driver log is always DEBUG)")
 
 # COMMAND ----------
 
@@ -141,6 +144,7 @@ _params = {
     "state_catalog": _w("state_catalog"),
     "state_schema": _w("state_schema"),
     "account_id": _w("account_id"),
+    "log_level": _w("log_level", "INFO"),
 }
 
 # Secret handling. The scope pointer is preferred and never puts the secret in a Job param. A raw

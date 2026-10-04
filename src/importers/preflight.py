@@ -20,9 +20,11 @@ So the answer to "must every manual step be done first?" is not "all or nothing"
 """
 from __future__ import annotations
 
+import time
+
 from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso, safe_str
-from src.utils.logger import get_logger
+from src.utils.logger import fmt_elapsed, get_logger
 
 _LOG = get_logger("preflight")
 
@@ -58,9 +60,9 @@ class Preflight:
         """
         self.findings.append({"check": check, "ok": bool(ok), "grade": grade, "detail": detail,
                               "affected_units": list(affected or [])})
-        level = "ok" if ok else grade
-        (_LOG.info if ok else _LOG.warning)("preflight check", check=check, result=level,
-                                           detail=detail[:200])
+        verdict = "GO" if ok else ("NO-GO" if grade == BLOCKING else "WARN")
+        (_LOG.info if ok else _LOG.warning)(f"preflight check {check} → {verdict} ({grade})",
+                                           detail=detail[:400])
 
     # ── the checks ────────────────────────────────────────────────────────
     def check_bundle(self) -> None:
@@ -217,8 +219,8 @@ class Preflight:
             for g in self.client.get_scim("Groups"):
                 target_group_kinds[safe_str(g.get("displayName"))] = safe_str(
                     (g.get("meta") or {}).get("resourceType")).lower()
-        except Exception:  # noqa: BLE001 — already reported above if listing failed
-            pass
+        except Exception as exc:  # noqa: BLE001 — expected: already reported above if listing failed
+            _LOG.debug(f"preflight: target group kinds unavailable ({str(exc)[:160]})")
 
         missing, shadowed = [], []
         for identity in account_managed:
@@ -418,7 +420,8 @@ class Preflight:
     def _exists_on_target(self, path: str) -> bool:
         try:
             return bool(self.client.get("api/2.0/workspace/get-status", params={"path": path}))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — expected: a 404 means "absent"
+            _LOG.debug(f"preflight: {path} absent on target ({str(exc)[:160]})")
             return False
 
     # ── run + verdict ─────────────────────────────────────────────────────
@@ -442,10 +445,14 @@ class Preflight:
             ("Git repos (out of scope for import)", self.check_repos),
             ("legacy SQL dashboards", self.check_legacy_dashboards),
         )
+        _LOG.info(f"Phase: preflight — {len(checks)} checks")
+        t0 = time.time()
         for name, check in checks:
+            _LOG.debug(f"preflight check {name} started")
             try:
                 check()
             except Exception as exc:  # noqa: BLE001 — a check that errors must not hide the others
+                _LOG.error(f"preflight check {name} itself failed to run", exc_info=True)
                 self._add(name, False, DEGRADING,
                           f"the check itself failed to run: {str(exc)[:200]}")
 
@@ -470,6 +477,7 @@ class Preflight:
         # was redundant and is gone. The machine-readable `misc/preflight_report.json` stays (small,
         # for audit; the manifest already excludes it).
         self.aw.write_json(BP.PREFLIGHT_REPORT_JSON, report)
-        _LOG.info("preflight verdict", verdict=verdict, blocking=len(blocking),
+        _LOG.info(f"Phase complete: preflight — verdict {verdict} "
+                  f"({fmt_elapsed(time.time() - t0)})", blocking=len(blocking),
                   degrading=len(degrading), cosmetic=len(cosmetic))
         return report

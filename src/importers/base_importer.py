@@ -45,7 +45,7 @@ from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATE
                                    CAT_PERMISSION_DENIED, CAT_PREREQUISITE_MISSING, UpsertAction)
 from src.utils.helpers import (folder_natural_key, home_owner, looks_like_app_id, normalize_ws_path,
                                safe_str)
-from src.utils.logger import get_logger
+from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 
 # The single decision a `/Users/<owner>/...` path resolves to (PLAN 9, lifted here in PLAN 11
 # Finding-8 so the workspace importer AND the four folder-placed importers — SQL queries/alerts,
@@ -300,6 +300,10 @@ class BaseImporter(ABC):
         self.result = ImportResult(self.component)
         self._pending_cp: list[str] = []
         self._pending_cp_results: dict = {}
+        # Phase progress (set by run(); 0 = _record called outside a phase run, e.g. a unit test).
+        self._phase_total = 0
+        self._phase_done = 0
+        self._phase_t0 = 0.0
 
     # ── properties ────────────────────────────────────────────────────────
     @property
@@ -503,9 +507,11 @@ class BaseImporter(ABC):
     # orphaned owner's query would hard-fail while their notebook is preserved.
     def _get_status(self, path: str) -> dict:
         """`workspace/get-status` for a path, or {} if absent. Never raises — absent 404s."""
+        self.log.debug(f"checking {path}")
         try:
             return self.client.get("api/2.0/workspace/get-status", params={"path": path}) or {}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — expected: a 404 means "absent"
+            self.log.debug(f"checked {path} → absent ({str(exc)[:160]})")
             return {}
 
     def _roster_status(self, owner: str) -> str:
@@ -539,8 +545,13 @@ class BaseImporter(ABC):
                                 val = safe_str(e.get("value") if isinstance(e, dict) else e)
                                 if val:
                                     roster.add(val)
-            except Exception:  # noqa: BLE001 — a missing/garbled file just means "unknown"
+            except Exception as exc:  # noqa: BLE001 — a missing/garbled file just means "unknown"
                 have_roster = False
+                self.log.warning("source identity roster unreadable — home owners are treated as "
+                                 "'unknown' (never diverted to backup)", error=str(exc)[:200])
+            if not have_roster and not hasattr(self, "_roster_warned"):
+                self._roster_warned = True
+                self.log.debug("no source identity roster in the bundle — home owners 'unknown'")
             self._roster_cache = (roster if have_roster else None)
         cache = self._roster_cache
         if cache is None:
@@ -604,8 +615,9 @@ class BaseImporter(ABC):
             return
         try:
             self.client.post("api/2.0/workspace/mkdirs", {"path": path})
-        except Exception:  # noqa: BLE001 — idempotent; a real problem resurfaces on the create
-            pass
+        except Exception as exc:  # noqa: BLE001 — idempotent; a real problem resurfaces on create
+            self.log.debug(f"mkdirs {path} failed (the create will surface any real problem): "
+                           f"{str(exc)[:200]}")
 
     def _resolve_home_target(self, path: str) -> HomeResolution:
         """Decide where a `/Users/<owner>/<rest>` path (root OR descendant) should be created.
@@ -715,16 +727,31 @@ class BaseImporter(ABC):
         failing to list is still not a reason to abandon the other families.
         """
         t0 = time.time()
+        phase = f"import {self.component}"
         try:
             units = self.load()
         except Exception as exc:  # noqa: BLE001 — a family that can't even load must not abort
-            self.log.error("importer load failed", component=self.component, error=str(exc))
+            self.log.error(f"{phase}: importer load failed: {exc}", exc_info=True)
             self.result.errors.append(f"{self.component}: load failed: {exc}")
             self.result.elapsed_sec = time.time() - t0
             return self.result
 
+        by_type: dict = {}
+        for u in units:
+            at = safe_str(u.get("asset_type"))
+            by_type[at] = by_type.get(at, 0) + 1
+        self.log.info(f"Phase: {phase} — {len(units):,} units"
+                      + (f" ({fmt_counts(by_type)})" if by_type else ""),
+                      dry_run=self.dry_run)
+
+        # The existence check is one LIST (or one probe per object) — silent before, so a
+        # 20-minute check looked like a hang (QA-2). Start + end lines; probes are DEBUG.
+        t_exist = time.time()
+        self.log.info(f"{phase}: existence check started")
         try:
             existing = self.existing_keys()
+            self.log.info(f"{phase}: existence check done — {len(existing):,} already on target "
+                          f"({fmt_elapsed(time.time() - t_exist)})")
         except Exception as exc:  # noqa: BLE001
             # Failing OPEN here would risk duplicates, so treat "cannot list" as an empty map but
             # say so loudly — the create path's RESOURCE_ALREADY_EXISTS adopt is the safety net.
@@ -735,9 +762,9 @@ class BaseImporter(ABC):
                 f"falls back to RESOURCE_ALREADY_EXISTS handling")
             existing = {}
 
-        self.log.info("importing", component=self.component, units=len(units),
-                      already_on_target=len(existing), dry_run=self.dry_run)
-
+        self._phase_total = len(units)
+        self._phase_done = 0
+        self._phase_t0 = t0
         for unit in units:
             try:
                 self._process_one(unit, existing)
@@ -745,22 +772,36 @@ class BaseImporter(ABC):
                 # Nothing a single unit does may end the run. This is the last line of defence:
                 # _process_one already handles expected API errors, so reaching here means a bug or
                 # an unforeseen shape — still recorded per-unit, still continuing.
+                self.log.error(f"unexpected importer error on {unit.get('asset_type')} "
+                               f"{self.natural_key(unit)}", exc_info=True)
                 self._record(unit, ACTION_FAILED, note=f"unexpected importer error: {exc}",
                              error_raw=str(exc), category=CAT_API_ERROR)
-                self.log.error("unit failed (unexpected)", component=self.component,
-                               natural_key=self.natural_key(unit), error=str(exc))
 
         self.flush_checkpoint()
         self.result.elapsed_sec = time.time() - t0
-        self.log.info("phase done", component=self.component, **{
-            k: v for k, v in self.result.as_dict().items()
-            if k in ("total", "created", "updated", "adopted", "skipped", "failed", "manual")})
+        self.log.info(f"Phase complete: {phase} — {fmt_counts(self._outcome_counts(final=True))} "
+                      f"({fmt_elapsed(self.result.elapsed_sec)})")
+        self._phase_total = 0
         return self.result
+
+    def _outcome_counts(self, final: bool = False) -> dict:
+        """The running tally for progress / phase-complete lines (zero buckets omitted, except the
+        two an operator always wants to see)."""
+        r = self.result
+        counts = {"created": r.created, "updated": r.updated, "adopted": r.adopted,
+                  "unchanged": r.skipped, "warned": r.warned, "manual": r.manual,
+                  "no_object": r.skipped_no_object, "not_selected": r.not_selected,
+                  "failed": r.failed}
+        if final and r.dry_run:
+            counts["dry_run"] = r.dry_run
+        return {k: v for k, v in counts.items() if v or k in ("created", "failed")}
 
     def _process_one(self, unit: dict, existing: dict) -> None:
         """Decide and act on ONE unit. Expected API errors are handled here."""
         key = self.natural_key(unit)
         asset_type = safe_str(unit.get("asset_type"))
+        # START line, before any work: a stuck run's last driver-log line names this object.
+        self.log.debug(f"importing {asset_type} {key}")
 
         # 0. retry_mode narrowed the work list and this unit isn't in it. Recorded (in-memory) so
         #    the run's result still ACCOUNTS for every unit, but flagged `retry_out_of_scope` so the
@@ -778,6 +819,7 @@ class BaseImporter(ABC):
                         f"outstanding units; this one was not outstanding",
                 "failure_category": "", "dry_run": self.dry_run,
                 "retry_out_of_scope": True})
+            self._log_outcome(asset_type, key, ACTION_SKIPPED, note="not in this retry's work list")
             return
 
         # 1. Units the bundle already marked as human work (repos, legacy dashboards, secret
@@ -832,6 +874,12 @@ class BaseImporter(ABC):
         action = (self.state.decide(asset_type, key, fingerprint, exists)
                   if self.state is not None else
                   (UpsertAction.ADOPT if exists else UpsertAction.CREATE))
+        # Decision INPUTS (DEBUG): enough to explain any create/adopt/update/skip after the fact.
+        _row = self.state.row(asset_type, key) if self.state is not None else None
+        _fp_same = bool(_row) and safe_str(_row.get("last_source_fingerprint")) == fingerprint
+        self.log.debug(f"decide {asset_type} {key}: state_row={'yes' if _row else 'no'} "
+                       f"exists={'yes' if exists else 'no'} "
+                       f"fingerprint={'same' if _fp_same else 'changed/new'} → {action.name}")
 
         if action is UpsertAction.SKIP:
             self._record(unit, ACTION_SKIPPED, target_id=existing.get(key, ""),
@@ -901,9 +949,8 @@ class BaseImporter(ABC):
                                   "adopted, not duplicated")
                 return
             category, message = classify_error(exc)
+            # The ERROR outcome line (object + category + raw server error) is logged by _record.
             self._record(unit, ACTION_FAILED, note=message, error_raw=str(exc), category=category)
-            self.log.warning("create failed", component=self.component, natural_key=key,
-                             category=category, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
@@ -928,8 +975,6 @@ class BaseImporter(ABC):
             category, message = classify_error(exc)
             self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
                          error_raw=str(exc), category=category)
-            self.log.warning("declarative apply failed", component=self.component,
-                             natural_key=key, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
@@ -952,8 +997,6 @@ class BaseImporter(ABC):
             category, message = classify_error(exc)
             self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
                          error_raw=str(exc), category=category)
-            self.log.warning("update failed", component=self.component, natural_key=key,
-                             target_id=target_id, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_UPDATED,
@@ -999,6 +1042,8 @@ class BaseImporter(ABC):
             "dry_run": bool(dry),
         }
         self.result.add(row)
+        self._log_outcome(asset_type, key, status, target_id=target_id, note=note,
+                          error_raw=error_raw, category=category, dry=dry)
 
         if self.state is not None:
             # A FAILED outcome must NOT advance the stored fingerprint. The change never landed on
@@ -1029,6 +1074,32 @@ class BaseImporter(ABC):
                                              "note": note}
             if len(self._pending_cp) >= CHECKPOINT_BATCH:
                 self.flush_checkpoint()
+
+    def _log_outcome(self, asset_type: str, key: str, status: str, *, target_id: str = "",
+                     note: str = "", error_raw: str = "", category: str = "",
+                     dry: bool = False) -> None:
+        """The per-object END line, then `progress()`. ONE level rule everywhere:
+        failed → ERROR; created_with_warning → WARNING; everything else → DEBUG. So failures and
+        warnings reach the cell, successes stay in the driver log."""
+        what = f"{asset_type} {key}"
+        if status == ACTION_FAILED:
+            raw = safe_str(error_raw)
+            line = f"{what} → FAILED {category or CAT_API_ERROR}: {note}"
+            if raw and raw[:200] not in safe_str(note):
+                line += f"  | raw: {raw[:1000]}"
+            self.log.error(line)
+        elif status == ACTION_CREATED_WITH_WARNING:
+            self.log.warning(f"{what} → {status}"
+                             + (f"  target_id={target_id}" if target_id else "")
+                             + (f": {note}" if note else ""))
+        else:
+            self.log.debug(f"{what} → {'(dry run) ' if dry else ''}{status}"
+                           + (f"  target_id={target_id}" if target_id else "")
+                           + (f"  note={safe_str(note)[:300]}" if note else ""))
+        if self._phase_total:
+            self._phase_done += 1
+            self.log.progress(f"import {self.component}", self._phase_done, self._phase_total,
+                              started=self._phase_t0, **self._outcome_counts())
 
     def flush_checkpoint(self) -> None:
         """Write the pending checkpoint batch. Called per batch, at phase end, and in `finally`."""

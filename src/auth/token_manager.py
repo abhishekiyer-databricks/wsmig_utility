@@ -35,10 +35,24 @@ from typing import Any, Optional
 import requests
 
 from src.config.config_manager import WorkspaceContext
-from src.utils.logger import get_logger
+from src.utils.logger import get_logger, register_secret
 from src.utils.retry import RetryableHTTPError, is_retryable_status, with_retry
 
 _LOG = get_logger("auth")
+# Every REST call gets one DEBUG line under `[api]` (driver log): method, path, query params,
+# status, ms — and on a 4xx/5xx the server's error_code + message. NEVER bodies or headers.
+_API_LOG = get_logger("api")
+
+
+def _log_call(method: str, path: str, params, status, t0: float, error: str = "") -> None:
+    ms = int((time.time() - t0) * 1000)
+    q = ""
+    if params:
+        q = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    line = f"{method:<4} {path.lstrip('/')}{q} → {status} ({ms} ms)"
+    if error:
+        line += f"  error={error[:600]}"
+    _API_LOG.debug(line)
 
 
 class HTTPStatusError(Exception):
@@ -114,6 +128,7 @@ def resolve_context(dbutils=None, spark=None, account_id: str = "") -> Workspace
             "ambient auth available, or on a cluster exposing the notebook context token."
         )
 
+    register_secret(token)   # never in a log line, even inside a quoted URL or traceback
     return WorkspaceContext(workspace_url=host.rstrip("/"), token=token, account_id=account_id)
 
 
@@ -172,6 +187,7 @@ class OAuthM2MTokenProvider:
         self._host = host.rstrip("/")
         self._client_id = client_id
         self._secret = client_secret
+        register_secret(client_secret)
         self._scope = scope
         self._verify = verify_ssl
         self._timeout = timeout
@@ -216,10 +232,11 @@ class OAuthM2MTokenProvider:
     def __call__(self) -> str:
         with self._lock:
             if not self._token or time.time() >= self._expires_at:
+                _LOG.debug("minting OAuth M2M token", host=self._host, client_id=self._client_id)
                 self._token, self._expires_at = self._mint()
-                _LOG.info("minted OAuth M2M token for source workspace",
-                          host=self._host, client_id=self._client_id,
-                          valid_for_s=int(self._expires_at - time.time()))
+                register_secret(self._token)
+                _LOG.info(f"token minted (expires in {int(self._expires_at - time.time())}s)",
+                          host=self._host, client_id=self._client_id)
             return self._token
 
 
@@ -241,6 +258,19 @@ def oauth_m2m_token_provider(host: str, client_id: str, client_secret: str,
 # REST client (bound to THIS workspace)
 # ---------------------------------------------------------------------------
 
+def _error_detail(r) -> str:
+    """The server's own explanation of a 4xx/5xx: `error_code` + `message` (or the raw text)."""
+    try:
+        doc = r.json()
+        detail = ""
+        if isinstance(doc, dict):
+            detail = " ".join(str(doc.get(k)) for k in ("error_code", "message", "error")
+                              if doc.get(k))
+        return detail or r.text[:600]
+    except ValueError:   # a non-JSON error body (an HTML gateway page) — its text IS the detail
+        return r.text[:600]
+
+
 class ApiClient:
     """Thin authenticated REST client with retry, pagination, and SCIM helpers.
 
@@ -251,6 +281,7 @@ class ApiClient:
     def __init__(self, host: str, token_provider, verify_ssl: bool = True, timeout: int = 60) -> None:
         self._base = host.rstrip("/")
         self._token_provider = token_provider
+        register_secret(getattr(token_provider, "_token", ""))
         self._verify = verify_ssl
         self._timeout = timeout
         self._s = requests.Session()
@@ -279,8 +310,19 @@ class ApiClient:
         url = f"{self._base}/{path.lstrip('/')}"
 
         def _do():
-            r = self._s.request(method, url, headers=self._headers(), params=params,
-                                json=json_body, verify=self._verify, timeout=self._timeout)
+            t0 = time.time()
+            try:
+                r = self._s.request(method, url, headers=self._headers(), params=params,
+                                    json=json_body, verify=self._verify, timeout=self._timeout)
+            except Exception as exc:
+                # A connection error / timeout never got a status — log it so a stuck or flaky
+                # call is visible in the driver log, then let it propagate unchanged.
+                _log_call(method, path, params, type(exc).__name__, t0, str(exc))
+                raise
+            if r.status_code >= 400:
+                _log_call(method, path, params, r.status_code, t0, _error_detail(r))
+            else:
+                _log_call(method, path, params, r.status_code, t0)
             if is_retryable_status(r.status_code):
                 retry_after = r.headers.get("Retry-After")
                 raise RetryableHTTPError(
@@ -295,21 +337,13 @@ class ApiClient:
                 # actionable — both for the operator reading the report and for classify_error(),
                 # which matches on markers like RESOURCE_ALREADY_EXISTS. Without it every API
                 # rejection looked identical.
-                detail = ""
-                try:
-                    doc = r.json()
-                    if isinstance(doc, dict):
-                        detail = " ".join(str(doc.get(k)) for k in ("error_code", "message", "error")
-                                          if doc.get(k))
-                    detail = detail or r.text[:600]
-                except ValueError:
-                    detail = r.text[:600]
+                detail = _error_detail(r)
                 raise HTTPStatusError(r.status_code,
                                       f"{method} {url} -> {r.status_code}: {detail[:600]}")
             if r.text:
                 try:
                     return r.json()
-                except ValueError:
+                except ValueError:   # expected: a 2xx with a non-JSON body — hand back the text
                     return {"_raw": r.text}
             return {}
 
@@ -331,8 +365,15 @@ class ApiClient:
         url = f"{self._base}/{path.lstrip('/')}"
 
         def _do() -> bytes:
-            with self._s.get(url, headers=self._headers(), params=params, verify=self._verify,
-                             timeout=self._timeout, stream=True) as r:
+            t0 = time.time()
+            try:
+                resp = self._s.get(url, headers=self._headers(), params=params,
+                                   verify=self._verify, timeout=self._timeout, stream=True)
+            except Exception as exc:
+                _log_call("GET", path, params, type(exc).__name__, t0, str(exc))
+                raise
+            with resp as r:
+                _log_call("GET", path, params, r.status_code, t0)
                 if is_retryable_status(r.status_code):
                     retry_after = r.headers.get("Retry-After")
                     raise RetryableHTTPError(
@@ -343,8 +384,8 @@ class ApiClient:
                     body = ""
                     try:
                         body = r.text[:2000]
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as exc:  # noqa: BLE001 — degraded: error raised without body
+                        _API_LOG.debug("could not read the error body", path=path, error=str(exc))
                     raise DownloadHTTPError(r.status_code, f"GET {url} -> {r.status_code}: {body}")
                 if max_bytes:
                     clen = r.headers.get("Content-Length")
@@ -459,6 +500,7 @@ def build_clients(config, dbutils=None, spark=None) -> tuple[ApiClient, ApiClien
         return local, local
 
     secret = config.resolve_source_secret(dbutils)   # never logged, never stored
+    register_secret(secret)
     provider = oauth_m2m_token_provider(config.source.workspace_url, config.source.client_id,
                                         secret)
     source_client = ApiClient(config.source.workspace_url, provider)

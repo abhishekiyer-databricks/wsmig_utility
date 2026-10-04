@@ -24,6 +24,7 @@ class DltCollector(BaseCollector):
         items = []
         for p in raw:
             pid = safe_str(p.get("pipeline_id"))
+            self.log.debug(f"collecting pipeline {pid}")
             spec = {}
             try:
                 detail = self.client.get(f"api/2.0/pipelines/{pid}")
@@ -39,4 +40,5 @@ class DltCollector(BaseCollector):
                 "spec": spec,
                 "_raw": p,
             })
+            self.log.debug(f"collected pipeline {pid} ({items[-1]['name']})")
         return items
