@@ -44,7 +44,7 @@ import time
 from enum import Enum
 from typing import Any, Optional
 
-from src.utils.helpers import now_iso, safe_str
+from src.utils.helpers import is_platform_internal, now_iso, safe_str
 from src.utils.logger import get_logger
 
 _LOG = get_logger("state_store")
@@ -95,6 +95,11 @@ LAST_ACTIONS = frozenset({
     ACTION_DELETED_IN_SOURCE,
 })
 
+# Outcomes that mean "this run made the object right on target" — a retry lets the units that
+# DEPEND on such an object (its ACL, a dashboard's publish/schedule units) follow it (16.2 §5a).
+ACTED_STATUSES = frozenset({ACTION_CREATED, ACTION_UPDATED, ACTION_ADOPTED,
+                            ACTION_CREATED_WITH_WARNING})
+
 # The `last_action` values that mean "went wrong / needs a fix" — the cumulative Outstanding view
 # (PLAN 11 Finding-4). Scoped to FAILURES ONLY (customer 2026-09-04): the operator wants the sheet
 # to hold nothing but things that actually failed. Everything else is by-design or visible
@@ -144,6 +149,25 @@ CAT_UNIT_FAILED_EARLIER = "unit_failed_earlier"
 CAT_FAMILY_NOT_SELECTED = "family_not_selected"
 CAT_OVERSIZE = "oversize"
 CAT_UC_BACKED = "uc_backed"
+# The object's family WAS selected, but the object is not on target and no other case applies
+# (PLAN 16.2 §3: this used to be mis-reported as `family_not_selected`).
+CAT_OBJECT_ABSENT = "object_absent"
+# A write the API accepted (2xx) but whose read-back shows it did not take effect (PLAN 16.2 §4).
+CAT_NOT_APPLIED = "not_applied"
+
+
+# The `deleted_in_source` note per asset_type. Nothing is ever deleted on target by this tool; for
+# a dashboard's publish state / schedule (PLAN 16.2 §4) there is not even an opt-in — the tool never
+# unpublishes and never deletes a schedule, it only flags the drift.
+_DELETED_IN_SOURCE_DEFAULT_NOTE = (
+    "present in the migration state table but absent from this bundle — deleted on source. NOT "
+    "deleted on target (set allow_deletes=true to opt into deletion).")
+DELETED_IN_SOURCE_NOTE = {
+    "lakeview_dashboard_publish": ("published on target but no longer on source — unpublish by "
+                                   "hand if intended (the tool never unpublishes)"),
+    "lakeview_dashboard_schedule": ("schedule on target but no longer on source — delete it by "
+                                    "hand if intended (the tool never deletes a schedule)"),
+}
 
 
 class StateLoadError(RuntimeError):
@@ -643,10 +667,13 @@ class StateStore:
                 continue
             if safe_str(r.get("last_action")) == ACTION_DELETED_IN_SOURCE:
                 continue   # already reported on an earlier run
+            # Platform-internal (`.db_internal` …, PLAN 16.2 §2): a `main`-written row (its ACL row,
+            # a child of the folder) is no longer exported — that is not a deletion, so the row is
+            # left untouched and never reported.
+            if is_platform_internal(nk):
+                continue
             self.record(at, nk, action=ACTION_DELETED_IN_SOURCE,
-                        error="present in the migration state table but absent from this bundle — "
-                              "deleted on source. NOT deleted on target (set allow_deletes=true "
-                              "to opt into deletion).")
+                        error=DELETED_IN_SOURCE_NOTE.get(at, _DELETED_IN_SOURCE_DEFAULT_NOTE))
             gone.append(nk)
         return gone
 
@@ -715,6 +742,20 @@ class StateStore:
         return {nk: safe_str(r.get("target_object_id"))
                 for (at, nk), r in list(self._cache.items())
                 if at == asset_type and safe_str(r.get("target_object_id"))}
+
+    def target_id_by_source_id(self, asset_type: str) -> dict:
+        """`{source_object_id: target_object_id}` for one asset_type (PLAN 16.2 §3).
+
+        For objects whose ACL entry is keyed by something OTHER than their state natural key —
+        `acls.json` names a dashboard / Genie space by display name, the state row by full path —
+        the source id is the one value both carry (also on `main`-written rows)."""
+        if not self.enabled:
+            return {}
+        self.load()
+        return {safe_str(r.get("source_object_id")): safe_str(r.get("target_object_id"))
+                for (at, _nk), r in list(self._cache.items())
+                if at == asset_type and safe_str(r.get("source_object_id"))
+                and safe_str(r.get("target_object_id"))}
 
     def outstanding_rows(self) -> list:
         """Every row for THIS pair that is NOT yet successfully migrated — the cumulative

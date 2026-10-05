@@ -211,7 +211,8 @@ def test_secret_never_written_into_the_bundle_artifacts():
             "target_staging_location": d}), spark=None)
         aw = ArtifactWriter(cfg)
         aw.ensure_output_path()
-        aw.write_json("inventory.json", {"objects_by_type": {
+        from src.exporters import bundle_paths as BP
+        aw.write_json(BP.INVENTORY_JSON, {"objects_by_type": {
             "workspace_object": [{"object_type": "NOTEBOOK", "path": "/n", "object_id": "1",
                                   "language": "PYTHON"}]}})
         aw.write_json("config_resolved.json", cfg.redacted())

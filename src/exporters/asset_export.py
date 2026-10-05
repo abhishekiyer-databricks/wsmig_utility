@@ -25,7 +25,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from src.transform.transforms import fingerprint, strip_runtime
-from src.utils.helpers import folder_natural_key, safe_str
+from src.utils.helpers import (PLATFORM_INTERNAL_NOTE, folder_natural_key,
+                               is_platform_internal, safe_str)
 
 # migration_mode → default export_status (the fetcher/runner may override for content/skip).
 # `covered` = the object is the on-disk twin of an asset already exported via its NATIVE API
@@ -97,6 +98,8 @@ _IMPORT_ACTION_BY_CLASS = {
 #   assign_on_target   — account GROUP: must ALREADY exist in the target ACCOUNT; assign + entitle
 #   add_members        — built-in group: PATCH members onto the group that already exists
 #   dab_redeploy       — bundle-owned; import SKIPS it, the customer's bundle redeploy owns it
+#   skip_internal      — platform-internal folder (`.db_internal` …); Databricks owns it, import
+#                        records it skipped without any API call (PLAN 16.2 §2)
 #   via_native_asset   — created as a side effect of its native asset (the on-disk twin)
 #   install            — attached to an existing object rather than created (cluster libraries)
 #   set_conf           — a workspace setting written via the conf API
@@ -106,13 +109,14 @@ _IMPORT_ACTION_BY_CLASS = {
 #   none               — nothing to import (toggled off, or export failed)
 _ACTION_CREATE = "create"
 _ACTION_DAB = "dab_redeploy"
+_ACTION_INTERNAL = "skip_internal"
 
 # The CLOSED vocabulary. `export_excel` renders a human label per action and any value missing
 # from its map silently degrades to "—", so the label map is checked against this set at import
 # time (see export_excel) — a new action can't be added here and forgotten there.
 IMPORT_ACTIONS = frozenset({
     "create", "create_and_upload", "assign_on_target", "adopt_or_assign", "add_members",
-    "dab_redeploy", "skip_generated",
+    "dab_redeploy", "skip_generated", "skip_internal",
     "via_native_asset", "install", "set_conf", "apply_acl", "manual", "review_required", "none",
 })
 
@@ -259,6 +263,9 @@ def derive_import_action(unit: dict, roots=None) -> str:
         return _ACTION_BY_STATUS[status]
     asset_type = safe_str(unit.get("asset_type"))
     mode = safe_str(unit.get("migration_mode"))
+    # Platform-internal folders (`.db_internal` …, PLAN 16.2 §2): Databricks-owned, never imported.
+    if asset_type in _DAB_CONTENT_TYPES and is_platform_internal(unit.get("natural_key")):
+        return _ACTION_INTERNAL
     # Bundle-root content: exported, never imported (see _DAB_ROOT_SEGMENT). Checked before the
     # mode mapping so `content`/`auto` can't win and advertise CREATE + UPLOAD. `migration_mode`
     # is intentionally NOT changed — that would drop these units out of the payload files and
@@ -317,6 +324,8 @@ ARTIFACT_PATH: dict[str, str] = {
     "alert_v2": "export/sql/alerts_v2.json",
     "dlt_pipeline": "export/dlt/pipelines.json",
     "lakeview_dashboard": "export/dashboards/lakeview.json",
+    "lakeview_dashboard_publish": "export/dashboards/lakeview_publish.json",
+    "lakeview_dashboard_schedule": "export/dashboards/lakeview_schedules.json",
     "genie_space": "export/genie/spaces.json",
     "serving_endpoint": "export/serving/endpoints.json",
     "global_init_script": "export/misc/global_init_scripts.json",
@@ -343,6 +352,7 @@ TOGGLE_FOR: dict[str, str] = {
     "legacy_dashboard": "sql", "alert_v2": "sql",
     "dlt_pipeline": "dlt",
     "lakeview_dashboard": "dashboards",
+    "lakeview_dashboard_publish": "dashboards", "lakeview_dashboard_schedule": "dashboards",
     "genie_space": "genie",
     "serving_endpoint": "serving",
     "global_init_script": "misc", "cluster_library": "misc", "workspace_conf": "misc",
@@ -564,7 +574,10 @@ def _workspace_units(records: list[dict], native_paths: Optional[dict] = None) -
         path = safe_str(r.get("path"))
         oid = r.get("object_id") or r.get("repo_id")
         if otype == "DIRECTORY":
-            out.append(_make_unit("directory", path, oid, {"path": path}, mode="auto"))
+            # A platform-internal dir keeps its unit (visible in the bundle + export_status.xlsx)
+            # and its fingerprint (same payload as before); derive_import_action → skip_internal.
+            note = PLATFORM_INTERNAL_NOTE if is_platform_internal(path) else ""
+            out.append(_make_unit("directory", path, oid, {"path": path}, mode="auto", note=note))
         elif otype == "NOTEBOOK":
             out.append(_make_unit(
                 "notebook", path, oid,
@@ -758,7 +771,117 @@ def _dlt_units(records: list[dict]) -> list[dict]:
     return out
 
 
-def _lakeview_units(records: list[dict]) -> list[dict]:
+# PLAN 16.2 §4 — a dashboard's PUBLISH state and each SCHEDULE are their own units, so the
+# `lakeview_dashboard` unit (natural key, payload, FINGERPRINT) stays byte-identical to `main` (no
+# mass UPDATE on upgrade) while the upsert machinery gives the two new facets create / update / skip
+# / retry / dry-run / report rows for free.
+PUBLISH_ASSET_TYPE = "lakeview_dashboard_publish"
+SCHEDULE_ASSET_TYPE = "lakeview_dashboard_schedule"
+_DAB_CHILD_NOTE = ("handled by DAB redeploy (the bundle owns the dashboard, its publish state and "
+                   "its schedules)")
+
+
+def publish_natural_key(dashboard_key: str) -> str:
+    return f"{dashboard_key}#published"
+
+
+def schedule_natural_key(dashboard_key: str, schedule_id: str) -> str:
+    return f"{dashboard_key}#schedule:{schedule_id}"
+
+
+def _iso_after(a: str, b: str) -> bool:
+    """Whether ISO-8601 timestamp `a` is strictly later than `b` (False if either is unparsable)."""
+    import datetime as _dt
+
+    def _p(v):
+        v = safe_str(v).strip()
+        if not v:
+            return None
+        try:
+            return _dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    pa, pb = _p(a), _p(b)
+    if pa is None or pb is None:
+        return False
+    if (pa.tzinfo is None) != (pb.tzinfo is None):
+        pa, pb = pa.replace(tzinfo=None), pb.replace(tzinfo=None)
+    return pa > pb
+
+
+def _norm_subscriber(sub: dict) -> dict:
+    """A source subscriber in the shape the target matches on (names, never source ids)."""
+    if safe_str(sub.get("kind")) == "user":
+        if sub.get("user_name"):
+            return {"kind": "user", "user_name": safe_str(sub.get("user_name"))}
+        return {"kind": "user", "user_id": safe_str(sub.get("user_id")), "unresolved": True}
+    if sub.get("unresolved") or not sub.get("display_name"):
+        return {"kind": "destination", "destination_id": safe_str(sub.get("destination_id")),
+                "unresolved": True}
+    return {"kind": "destination", "display_name": safe_str(sub.get("display_name")),
+            "destination_type": safe_str(sub.get("destination_type"))}
+
+
+def _dashboard_child_units(r: dict, nk: str, warehouse_names: dict) -> list[dict]:
+    """The publish unit + one unit per schedule of a PUBLISHED source dashboard. A draft (or an
+    unknown publish state — the collector could not tell) has none, so nothing changes on target."""
+    import json as _json
+    if safe_str(r.get("publish_state")) != "published":
+        return []
+    did = safe_str(r.get("dashboard_id"))
+    pub = r.get("published") or {}
+    embed = bool(pub.get("embed_credentials"))
+    parent_extra = {"parent_natural_key": nk, "parent_source_id": did,
+                    "dashboard_display_name": safe_str(r.get("display_name"))}
+    out: list[dict] = []
+    if r.get("deployed_by_dab"):
+        out.append(_make_unit(PUBLISH_ASSET_TYPE, publish_natural_key(nk), did, None, mode="dab",
+                              migratable=False, note=_DAB_CHILD_NOTE, extra=parent_extra))
+        for sch in r.get("schedules") or []:
+            out.append(_make_unit(SCHEDULE_ASSET_TYPE,
+                                  schedule_natural_key(nk, safe_str(sch.get("schedule_id"))),
+                                  sch.get("schedule_id"), None, mode="dab", migratable=False,
+                                  note=_DAB_CHILD_NOTE, extra=parent_extra))
+        return out
+    wh = safe_str(pub.get("warehouse_id"))
+    out.append(_make_unit(
+        PUBLISH_ASSET_TYPE, publish_natural_key(nk), did,
+        {"embed_credentials": embed, "warehouse_id": wh,
+         "warehouse_name": warehouse_names.get(wh, ""),
+         "revision_create_time": safe_str(pub.get("revision_create_time"))},
+        mode="auto",
+        # NOT fingerprinted: a draft edit on source does not change what is PUBLISHED there.
+        extra={**parent_extra, "unpublished_changes": _iso_after(
+            r.get("update_time"), pub.get("revision_create_time"))}))
+    for sch in r.get("schedules") or []:
+        sid = safe_str(sch.get("schedule_id"))
+        swh = safe_str(sch.get("warehouse_id"))
+        payload = {"cron_schedule": dict(sch.get("cron_schedule") or {}),
+                   "pause_status": safe_str(sch.get("pause_status")),
+                   "display_name": safe_str(sch.get("display_name")),
+                   "subscribers": sorted(
+                       (_norm_subscriber(x) for x in sch.get("subscribers") or []),
+                       key=lambda x: _json.dumps(x, sort_keys=True))}
+        if swh:
+            payload["warehouse_id"] = swh
+            payload["warehouse_name"] = warehouse_names.get(swh, "")
+        out.append(_make_unit(
+            SCHEDULE_ASSET_TYPE, schedule_natural_key(nk, sid), sid, payload, mode="auto",
+            # The parent's credentials MODE decides whether subscribers can be added at all (F12),
+            # so a mode switch on source must re-evaluate the schedule.
+            fingerprint_extra={"_parent_embed_credentials": embed},
+            extra={**parent_extra, "parent_embed_credentials": embed}))
+    return out
+
+
+def _warehouse_names(objects_by_type: dict) -> dict:
+    """source warehouse id → its natural key (name), for the publish/schedule payloads."""
+    return {safe_str(s.get("id")): safe_str(s.get("_natural_key") or s.get("name"))
+            for s in objects_by_type.get("sql", []) or [] if s.get("sql_type") == "warehouse"}
+
+
+def _lakeview_units(records: list[dict], warehouse_names: Optional[dict] = None) -> list[dict]:
+    warehouse_names = warehouse_names or {}
     out: list[dict] = []
     for r in records:
         name = safe_str(r.get("display_name"))
@@ -780,6 +903,7 @@ def _lakeview_units(records: list[dict]) -> list[dict]:
                        "serialized_dashboard": r.get("serialized_dashboard"),
                        "parent_path": safe_str(r.get("parent_path"))}
             out.append(_make_unit("lakeview_dashboard", nk, did, payload, mode="auto"))
+        out.extend(_dashboard_child_units(r, nk, warehouse_names))
     return out
 
 
@@ -963,6 +1087,8 @@ def build_all(objects_by_type: dict[str, list]) -> dict[str, list[dict]]:
         records = objects_by_type.get(object_type) or []
         if object_type == "workspace_object":
             units = builder(records, native_paths)
+        elif object_type == "lakeview_dashboard":
+            units = builder(records, _warehouse_names(objects_by_type))
         else:
             units = builder(records)
         for unit in units:

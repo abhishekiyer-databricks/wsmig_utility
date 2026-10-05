@@ -244,6 +244,11 @@ _COLUMNS: Dict[str, List[tuple]] = {
         ("lifecycle_state",   "State",          "badge_state"),
         ("_dab",              "Deployed by DAB","badge_type"),
         ("_acls",             "ACL Grants",     "plain"),
+        # PLAN 16.2 §4: publish state + schedules are migrated, so inventory shows them.
+        ("_published",        "Published",      "plain"),
+        ("_credentials",      "Credentials",    "plain"),
+        ("_schedules",        "Schedules",      "plain"),
+        ("_subscribers",      "Subscribers",    "trunc"),
         ("create_time",       "Created",        "iso_ts"),
         ("update_time",       "Updated",        "iso_ts"),
     ],
@@ -394,6 +399,25 @@ def _flatten_library(rec: Dict[str, Any]) -> Dict[str, Any]:
 # alone.
 # ---------------------------------------------------------------------------
 
+def _dashboard_publish_cols(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Published / Credentials / Schedules / Subscribers for the Dashboards sheet (PLAN 16.2 §4)."""
+    state = str(d.get("publish_state") or "")
+    if state != "published":
+        # Never a blank cell (no-null report rule): an older inventory has no publish_state at all.
+        return {"_published": "No (draft)" if state == "draft" else "Unknown",
+                "_credentials": "NA", "_schedules": "NA", "_subscribers": "NA"}
+    embed = bool((d.get("published") or {}).get("embed_credentials"))
+    schedules = d.get("schedules") or []
+    names = []
+    for sch in schedules:
+        for sub in sch.get("subscribers") or []:
+            names.append(str(sub.get("user_name") or sub.get("display_name")
+                             or sub.get("user_id") or sub.get("destination_id") or ""))
+    return {"_published": "Yes", "_credentials": "publisher" if embed else "viewer",
+            "_schedules": len(schedules),
+            "_subscribers": ", ".join(sorted({n for n in names if n})) or "none"}
+
+
 def _merge(rec: Dict[str, Any], **enrichment) -> Dict[str, Any]:
     """Merge the raw API object (base — feeds the reference columns) with our collector's
     enrichment (added under distinct keys — feeds the metadata columns). Falls back to our
@@ -493,7 +517,7 @@ def adapt(objects_by_type: Dict[str, List[dict]]) -> Dict[str, List[dict]]:
         for p in objects_by_type.get("dlt_pipeline", []) or []]
     data["lakeview_dashboards"] = [
         _merge(d, warehouse_id=d.get("warehouse_id"), parent_path=d.get("parent_path"),
-               _acls=_acl_count(d), _dab=_dab_label(d))
+               _acls=_acl_count(d), _dab=_dab_label(d), **_dashboard_publish_cols(d))
         for d in objects_by_type.get("lakeview_dashboard", []) or []]
     data["genie_spaces"] = [
         _merge(g, warehouse_id=g.get("warehouse_id"), _acls=_acl_count(g), _dab=_dab_label(g))

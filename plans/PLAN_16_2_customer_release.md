@@ -333,5 +333,32 @@ audit + `DESCRIBE HISTORY` queries). Reports → `~/Desktop/wsmig_runs/plan16_2/
   (master plan 16.7).
 - DEBUG lines in the cell's stderr panel (QA16.1-1): accepted by the user, no change.
 
+## 9b. Dev notes (implemented offline 2026-10-05 on `feature/dashboard_publish_and_acl`)
+All six items done; **497 offline tests pass** (441 + 56 in `tests/test_plan16_2.py`), key fixes
+mutation-checked. Judgment calls the plan left open — check these during live QA:
+- **§2** A `main`-bundle content unit under `.db_internal` (no `skip_internal` action) is ALSO recorded
+  `skipped — platform-internal` (by path), not `created`. Export never fetches content under an internal
+  folder (only an older inventory can carry any). The workspace importer's up-front existence probe skips
+  internal paths too (zero calls).
+- **§3** An ACL whose object is absent while its family IS selected is now `object_absent` (new category);
+  `family_not_selected` only when the family really isn't in `import_assets`. A DAB dashboard/genie ACL
+  reads `dab_redeploy` (from its bundle unit's action). Parity also lists a dashboard/genie that is on
+  target but whose ACL was not applied (verdict `missing_on_target`).
+- **§4** Publish/schedule existence is probed lazily per unit (`probe_existing` hook): a SKIP costs one
+  read (`GET …/published` or `…/schedules`), zero writes. Read-back mismatch after publish → FAILED
+  `not_applied` (new category). A schedule on a target dashboard that is not published → `prerequisite_missing`
+  (retryable). Schedule fingerprint includes the parent's `embed_credentials`, so a credentials-mode
+  switch re-evaluates subscribers. A schedule left `created_with_warning` (pending subscribers / the
+  viewer-credential note) and a child left `skipped_no_object` are RE-CHECKED on every run as an adopt
+  (subscribers only — no PUT, the target pause state is never touched), so a destination/user created
+  later heals on a plain re-run. Target user id: identity map `scim_ids`, else a SCIM `userName eq` lookup.
+  Source `user_id → userName` is resolved in `InventoryRunner` from the identity roster. If every source
+  dashboard is unpublished, the publish rows are still compared for deleted-in-source.
+- **§5** ACLs follow via the runner (`AclImporter.retry_keys_following` + `object_ref`); dashboard
+  children follow inside `DashboardsImporter` (same phase — parents run first). A `main` checkpoint row
+  without `asset_type` in the dashboards family replays as `lakeview_dashboard`.
+- **§6** `tests/test_config_auth.py` redaction test wrote `inventory.json` at the wrong path and silently
+  relied on the removed fallback — fixed to `BP.INVENTORY_JSON`.
+
 ## 10. Findings
 (live QA appends here)

@@ -34,7 +34,7 @@ import posixpath
 import time
 
 from src.importers.base_importer import BaseImporter, HomeResolution, PrerequisiteMissing
-from src.utils.helpers import home_owner, looks_like_app_id, safe_str
+from src.utils.helpers import home_owner, is_platform_internal, looks_like_app_id, safe_str
 
 # The home-resolution seam (`_resolve_home_target`, `_roster_status`, `_home_present`,
 # `_remap_home_path`, `_backup_path`, `_note_path_remap`, `_get_status`) and the HomeResolution
@@ -45,11 +45,8 @@ from src.utils.helpers import home_owner, looks_like_app_id, safe_str
 _SKIP_ROOTS = ("/Repos", "/Users", "/Shared", "/Workspace")
 _SKIP_PREFIXES = ("/Users/Trash", "/Trash")
 
-# Platform-internal directories the workspace walk returns but that must NOT be recreated. Found
-# live: `mkdirs` on `.db_internal` returns a bare 400, because these are managed by Databricks (they
-# hold things like MLflow/notebook internals) and appear on their own when needed. Matched as a path
-# SEGMENT so both the directory itself and anything under it is skipped.
-_INTERNAL_SEGMENTS = ("/.db_internal", "/.ide", "/.databricks")
+# Platform-internal directories (`.db_internal` etc.) are matched by the shared
+# `helpers.is_platform_internal` (PLAN 16.2 §2) — collector, exporter and importers share ONE rule.
 
 # Fallback language inference, used only for a unit with no recorded language.
 _LANG_BY_EXT = {".py": "PYTHON", ".sql": "SQL", ".scala": "SCALA", ".r": "R", ".ipynb": "PYTHON"}
@@ -72,7 +69,7 @@ def is_skippable_path(path: str) -> bool:
         return True
     # Platform-internal (`.db_internal` etc.) — `mkdirs` returns a bare 400 for these, and they are
     # recreated by Databricks itself when needed.
-    return any(seg in p + "/" for seg in (s + "/" for s in _INTERNAL_SEGMENTS))
+    return is_platform_internal(p)
 
 
 def is_user_home(path: str) -> bool:
@@ -116,6 +113,9 @@ class WorkspaceImporter(BaseImporter):
             path = self.natural_key(unit)
             if not path or safe_str(unit.get("import_action")) in ("manual", "dab_redeploy"):
                 continue
+            if self.is_platform_internal_unit(unit):
+                continue        # skipped without any call (PLAN 16.2 §2) — never probed
+
             # Probe the RESOLVED target path — an SP-home path is remapped to its new appId (IMP-6)
             # and an orphaned home is diverted to the backup root (PLAN 9), so a re-run ADOPTS the
             # already-migrated content instead of recreating it. The existence map is keyed by the

@@ -40,10 +40,10 @@ from src.exporters import bundle_paths as BP
 from src.importers.base_importer import BaseImporter, SkippedNoObject
 from src.state.state_store import (ACTION_FAILED, ACTION_SKIPPED_NO_OBJECT, CAT_DAB_REDEPLOY,
                                    CAT_FAMILY_NOT_SELECTED, CAT_LEGACY_DASHBOARD, CAT_NOT_SUPPORTED,
-                                   CAT_OVERSIZE, CAT_REPO_OUT_OF_SCOPE, CAT_UC_BACKED,
-                                   CAT_UNIT_FAILED_EARLIER)
+                                   CAT_OBJECT_ABSENT, CAT_OVERSIZE, CAT_REPO_OUT_OF_SCOPE,
+                                   CAT_UC_BACKED, CAT_UNIT_FAILED_EARLIER)
 from src.transform.transforms import fingerprint
-from src.utils.helpers import safe_str
+from src.utils.helpers import is_platform_internal, safe_str
 
 # The built-in group that always exists on target with unconditional admin, has no id to remap, and
 # is rejected on write. Omitting it PRESERVES parity rather than breaking it.
@@ -99,7 +99,16 @@ _ABSENCE_REASON = {
     "uc_backed": (CAT_UC_BACKED,
                   "the object is Unity Catalog-backed and UC is out of scope, so it could not be "
                   "recreated here"),
+    "absent": (CAT_OBJECT_ABSENT,
+               "the object's family WAS selected, but the object is not on target and this "
+               "migration has no record of creating it (not imported yet, deleted on target, or "
+               "skipped by its importer) — import it, then re-run import_assets=acls"),
 }
+
+# Objects whose `acls.json` entry is keyed by display name / title while their state row (and bundle
+# unit) is keyed by FULL PATH (PLAN 11 Finding-9). The two never meet by key, so they are matched by
+# SOURCE ID instead (PLAN 16.2 §3) — the one value both sides carry, `main`-written rows included.
+_RESOLVE_BY_SOURCE_ID = {"dashboards": "lakeview_dashboard", "genie": "genie_space"}
 
 
 class AclImporter(BaseImporter):
@@ -146,6 +155,13 @@ class AclImporter(BaseImporter):
             })
         return units
 
+    def is_platform_internal_unit(self, unit: dict) -> bool:
+        """An ACL on a platform-internal workspace object (`.db_internal` …, PLAN 16.2 §2) is
+        skipped without a call — a 16.2 bundle has none, but a `main`-written one still carries them."""
+        payload = unit.get("payload") or {}
+        return (safe_str(payload.get("perm_object_type")) in ("directories", "notebooks", "files")
+                and is_platform_internal(payload.get("object_natural_key")))
+
     def existing_keys(self) -> dict:
         """`{acl natural_key: target_object_id}` for ACLs this tool has ALREADY applied.
 
@@ -177,9 +193,11 @@ class AclImporter(BaseImporter):
                 f"not attempted. Its access is fixed by the platform on BOTH sides, so this is not a "
                 f"parity gap.", category=CAT_NOT_SUPPORTED)
 
-        target_id = self._resolve_target_object(perm_type, object_asset_type, object_key)
+        target_id = self._resolve_target_object(perm_type, object_asset_type, object_key,
+                                                source_id=safe_str(unit.get("source_id")))
         if not target_id:
-            category, guidance = _ABSENCE_REASON[self._absence_reason(object_asset_type, object_key)]
+            ref_type, ref_key = self.object_ref(unit)
+            category, guidance = _ABSENCE_REASON[self._absence_reason(ref_type, ref_key)]
             raise SkippedNoObject(
                 f"the target object `{object_key}` ({object_asset_type}) does not exist, so its "
                 f"{len(grants)} grant(s) could not be applied: {guidance}", category=category)
@@ -316,14 +334,63 @@ class AclImporter(BaseImporter):
         return "user_name" if "@" in principal else "group_name"
 
     # ── object resolution ─────────────────────────────────────────────────
+    def object_ref(self, unit: dict) -> tuple:
+        """`(asset_type, natural_key)` of the OBJECT an ACL unit grants on — the key its own import
+        unit / state row carries (PLAN 16.2 §5a). One mapping, used by the absence reason and by the
+        retry rule that lets an object's ACL follow a successful retry of the object.
+
+        Dashboards / Genie spaces are matched by SOURCE ID (their ACL entry is keyed by display
+        name, their unit by full path — §3); everything else's ACL key IS the object's key."""
+        payload = unit.get("payload") or {}
+        perm_type = safe_str(payload.get("perm_object_type"))
+        object_key = safe_str(payload.get("object_natural_key"))
+        asset_type = (safe_str(payload.get("object_asset_type"))
+                      or _PERM_TYPE_TO_ASSET.get(perm_type, ""))
+        by_src = _RESOLVE_BY_SOURCE_ID.get(perm_type)
+        if by_src:
+            key = self.source_id_to_key(by_src).get(safe_str(unit.get("source_id")), "")
+            if key:
+                return by_src, key
+            return by_src, object_key
+        return asset_type, object_key
+
+    def retry_keys_following(self, acted: set) -> set:
+        """The ACL unit keys whose OBJECT is in `acted` (PLAN 16.2 §5a) — added to a retry's work
+        list so a healed object comes back with its grants. ACLs of objects not acted on stay out."""
+        if not acted:
+            return set()
+        return {("acl", self.natural_key(u)) for u in self.load()
+                if self.object_ref(u) in acted}
+
+    def _target_ids_by_source(self, asset_type: str) -> dict:
+        """`{source id: target id}` from the state table, built ONCE per phase (§3). Taken lazily at
+        the first ACL that needs it — the ACL phase runs last, so this run's dashboards/genie
+        creations are already in the state cache by then."""
+        cache = self.__dict__.setdefault("_by_source_cache", {})
+        if asset_type not in cache:
+            cache[asset_type] = (self.state.target_id_by_source_id(asset_type)
+                                 if self.state is not None else {})
+        return cache[asset_type]
+
     def _resolve_target_object(self, perm_type: str, object_asset_type: str,
-                               object_key: str) -> str:
+                               object_key: str, source_id: str = "") -> str:
         """The TARGET object id this grant applies to, or "" if it isn't on target.
 
         Workspace content is resolved by PATH (`workspace/get-status` returns the target's own
         object_id — the source id is meaningless), everything else through the state table's stored
         target id, which is what lets an object imported in an EARLIER session still get its ACL.
+
+        Dashboards / Genie spaces (PLAN 16.2 §3) resolve by SOURCE ID first — state row with that
+        `source_object_id` → its target id — then the bundle's source id → full-path key → target id
+        (covers this run's context maps and a state-less dry run), then the old natural-key map.
         """
+        by_src = _RESOLVE_BY_SOURCE_ID.get(perm_type)
+        if by_src and source_id:
+            tid = safe_str(self._target_ids_by_source(by_src).get(source_id, ""))
+            if not tid:
+                tid, _key = self.remap_id(by_src, source_id)
+            if tid:
+                return safe_str(tid)
         if perm_type in ("directories", "notebooks", "files"):
             # Workspace content may have been diverted from its source path — a recreated SP's home
             # (IMP-6) or an orphaned owner's home backed up to /Users_Backup (PLAN 9 §4.5). The
@@ -368,6 +435,10 @@ class AclImporter(BaseImporter):
             return "legacy_dashboard"
         # Dynamic cases — these are why the rule cannot be path-based: the same object is creatable
         # on one run and absent on another.
+        # A bundle unit marked bundle-owned (a DAB dashboard / genie space has no `.bundle/` path in
+        # its natural key — its unit's action is what says so).
+        if self._bundle_action(object_asset_type, object_key) == "dab_redeploy":
+            return "dab_redeploy"
         if self.state is not None:
             row = self.state.row(object_asset_type, object_key)
             action = safe_str((row or {}).get("last_action"))
@@ -379,7 +450,19 @@ class AclImporter(BaseImporter):
         family = family_of(object_asset_type)
         if family and not self.config.imports.selects(family):
             return "not_selected"
-        return "not_selected"
+        # The family IS selected (PLAN 16.2 §3: this used to fall through to `not_selected` too,
+        # which named the wrong cause for every dashboard/genie grant).
+        return "absent"
+
+    def _bundle_action(self, asset_type: str, natural_key: str) -> str:
+        """The bundle unit's `import_action` for an object (indexed once per phase)."""
+        idx = self.__dict__.get("_bundle_action_idx")
+        if idx is None:
+            idx = self.__dict__["_bundle_action_idx"] = {
+                (safe_str(u.get("asset_type")), safe_str(u.get("natural_key"))):
+                    safe_str(u.get("import_action"))
+                for units in (self.units_by_type or {}).values() for u in units or []}
+        return idx.get((safe_str(asset_type), safe_str(natural_key)), "")
 
     @staticmethod
     def _is_immutable(perm_type: str, object_key: str) -> bool:
@@ -500,6 +583,23 @@ class AclImporter(BaseImporter):
                 continue
             if (perm_type, target_id) in seen:
                 continue
+            seen.add((perm_type, target_id))
+            out.append({"perm_type": perm_type, "target_id": target_id,
+                        "object_natural_key": safe_str(entry.get("natural_key")),
+                        "grants": entry.get("grants") or []})
+        # Dashboards / Genie spaces (PLAN 16.2 §3): every one whose OBJECT is on target is verified,
+        # whether or not its ACL unit has a state row with a target id — before this they were
+        # silently absent while the sheet read "all match".
+        for entry in by_key.values():
+            perm_type = safe_str(entry.get("perm_object_type"))
+            if perm_type not in _RESOLVE_BY_SOURCE_ID:
+                continue
+            target_id = self._resolve_target_object(
+                perm_type, safe_str(entry.get("asset_type")), safe_str(entry.get("natural_key")),
+                source_id=safe_str(entry.get("source_id")))
+            if not target_id or (perm_type, target_id) in seen:
+                continue
+            seen.add((perm_type, target_id))
             out.append({"perm_type": perm_type, "target_id": target_id,
                         "object_natural_key": safe_str(entry.get("natural_key")),
                         "grants": entry.get("grants") or []})

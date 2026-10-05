@@ -11,7 +11,8 @@ inventory script). natural_key = workspace path.
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, is_bundle_root_path, safe_str
+from src.utils.helpers import (PLATFORM_INTERNAL_NOTE, dab_path_info, is_bundle_root_path,
+                               is_platform_internal, safe_str)
 
 # /Projects is not inventoried as workspace content. /Repos IS descended (to discover git
 # folders) but its container dirs are not emitted as content — see _walk.
@@ -103,6 +104,20 @@ class WorkspaceCollector(BaseCollector):
             # each item records whether it lives under a `.bundle/` folder and, if so, whether
             # the bundle is shared (/Shared/.bundle — current staging + all prod) or user-scoped
             # (/Users/<email>/.bundle or /Workspace/<uuid>/.bundle — legacy staging pattern).
+            # Platform-internal folder (`.db_internal`, `.ide`, `.databricks` — PLAN 16.2 §2): keep
+            # the entry so it stays visible in the inventory, but never fetch its ACL (it 403s on
+            # every user home) and never descend (its children are Databricks-owned).
+            if is_platform_internal(p):
+                out.append({
+                    "path": p, "object_type": otype, "language": safe_str(obj.get("language")),
+                    "object_id": safe_str(obj.get("object_id")),
+                    "resource_id": safe_str(obj.get("resource_id")),
+                    "is_user_root": False, "deployed_by_dab": False, "dab_scope": "",
+                    "platform_internal": True, "migration_note": PLATFORM_INTERNAL_NOTE,
+                    "acl": None,
+                })
+                self.log.debug(f"{p}: platform-internal — recorded, not descended, ACL not read")
+                continue
             dab = dab_path_info(p, getattr(self.config, "dab_bundle_roots", None))
             record = {
                 "path": p,

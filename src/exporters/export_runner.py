@@ -3,7 +3,8 @@ ExportRunner — orchestrates `02_Export` (SOURCE side). Mirrors InventoryRunner
 
 Flow:
   1. Load `inventory.json` from the resolved run's bundle dir (Export reuses inventory — it does
-     NOT re-list the source; §2). If absent, run inventory first so the run is self-consistent.
+     NOT re-list the source; §2). Absent / unreadable / incomplete → `InventoryMissingError`, the
+     task goes red and nothing is written (PLAN 16.2 §6 — export never re-runs the inventory).
   2. Build create-ready per-unit export records from the inventory (`asset_export.build_all`).
   3. Apply per-asset toggles → toggled-off families become `skip` rows (kept in the index).
   4. Collect ACLs → `export/acls.json`; stamp `acl_grants` counts onto units (`acl_writer`).
@@ -36,7 +37,7 @@ from src.transform.transforms import fingerprint
 import os
 import time
 
-from src.utils.helpers import now_iso
+from src.utils.helpers import PLATFORM_INTERNAL_NOTE, is_platform_internal, now_iso
 from src.utils.logger import fmt_elapsed, get_logger
 
 _LOG = get_logger("export")
@@ -72,6 +73,10 @@ def _apply_content_fingerprint(unit: dict, content_sha256: str) -> None:
                                        "_content_sha256": content_sha256})
 
 
+class InventoryMissingError(RuntimeError):
+    """`inventory.json` is absent, unreadable or incomplete → export won't start (PLAN 16.2 §6)."""
+
+
 class ExportRunner:
     def __init__(self, client, config, artifact_writer, dbutils=None,
                  content_fetch_workers: int = 8, force_full_export: bool = False) -> None:
@@ -84,32 +89,43 @@ class ExportRunner:
 
     # ── inventory input ────────────────────────────────────────────────────
     def _load_inventory(self) -> dict:
+        """`inventory.json` of this run — or `InventoryMissingError` (PLAN 16.2 §6).
+
+        Export NEVER re-runs the inventory: the old fallback re-listed the whole source (hours on a
+        large workspace) and, if that also produced nothing, continued with an EMPTY inventory — a
+        green export of an empty bundle. Absent, unreadable / not JSON, or without `objects_by_type`
+        all stop the export before anything is written to the bundle.
+        """
         path = os.path.join(self.aw.root, BP.INVENTORY_JSON)
         _LOG.info(f"loading {BP.INVENTORY_JSON}", path=path)
         t0 = time.time()
-        inv = self.aw.read_json(BP.INVENTORY_JSON)
-        if inv is None:
-            # Behaviour unchanged (PLAN_12 owns fail-loud here) — but the fallback is now LOUD: it
-            # re-runs the WHOLE inventory, which on a large workspace is hours.
-            _LOG.error(f"{BP.INVENTORY_JSON} is ABSENT at {path} — FALLBACK: re-running the full "
-                       f"inventory now so the bundle is consistent (this can take as long as "
-                       f"01_Inventory did)")
-            from src.collectors.inventory_runner import InventoryRunner
-            InventoryRunner(self.client, self.config, self.aw, self.dbutils).run()
+        fix = ("run 01_Inventory first (or pass the run_id of a completed inventory)")
+        try:
             inv = self.aw.read_json(BP.INVENTORY_JSON)
-            if inv is None:
-                _LOG.error(f"{BP.INVENTORY_JSON} still absent after the inventory re-run — "
-                           f"continuing with an EMPTY inventory (the bundle will have no units)")
-            inv = inv or {}
-        objects = sum(len(v or []) for v in (inv.get("objects_by_type") or {}).values())
+        except Exception as exc:  # noqa: BLE001 — re-raised as the hard stop
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} at {path} (run_id {self.config.run_id!r}) is unreadable "
+                f"({type(exc).__name__}: {str(exc)[:300]}) — export will NOT start; {fix}."
+            ) from exc
+        if inv is None:
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} is ABSENT at {path} (run_id {self.config.run_id!r}) — export "
+                f"will NOT start and does not re-run the inventory; {fix}.")
+        if not isinstance(inv, dict) or not isinstance(inv.get("objects_by_type"), dict):
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} at {path} (run_id {self.config.run_id!r}) has no "
+                f"`objects_by_type` — it is not a completed inventory, so export will NOT start; "
+                f"{fix}.")
+        objects = sum(len(v or []) for v in inv["objects_by_type"].values())
         _LOG.info(f"loaded {BP.INVENTORY_JSON} — {objects:,} objects",
-                  bytes=_file_size(path), types=len(inv.get("objects_by_type") or {}),
+                  bytes=_file_size(path), types=len(inv["objects_by_type"]),
                   elapsed=fmt_elapsed(time.time() - t0))
         return inv
 
     def run(self) -> dict:
-        self.aw.ensure_output_path()
+        # The inventory is checked BEFORE anything is created, so a missing one writes nothing.
         inventory = self._load_inventory()
+        self.aw.ensure_output_path()
         objects_by_type = inventory.get("objects_by_type", {}) or {}
 
         # 2. Build units (pure transform).
@@ -214,9 +230,17 @@ class ExportRunner:
         Resume (§7a): a content unit already marked done in the checkpoint is skipped and its
         prior index row (content_ref/status) reused from the previous export_index.json.
         """
-        content_units = [u for at in ("notebook", "workspace_file")
-                         for u in units_by_type.get(at, [])
-                         if u["export_status"] != "skip"]
+        # Content inside a platform-internal folder (only an older inventory, which still descended
+        # into `.db_internal`, can carry any) is never fetched — import skips it (PLAN 16.2 §2).
+        content_units = []
+        for at in ("notebook", "workspace_file"):
+            for u in units_by_type.get(at, []):
+                if u["export_status"] == "skip":
+                    continue
+                if is_platform_internal(u.get("natural_key")):
+                    u["note"] = PLATFORM_INTERNAL_NOTE
+                    continue
+                content_units.append(u)
         if not content_units:
             _LOG.info("Phase: export content — no notebooks/files to fetch")
             return []

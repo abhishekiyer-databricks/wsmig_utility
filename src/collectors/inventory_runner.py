@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from src.collectors.apps_collector import AppsCollector
 from src.collectors.compute_collector import ComputeCollector
-from src.collectors.dashboards_collector import DashboardsCollector
+from src.collectors.dashboards_collector import DashboardsCollector, resolve_subscriber_users
 from src.collectors.dlt_collector import DltCollector
 from src.collectors.genie_collector import GenieCollector
 from src.collectors.identity_collector import IdentityCollector
@@ -73,6 +73,13 @@ class InventoryRunner:
         # tree; this closes the gap for everything else. Fail-soft: an empty registry just means
         # nothing is claimed, so assets export normally rather than being wrongly skipped.
         self._stamp_dab_ownership(objects_by_type, bundle_state_paths)
+
+        # Dashboard schedule subscribers carry a source user_id only — resolve it to the userName
+        # the target matches on, from the identity roster collected above (PLAN 16.2 §4).
+        unresolved = resolve_subscriber_users(objects_by_type)
+        if unresolved:
+            _LOG.warning(f"{unresolved} dashboard subscriber(s) are not in the source user roster "
+                         f"— they are reported as a manual step at import")
 
         # Classify identities (annotates in place).
         identities = objects_by_type.get("identity", [])

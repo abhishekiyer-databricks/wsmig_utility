@@ -130,6 +130,7 @@ _IMPORT_ACTION_LABEL = {
     "manual": "MANUAL on target",
     "review_required": "REVIEW REQUIRED",
     "skip_generated": "SKIP — Databricks-generated (nothing to do)",
+    "skip_internal": "SKIP — platform-internal (Databricks-owned)",
     "none": "NOT EXPORTED (nothing to import)",
     "": "—",
 }
@@ -147,6 +148,7 @@ _IMPORT_ACTION_FILL = {
     "manual": "FEF3C7",              # amber — a human must do it on target
     "review_required": "FEF3C7",     # amber — human must confirm
     "skip_generated": "E5E7EB",      # grey  — platform artifact, nothing to do
+    "skip_internal": "E5E7EB",       # grey  — platform-internal folder, nothing to do
     "none": "E5E7EB",                # grey  — nothing to import
     "": "F1F5F9",
 }

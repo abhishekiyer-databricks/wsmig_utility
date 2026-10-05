@@ -27,9 +27,9 @@ import time
 from typing import Optional
 
 from src.exporters import bundle_paths as BP
-from src.importers.phases import (FAMILY_ASSET_TYPES, PHASE_ORDER, asset_types_for, ordered,
-                                  validate_selection)
-from src.state.state_store import ACTION_NOT_SELECTED, StateStore
+from src.importers.phases import (FAMILY_ASSET_TYPES, LEGACY_CHECKPOINT_TYPE, PHASE_ORDER,
+                                  asset_types_for, ordered, validate_selection)
+from src.state.state_store import ACTED_STATUSES, ACTION_NOT_SELECTED, StateStore
 from src.utils.helpers import now_iso, safe_str
 from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 
@@ -40,6 +40,9 @@ _LOG = get_logger("import")
 # changed, but the source→target id map was NOT persisted. The notebook raises on it so the job
 # goes red; the checkpoint recovery replay re-merges the rows on the next run.
 RUN_STATUS_STATE_NOT_SAVED = "completed_state_not_saved"
+
+
+_DASHBOARD_CHILD_TYPES = ("lakeview_dashboard_publish", "lakeview_dashboard_schedule")
 
 
 class BundleVerificationError(RuntimeError):
@@ -134,10 +137,12 @@ class ImportRunner:
         it stamps a loud warning into the report rather than passing silently.
         """
         _LOG.info("Phase: verify bundle manifest")
+        t0 = time.time()
         if self.config.imports.skip_manifest_verify:
             _LOG.warning("MANIFEST VERIFICATION SKIPPED by skip_manifest_verify=true — the bundle "
                          "was NOT checked for completeness; a partial upload will present as a "
                          "partial migration")
+            _LOG.info("Phase complete: verify bundle manifest — SKIPPED")
             return {"ok": True, "skipped": True, "missing": [], "mismatched": []}
         verify = self.aw.verify_manifest()
         if not verify["ok"]:
@@ -148,7 +153,10 @@ class ImportRunner:
                 f"  checksum mismatch ({len(verify['mismatched'])}): {verify['mismatched'][:10]}\n"
                 "Re-copy the whole run directory from the source staging location, or set "
                 "skip_manifest_verify=true if you deliberately pruned it.")
-        _LOG.info("bundle verified", files=len(verify["manifest"].get("files", [])))
+        _LOG.info(f"Phase complete: verify bundle manifest — "
+                  f"{len((verify.get('manifest') or {}).get('files', [])):,} files, "
+                  f"{len(verify['missing'])} missing, {len(verify['mismatched'])} mismatched "
+                  f"({fmt_elapsed(time.time() - t0)})")
         return verify
 
     def check_pointer_matches_bundle(self) -> Optional[str]:
@@ -345,9 +353,12 @@ class ImportRunner:
                     # the family maps to exactly ONE type, else skip (better than guessing wrong —
                     # a mis-keyed replay row would write state against the wrong asset_type).
                     types = FAMILY_ASSET_TYPES.get(family, ())
-                    if len(types) != 1:
+                    if len(types) == 1:
+                        at = types[0]
+                    elif family in LEGACY_CHECKPOINT_TYPE:
+                        at = LEGACY_CHECKPOINT_TYPE[family]
+                    else:
                         continue
-                    at = types[0]
                 out[f"{at}|{key}"] = row
         return out
 
@@ -395,6 +406,15 @@ class ImportRunner:
         importer.units_by_type = units_by_type
         importer.retry_keys = (self.state.retry_keys(self.config.imports.retry_mode)
                                if self.state is not None else None)
+        if importer.retry_keys is not None and hasattr(importer, "retry_keys_following"):
+            # PLAN 16.2 §5a: a retry that HEALS an object must also apply its ACL in the same run.
+            # The ACL unit sat as `skipped_no_object` (not in the failed bucket), so without this a
+            # failed_only retry healed 143 objects and applied 0 of their grants (16.1 QA Run 3).
+            extra = importer.retry_keys_following(self._acted_this_run()) - importer.retry_keys
+            if extra:
+                _LOG.info(f"retry: {len(extra):,} {family} unit(s) of objects acted on this run "
+                          f"join the work list")
+                importer.retry_keys = set(importer.retry_keys) | extra
         try:
             self.results.append(importer.run())
         finally:
@@ -409,6 +429,18 @@ class ImportRunner:
                           f"({fmt_elapsed(time.time() - t_flush)})"
                           + (" — FAILED, rows still pending"
                              if getattr(self.state, "flush_failed", False) else ""))
+
+    def _acted_this_run(self) -> set:
+        """`{(asset_type, natural_key)}` of every unit this run created / updated / adopted (incl.
+        created_with_warning) — the objects whose dependents follow them on a retry (§5a)."""
+        out: set = set()
+        for res in self.results:
+            for row in res.units:
+                if row.get("retry_out_of_scope"):
+                    continue
+                if safe_str(row.get("import_status")) in ACTED_STATUSES:
+                    out.add((safe_str(row.get("asset_type")), safe_str(row.get("natural_key"))))
+        return out
 
     def _record_not_selected(self, units_by_type: dict, selected: list) -> None:
         """Record deferred families as `not_selected` — deferred work must be visible, not absent.
@@ -448,9 +480,13 @@ class ImportRunner:
         if self.state is None or not self.state.enabled:
             return
         gone: dict[str, list] = {}
+        dashboards_in_bundle = bool(units_by_type.get("lakeview_dashboard"))
         for at in asset_types_for(selected):
             present = {safe_str(u.get("natural_key")) for u in units_by_type.get(at, []) or []}
-            if not present:
+            # A dashboard's publish/schedule units are legitimately ALL gone when every source
+            # dashboard was unpublished — still compared, as long as the bundle has dashboards
+            # (PLAN 16.2 §4: a source unpublish is flagged, never acted on).
+            if not present and not (at in _DASHBOARD_CHILD_TYPES and dashboards_in_bundle):
                 continue
             missing = self.state.mark_missing_in_source(at, present)
             if missing:

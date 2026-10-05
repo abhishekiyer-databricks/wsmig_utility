@@ -58,6 +58,34 @@ def home_owner(path: Any) -> str:
     return parts[1] if len(parts) >= 2 and parts[0] == "Users" else ""
 
 
+# Platform-internal workspace folders (PLAN 16.2 §2): Databricks owns and recreates them itself, so
+# they are skipped END TO END — never descended into or ACL-read at inventory (each one 403s), never
+# given an ACL entry at export, never created at import. Matched as a path SEGMENT, so the folder
+# itself and anything beneath it both match. `mkdirs` on `.db_internal` returns a bare 400 (live).
+PLATFORM_INTERNAL_SEGMENTS = ("/.db_internal", "/.ide", "/.databricks")
+
+PLATFORM_INTERNAL_NOTE = "platform-internal (Databricks-owned) — not migrated"
+
+
+def is_platform_internal(path: Any) -> bool:
+    """Whether a workspace path is (inside) a platform-internal folder (`.db_internal` etc.).
+
+    Works on any string that EMBEDS a path too — e.g. an ACL unit key `directories:/Users/a/.ide` —
+    because the match is the `/<segment>/` substring, not a prefix."""
+    p = safe_str(path).rstrip("/") + "/"
+    return any(seg + "/" in p for seg in PLATFORM_INTERNAL_SEGMENTS)
+
+
+def is_not_found(exc: BaseException) -> bool:
+    """Whether an API error is a 404 / NOT_FOUND (e.g. `GET …/published` of a DRAFT dashboard —
+    the ONLY response that means "not published", PLAN 16.2 §4 F1). Any other error is not."""
+    if getattr(exc, "status", None) == 404:
+        return True
+    text = str(exc)
+    return ("-> 404" in text or "NOT_FOUND" in text or "RESOURCE_DOES_NOT_EXIST" in text
+            or "Unable to find published dashboard" in text)
+
+
 def looks_like_app_id(owner: Any) -> bool:
     """A UUID-shaped owner is a service-principal home; an email is a user home."""
     o = safe_str(owner)

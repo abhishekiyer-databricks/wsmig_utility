@@ -10,6 +10,35 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
+### Added
+- **AI/BI dashboard publish state, schedules and subscriptions are migrated** (PLAN 16.2 §4). A
+  source-published dashboard is published on the target with the same credentials mode
+  (publisher / viewer); each schedule is recreated (PAUSED when `pause_job_schedules=true`) with its
+  subscribers (users by user name, notification destinations by name). Two new row types —
+  `lakeview_dashboard_publish`, `lakeview_dashboard_schedule` — with their own report sheets. The
+  dashboard row and its fingerprint are unchanged, so an upgraded run only adds the new rows. Never
+  unpublishes or deletes a schedule. See the Runbook for the publisher-credential caveat.
+- The inventory Dashboards sheet shows Published / Credentials / Schedules / Subscribers.
+
+### Fixed
+- **Dashboard and Genie permissions are applied** (PLAN 16.2 §3). They were always reported
+  `skipped_no_object` (`acls.json` names them by title, the state by path); they are now matched by
+  source id, and appear on the ACL Parity sheet. An ACL whose object is simply absent is no longer
+  mislabelled `family_not_selected` (new category `object_absent`).
+- **A retry that heals an object also applies its permissions** in the same run, and a healed
+  dashboard comes back published and scheduled (PLAN 16.2 §5). A same-`run_id` re-run re-checks
+  `skipped_no_object` units instead of replaying them from the checkpoint.
+- **`.db_internal` / `.ide` / `.databricks` folders are skipped end to end** (PLAN 16.2 §2): no
+  per-home 403 at inventory, no ACL entry at export, reported **Skipped — platform-internal** (not
+  Created) at import, and their old state rows are never reported deleted-in-source.
+- **Export fails fast without an inventory** (PLAN 16.2 §6) instead of re-running the whole inventory
+  and possibly exporting an empty bundle.
+- Logs: a unit restored from the checkpoint says `resumed from checkpoint — no API call this run`;
+  the manifest check logs its `Phase complete:` line (PLAN 16.2 §1).
+- The import checkpoint now records each outcome's `asset_type`, so the start-of-run recovery replay
+  restores lost rows for multi-type families (identity, compute, workspace, secrets, SQL, misc), not
+  only single-type ones. Older checkpoints still replay as before.
+
 ### Changed
 - **Import state writes no longer commit once per failed object** (PLAN 16.1 §4.4). The migration
   state table and the import checkpoint are now written every 200 objects **or 5 minutes**, whichever
@@ -17,11 +46,6 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
   (~3–7 s each, plus auto-OPTIMIZE churn), so runs with many failures spent most of their time in
   bookkeeping. A hard crash loses at most < 200 objects / 5 minutes of bookkeeping; the re-run adopts
   them (dashboards / Genie / alerts / legacy queries may be duplicated — see the Runbook).
-
-### Fixed
-- The import checkpoint now records each outcome's `asset_type`, so the start-of-run recovery replay
-  restores lost rows for multi-type families (identity, compute, workspace, secrets, SQL, misc), not
-  only single-type ones. Older checkpoints still replay as before.
 
 ## [1.0.0] - 2026-09-07
 
