@@ -78,12 +78,12 @@ def _cell_text(value, fmt: str):
     if fmt == "epoch_ms":
         try:
             return datetime.fromtimestamp(int(value) / 1000).strftime("%Y-%m-%d %H:%M")
-        except Exception:
+        except Exception:   # expected + harmless: show the raw value if it won't format
             return str(value)
     if fmt == "iso_ts":
         try:
             return str(value)[:16].replace("T", " ")
-        except Exception:
+        except Exception:   # expected + harmless: show the raw value if it won't format
             return str(value)
     if fmt == "url_link":
         return str(value)

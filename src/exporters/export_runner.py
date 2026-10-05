@@ -3,7 +3,8 @@ ExportRunner — orchestrates `02_Export` (SOURCE side). Mirrors InventoryRunner
 
 Flow:
   1. Load `inventory.json` from the resolved run's bundle dir (Export reuses inventory — it does
-     NOT re-list the source; §2). If absent, run inventory first so the run is self-consistent.
+     NOT re-list the source; §2). Absent / unreadable / incomplete → `InventoryMissingError`, the
+     task goes red and nothing is written (PLAN 16.2 §6 — export never re-runs the inventory).
   2. Build create-ready per-unit export records from the inventory (`asset_export.build_all`).
   3. Apply per-asset toggles → toggled-off families become `skip` rows (kept in the index).
   4. Collect ACLs → `export/acls.json`; stamp `acl_grants` counts onto units (`acl_writer`).
@@ -33,8 +34,11 @@ from src.exporters import bundle_paths as BP
 from src.exporters.content_fetcher import ContentFetcher
 from src.exporters.parallel import Locked, parallel_map
 from src.transform.transforms import fingerprint
-from src.utils.helpers import now_iso
-from src.utils.logger import get_logger
+import os
+import time
+
+from src.utils.helpers import PLATFORM_INTERNAL_NOTE, is_platform_internal, now_iso
+from src.utils.logger import fmt_elapsed, get_logger
 
 _LOG = get_logger("export")
 
@@ -69,6 +73,10 @@ def _apply_content_fingerprint(unit: dict, content_sha256: str) -> None:
                                        "_content_sha256": content_sha256})
 
 
+class InventoryMissingError(RuntimeError):
+    """`inventory.json` is absent, unreadable or incomplete → export won't start (PLAN 16.2 §6)."""
+
+
 class ExportRunner:
     def __init__(self, client, config, artifact_writer, dbutils=None,
                  content_fetch_workers: int = 8, force_full_export: bool = False) -> None:
@@ -81,29 +89,65 @@ class ExportRunner:
 
     # ── inventory input ────────────────────────────────────────────────────
     def _load_inventory(self) -> dict:
-        inv = self.aw.read_json(BP.INVENTORY_JSON)
+        """`inventory.json` of this run — or `InventoryMissingError` (PLAN 16.2 §6).
+
+        Export NEVER re-runs the inventory: the old fallback re-listed the whole source (hours on a
+        large workspace) and, if that also produced nothing, continued with an EMPTY inventory — a
+        green export of an empty bundle. Absent, unreadable / not JSON, or without `objects_by_type`
+        all stop the export before anything is written to the bundle.
+        """
+        path = os.path.join(self.aw.root, BP.INVENTORY_JSON)
+        _LOG.info(f"loading {BP.INVENTORY_JSON}", path=path)
+        t0 = time.time()
+        fix = ("run 01_Inventory first (or pass the run_id of a completed inventory)")
+        try:
+            inv = self.aw.read_json(BP.INVENTORY_JSON)
+        except Exception as exc:  # noqa: BLE001 — re-raised as the hard stop
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} at {path} (run_id {self.config.run_id!r}) is unreadable "
+                f"({type(exc).__name__}: {str(exc)[:300]}) — export will NOT start; {fix}."
+            ) from exc
         if inv is None:
-            _LOG.warning("inventory.json absent — running inventory first for a consistent bundle")
-            from src.collectors.inventory_runner import InventoryRunner
-            InventoryRunner(self.client, self.config, self.aw, self.dbutils).run()
-            inv = self.aw.read_json(BP.INVENTORY_JSON) or {}
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} is ABSENT at {path} (run_id {self.config.run_id!r}) — export "
+                f"will NOT start and does not re-run the inventory; {fix}.")
+        if not isinstance(inv, dict) or not isinstance(inv.get("objects_by_type"), dict):
+            raise InventoryMissingError(
+                f"{BP.INVENTORY_JSON} at {path} (run_id {self.config.run_id!r}) has no "
+                f"`objects_by_type` — it is not a completed inventory, so export will NOT start; "
+                f"{fix}.")
+        objects = sum(len(v or []) for v in inv["objects_by_type"].values())
+        _LOG.info(f"loaded {BP.INVENTORY_JSON} — {objects:,} objects",
+                  bytes=_file_size(path), types=len(inv["objects_by_type"]),
+                  elapsed=fmt_elapsed(time.time() - t0))
         return inv
 
     def run(self) -> dict:
-        self.aw.ensure_output_path()
+        # The inventory is checked BEFORE anything is created, so a missing one writes nothing.
         inventory = self._load_inventory()
+        self.aw.ensure_output_path()
         objects_by_type = inventory.get("objects_by_type", {}) or {}
 
         # 2. Build units (pure transform).
+        _LOG.info("Phase: build export units")
+        t0 = time.time()
         units_by_type = build_all(objects_by_type)
+        _LOG.info(f"Phase complete: build export units — "
+                  f"{sum(len(u) for u in units_by_type.values()):,} units "
+                  f"({fmt_elapsed(time.time() - t0)})",
+                  **{at: len(u) for at, u in sorted(units_by_type.items())})
 
         # 3. Toggles → skip toggled-off families (still recorded).
         self._apply_toggles(units_by_type)
 
         # 4. ACLs → acls.json + stamp counts.
+        _LOG.info("Phase: collect ACLs")
+        t0 = time.time()
         acls = collect_acls(objects_by_type)
         self.aw.write_json(BP.EXPORT_ACLS_JSON, acls)
         counts_by_key = acl_counts(acls)
+        _LOG.info(f"Phase complete: collect ACLs — {sum(counts_by_key.values()):,} grants on "
+                  f"{len(counts_by_key):,} objects ({fmt_elapsed(time.time() - t0)})")
         for units in units_by_type.values():
             for u in units:
                 u["acl_grants"] = counts_by_key.get((u["asset_type"], u["natural_key"]), 0)
@@ -117,14 +161,18 @@ class ExportRunner:
         self._refresh_import_actions(units_by_type)
 
         # 6. Write artifacts.
+        _LOG.info("Phase: write bundle artifacts")
+        t0 = time.time()
         self._write_artifact_files(units_by_type)
         self.aw.write_json(BP.EXPORT_OVERSIZE_JSON, oversize_rows)
         self._write_manual_actions(units_by_type, oversize_rows)
 
         index = self._build_index(units_by_type)
         self.aw.write_json(BP.EXPORT_INDEX_JSON, index)
+        _LOG.info(f"wrote {BP.EXPORT_INDEX_JSON} — {len(index['units']):,} units")
         self._append_export_config()
         self._write_excel(objects_by_type, index)
+        _LOG.info(f"Phase complete: write bundle artifacts ({fmt_elapsed(time.time() - t0)})")
 
         # manifest LAST — its presence marks the bundle complete (resume detection, §7a).
         asset_counts = {t: len(u) for t, u in units_by_type.items()}
@@ -137,6 +185,7 @@ class ExportRunner:
         try:
             from src.exporters.bundle_state import write_latest_export_pointer
             write_latest_export_pointer(self.config, self.config.run_id, manifest, asset_counts)
+            _LOG.info("LATEST_EXPORT.json pointer written", run_id=self.config.run_id)
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("latest-export pointer not written", error=str(exc))
 
@@ -154,6 +203,8 @@ class ExportRunner:
             if not toggle_name:
                 continue   # inventory-only families (app/lakebase) have no toggle
             if not getattr(self.config.toggles, toggle_name, True):
+                _LOG.info(f"toggle migrate_{toggle_name}=false → {len(units):,} {asset_type} "
+                          f"units skipped (still recorded in the index)")
                 for u in units:
                     u["export_status"] = "skip"
                     u["note"] = f"toggle migrate_{toggle_name}=false"
@@ -179,11 +230,21 @@ class ExportRunner:
         Resume (§7a): a content unit already marked done in the checkpoint is skipped and its
         prior index row (content_ref/status) reused from the previous export_index.json.
         """
-        content_units = [u for at in ("notebook", "workspace_file")
-                         for u in units_by_type.get(at, [])
-                         if u["export_status"] != "skip"]
+        # Content inside a platform-internal folder (only an older inventory, which still descended
+        # into `.db_internal`, can carry any) is never fetched — import skips it (PLAN 16.2 §2).
+        content_units = []
+        for at in ("notebook", "workspace_file"):
+            for u in units_by_type.get(at, []):
+                if u["export_status"] == "skip":
+                    continue
+                if is_platform_internal(u.get("natural_key")):
+                    u["note"] = PLATFORM_INTERNAL_NOTE
+                    continue
+                content_units.append(u)
         if not content_units:
+            _LOG.info("Phase: export content — no notebooks/files to fetch")
             return []
+        phase_t0 = time.time()
 
         prior = self._prior_index_by_key()
         # Outcomes recorded in the checkpoint by earlier batches of THIS run (or a crashed one).
@@ -217,8 +278,12 @@ class ExportRunner:
             else:
                 to_fetch.append(u)
 
-        _LOG.info("content pass", to_fetch=len(to_fetch), resumed=len(content_units) - len(to_fetch),
+        _LOG.info(f"Phase: export content — {len(content_units):,} units",
+                  to_fetch=len(to_fetch), resumed=len(content_units) - len(to_fetch),
                   workers=self.workers)
+        done_n = 0
+        tally = {"fetched": 0, "oversize": 0, "failed": 0}
+        fetched_bytes = 0
 
         # parallel_map YIELDS (item, result, error) as each fetch completes; here item IS the unit
         # and result is the FetchResult (a worker that raised puts the exception in `error`, result
@@ -234,11 +299,28 @@ class ExportRunner:
         pending: list[str] = []
         pending_results: dict = {}
         for unit, res, err in parallel_map(to_fetch, fetcher.fetch, self.workers):
+            # Runs on the MAIN thread: the per-object END line + progress for every fetch.
+            done_n += 1
             if err is not None:
                 unit["export_status"] = "failure"
                 unit["note"] = f"content fetch worker error: {err}"
-                _LOG.warning("content worker error", path=unit["natural_key"], error=str(err))
+                tally["failed"] += 1
+                _LOG.warning(f"{unit['asset_type']} {unit['natural_key']} → FAILED "
+                             f"(content worker error): {err}")
+                _LOG.progress("export content", done_n, len(to_fetch), started=phase_t0, **tally)
                 continue
+            if res.status == "success":
+                tally["fetched"] += 1
+                fetched_bytes += res.size_bytes or 0
+                _LOG.debug(f"fetched {unit['natural_key']} ({res.size_bytes:,} bytes)")
+            elif res.status == "skipped_oversize":
+                tally["oversize"] += 1
+                _LOG.warning(f"{unit['asset_type']} {unit['natural_key']} → skipped_oversize "
+                             f"({res.size_bytes:,} bytes): {res.note}")
+            else:
+                tally["failed"] += 1
+                _LOG.warning(f"{unit['asset_type']} {unit['natural_key']} → FAILED: {res.note}")
+            _LOG.progress("export content", done_n, len(to_fetch), started=phase_t0, **tally)
             unit["export_status"] = res.status
             unit["content_ref"] = res.content_ref
             unit["content_route"] = res.content_route
@@ -269,10 +351,16 @@ class ExportRunner:
                                         "oversize": unit.get("oversize")}
                 if len(pending) >= CHECKPOINT_BATCH:
                     self.aw.mark_done_bulk("export:content", pending, pending_results)
-                    _LOG.info("content checkpoint", done=len(done_keys), of=len(to_fetch))
+                    _LOG.debug("content checkpoint flushed",
+                               batch=len(done_keys) // CHECKPOINT_BATCH, done=len(done_keys),
+                               of=len(to_fetch))
                     pending, pending_results = [], {}
         # Final flush for the remainder (and the whole batch when to_fetch < CHECKPOINT_BATCH).
         self.aw.mark_done_bulk("export:content", pending, pending_results)
+        _LOG.info(f"Phase complete: export content — fetched {tally['fetched']:,}, oversize "
+                  f"{tally['oversize']:,}, failed {tally['failed']:,}, resumed "
+                  f"{len(content_units) - len(to_fetch):,} ({fetched_bytes / 1048576:.1f} MB, "
+                  f"{fmt_elapsed(time.time() - phase_t0)})")
 
         return shared.value["oversize"]
 
@@ -415,7 +503,14 @@ class ExportRunner:
                 lambda local: generate_export_excel(objects_by_type, index, local, self.config),
             )
         except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
-            _LOG.warning("export excel skipped", error=str(exc))
+            _LOG.warning("export excel skipped", error=str(exc), exc_info=True)
+
+
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:   # expected + harmless: only feeds a log line
+        return -1
 
 
 def _tool_version() -> str:

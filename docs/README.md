@@ -57,6 +57,10 @@ Both modes emit the **same bundle**, so preflight + transforms + import are mode
 | **Fail-soft units** | One asset's failure is recorded with its reason; the run continues. Only a handful of *pre-flight* conditions stop the whole run. |
 | **Identity classification** | Users / account SPs stay stable; Databricks-managed SPs & groups are recreated and an `old → new` map is persisted. |
 
+> ⚠️ **Known limitation — dashboards published with publisher credentials** are re-published on the
+> target by the migration service principal, so viewers query with its data access until the owner
+> re-publishes. See [Runbook › Dashboards](RUNBOOK.md#-dashboards-publish-credentials-schedules).
+
 Full detail in **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---

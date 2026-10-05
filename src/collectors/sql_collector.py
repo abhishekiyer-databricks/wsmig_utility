@@ -69,6 +69,7 @@ class SqlCollector(BaseCollector):
             # natural_key and the ACL-tab Object column are never blank.
             name = safe_str(o.get("display_name") or o.get("name") or o.get("title"))
             oid = safe_str(o.get("id"))
+            self.log.debug(f"collecting {sql_type} {oid} ({name})")
             if kind == "queries":
                 # PLAN 8 Bug 7: the LIST omits `parent_path` (verified live 2026-08-18) — enrich via
                 # GET-by-id so the query can be recreated in its SOURCE workspace folder rather than
@@ -98,6 +99,7 @@ class SqlCollector(BaseCollector):
             item["deployed_by_dab"] = dab["deployed_by_dab"]
             item["dab_scope"] = dab["dab_scope"]
             items.append(item)
+            self.log.debug(f"collected {sql_type} {oid} → {item['_natural_key']}")
         return items
 
     def _enrich_query_parent_path(self, raw: dict, oid: str) -> None:
@@ -132,6 +134,7 @@ class SqlCollector(BaseCollector):
         items = []
         for o in raw:
             oid = safe_str(o.get("id"))
+            self.log.debug(f"collecting alert_v2 {oid}")
             # PLAN 8 Bug 10: the LIST is SHALLOW — it omits `evaluation` (with `source.name`) and
             # `schedule`, both REQUIRED by the create API (verified live 2026-08-18). Enrich via
             # GET-by-id so the exported payload can actually be recreated. Fall back to the list
@@ -156,6 +159,7 @@ class SqlCollector(BaseCollector):
                 "acl": self.fetch_acl("alertsv2", oid),
                 "_raw": full,
             })
+            self.log.debug(f"collected alert_v2 {oid} → {items[-1]['_natural_key']}")
         return items
 
     def _alert_v2_full(self, oid: str) -> dict:

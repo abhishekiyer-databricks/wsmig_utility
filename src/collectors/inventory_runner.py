@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from src.collectors.apps_collector import AppsCollector
 from src.collectors.compute_collector import ComputeCollector
-from src.collectors.dashboards_collector import DashboardsCollector
+from src.collectors.dashboards_collector import DashboardsCollector, resolve_subscriber_users
 from src.collectors.dlt_collector import DltCollector
 from src.collectors.genie_collector import GenieCollector
 from src.collectors.identity_collector import IdentityCollector
@@ -23,8 +23,10 @@ from src.collectors.workspace_collector import WorkspaceCollector
 from src.exporters import bundle_paths as BP
 from src.identity.classifier import (classify_all, classification_summary,
                                      needs_account_action)
-from src.utils.helpers import now_iso
-from src.utils.logger import get_logger
+import time
+
+from src.utils.helpers import now_iso, safe_str
+from src.utils.logger import fmt_elapsed, get_logger
 
 _LOG = get_logger("inventory")
 
@@ -49,13 +51,17 @@ class InventoryRunner:
         self.dbutils = dbutils
 
     def run(self) -> dict:
+        t0 = time.time()
         self.aw.ensure_output_path()
         objects_by_type: dict[str, list] = {}
         stats: list[dict] = []
 
+        _LOG.info(f"inventory: {len(_COLLECTORS)} collectors to run (read-only)",
+                  source=getattr(self.client, "base_url", ""))
         bundle_state_paths: set[str] = set()
-        for cls in _COLLECTORS:
+        for i, cls in enumerate(_COLLECTORS, 1):
             coll = cls(self.client, self.config, self.dbutils)
+            _LOG.info(f"collector {i}/{len(_COLLECTORS)}: {coll.object_type}")
             objs = coll.run()
             objects_by_type[coll.object_type] = objs
             stats.append(coll.stats())
@@ -68,15 +74,25 @@ class InventoryRunner:
         # nothing is claimed, so assets export normally rather than being wrongly skipped.
         self._stamp_dab_ownership(objects_by_type, bundle_state_paths)
 
+        # Dashboard schedule subscribers carry a source user_id only — resolve it to the userName
+        # the target matches on, from the identity roster collected above (PLAN 16.2 §4).
+        unresolved = resolve_subscriber_users(objects_by_type)
+        if unresolved:
+            _LOG.warning(f"{unresolved} dashboard subscriber(s) are not in the source user roster "
+                         f"— they are reported as a manual step at import")
+
         # Classify identities (annotates in place).
         identities = objects_by_type.get("identity", [])
+        _LOG.info(f"classifying {len(identities):,} identities")
         classify_all(identities)
         id_summary = classification_summary(identities)
+        _LOG.info("identity classification done", **id_summary)
 
         counts = {t: len(o) for t, o in objects_by_type.items()}
         warnings = [e for s in stats for e in s.get("errors", [])]
 
         # ── artifacts ─────────────────────────────────────────────────────
+        _LOG.info(f"writing {BP.INVENTORY_JSON}", objects=sum(counts.values()))
         self.aw.write_json(BP.INVENTORY_JSON, {
             "generated_utc": now_iso(),
             "source_workspace_id": self.config.source_workspace_id,
@@ -98,6 +114,7 @@ class InventoryRunner:
                       count=len(account_actions),
                       groups=[a["displayName"] for a in account_actions][:10])
         self.aw.write_json(BP.CONFIG_RESOLVED_JSON, self.config.redacted())
+        _LOG.info(f"wrote {BP.IDENTITY_CLASSIFICATION_JSON} + {BP.CONFIG_RESOLVED_JSON}")
 
         # inventory.html generation is gated OFF by default (PLAN 7 §B2): inventory.xlsx carries the
         # same content, so the HTML is redundant. Flip WRITE_INVENTORY_HTML to re-enable in one line.
@@ -111,10 +128,12 @@ class InventoryRunner:
         try:
             from src.exporters.bundle_state import write_latest_pointer
             write_latest_pointer(self.config, self.config.run_id, counts)
+            _LOG.info("LATEST_INVENTORY.json pointer written", run_id=self.config.run_id)
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("latest-inventory pointer not written", error=str(exc))
 
-        _LOG.info("inventory complete", total=sum(counts.values()), warnings=len(warnings))
+        _LOG.info(f"inventory complete ({fmt_elapsed(time.time() - t0)})",
+                  total=sum(counts.values()), warnings=len(warnings))
         return {"counts": counts, "identity_summary": id_summary,
                 "warnings": warnings, "output_path": self.aw.root}
 
@@ -140,12 +159,14 @@ class InventoryRunner:
         if not bundle_state_paths:
             return
         from src.collectors.dab_registry import DabRegistry
+        _LOG.info(f"DAB registry: reading {len(bundle_state_paths)} bundle state file(s)")
         try:
             reg = DabRegistry.build(self.client, sorted(bundle_state_paths))
         except Exception as exc:  # noqa: BLE001 — never fail inventory over DAB detection
             _LOG.warning("DAB registry build failed", error=str(exc))
             return
         if not len(reg):
+            _LOG.info("DAB registry: no bundle-owned resources found")
             return
         stamped = 0
         for bucket, id_field, asset_type in self._DAB_STAMP_TARGETS:
@@ -182,11 +203,14 @@ class InventoryRunner:
         self.aw.write_bytes(BP.INVENTORY_HTML, html_doc.encode("utf-8"))
 
     def _write_excel(self, objects_by_type, counts) -> None:
+        t0 = time.time()
+        _LOG.info(f"writing {BP.INVENTORY_XLSX}")
         try:
             from src.exporters.excel_generator import generate_excel
             self.aw.write_text_local_then_copy(
                 BP.INVENTORY_XLSX,
                 lambda local: generate_excel(objects_by_type, counts, local, self.config),
             )
+            _LOG.info(f"wrote {BP.INVENTORY_XLSX} ({fmt_elapsed(time.time() - t0)})")
         except Exception as exc:  # noqa: BLE001 — Excel is optional; never fail the run
-            _LOG.warning("excel generation skipped", error=str(exc))
+            _LOG.warning("excel generation skipped", error=str(exc), exc_info=True)

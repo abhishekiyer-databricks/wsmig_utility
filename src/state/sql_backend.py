@@ -10,6 +10,10 @@ either by Spark or by the **SQL Statement Execution API** against a serverless w
 
 Both backends must behave identically for the store's needs: DDL, MERGE, INSERT, and SELECT
 returning plain Python rows. Nothing here is Delta-specific beyond the SQL the caller writes.
+
+FAIL LOUD (PLAN 16.1 §4.1): `execute()` (DDL/DML) and `query()` (SELECT) both RAISE on any error.
+The Spark backend used to turn every error into `[]`, so a state read that failed looked exactly like
+an empty table — a re-run then re-created/adopted every object and silently dropped source edits.
 """
 from __future__ import annotations
 
@@ -22,10 +26,20 @@ _LOG = get_logger("sql_backend")
 
 
 class SqlBackend:
-    """Interface: run a statement, optionally returning rows as list[dict]."""
+    """Interface: `execute()` for DDL/DML (result ignored), `query()` for SELECT (rows as dicts).
+
+    Both raise on failure. `sql()` is kept as an alias of `execute()` so existing DDL call sites
+    keep their shape; a backend that only implements `sql()` (the Statement API one) gets
+    `query()`/`execute()` from it."""
 
     def sql(self, statement: str) -> list[dict]:
         raise NotImplementedError
+
+    def execute(self, statement: str) -> None:
+        self.sql(statement)
+
+    def query(self, statement: str) -> list[dict]:
+        return self.sql(statement)
 
     @property
     def name(self) -> str:
@@ -38,14 +52,19 @@ class SparkSqlBackend(SqlBackend):
     def __init__(self, spark) -> None:
         self._spark = spark
 
+    def execute(self, statement: str) -> None:
+        """DDL/DML. `spark.sql` runs these eagerly, so an error raises here — never swallowed."""
+        self._spark.sql(statement)
+
+    def query(self, statement: str) -> list[dict]:
+        """SELECT → rows. No try/except on purpose: a failed read must stop the run, not return
+        `[]` (which is indistinguishable from an empty table)."""
+        return [row.asDict() for row in self._spark.sql(statement).collect()]
+
     def sql(self, statement: str) -> list[dict]:
-        df = self._spark.sql(statement)
-        # A DDL/DML statement returns a df with no useful rows; collecting it is cheap and
-        # uniform, and lets MERGE/INSERT metrics come back the same shape as a SELECT.
-        try:
-            return [row.asDict() for row in df.collect()]
-        except Exception:  # noqa: BLE001 — some DDL returns nothing collectable
-            return []
+        """Alias of `execute()` (DDL/DML call sites); returns [] because the result is ignored."""
+        self.execute(statement)
+        return []
 
 
 class StatementApiBackend(SqlBackend):

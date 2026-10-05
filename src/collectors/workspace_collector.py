@@ -11,7 +11,8 @@ inventory script). natural_key = workspace path.
 from __future__ import annotations
 
 from src.collectors.base_collector import BaseCollector
-from src.utils.helpers import dab_path_info, is_bundle_root_path, safe_str
+from src.utils.helpers import (PLATFORM_INTERNAL_NOTE, dab_path_info, is_bundle_root_path,
+                               is_platform_internal, safe_str)
 
 # /Projects is not inventoried as workspace content. /Repos IS descended (to discover git
 # folders) but its container dirs are not emitted as content — see _walk.
@@ -52,18 +53,27 @@ class WorkspaceCollector(BaseCollector):
 
     def _walk(self, path: str, out: list[dict]) -> None:
         if not self._budget_left():
-            self.client.warnings.append(
-                f"workspace/list: hit max_ws_api_calls={self._max_calls} — tree traversal truncated")
+            msg = (f"workspace/list: hit max_ws_api_calls={self._max_calls} — tree traversal "
+                   f"truncated")
+            if msg not in self.client.warnings:
+                self.log.warning(f"{msg} (at {path})")
+            self.client.warnings.append(msg)
             return
         if self._max_items and len(out) >= self._max_items:
+            self.log.debug(f"max_workspace_items={self._max_items} reached — not listing {path}")
             return
         self._api_calls += 1
+        self.log.debug(f"listing {path}")
         try:
             data = self.client.get("api/2.0/workspace/list", params={"path": path})
-        except Exception as exc:  # noqa: BLE001
-            self.log.warning("workspace/list failed", path=path, error=str(exc))
+        except Exception as exc:  # noqa: BLE001 — degraded: this subtree is missing from inventory
+            self.log.warning(f"listing {path} FAILED — its subtree is NOT inventoried: {exc}")
             return
-        for obj in data.get("objects", []) or []:
+        listed = data.get("objects", []) or []
+        self.log.debug(f"listed {path} ({len(listed)} objects)")
+        self.log.progress("collect workspace_object: directories listed", self._api_calls,
+                          started=self._t0, objects=len(out))
+        for obj in listed:
             p = safe_str(obj.get("path"))
             otype = safe_str(obj.get("object_type"))  # DIRECTORY | NOTEBOOK | FILE | REPO | LIBRARY
             if self._is_trash(p):
@@ -94,6 +104,20 @@ class WorkspaceCollector(BaseCollector):
             # each item records whether it lives under a `.bundle/` folder and, if so, whether
             # the bundle is shared (/Shared/.bundle — current staging + all prod) or user-scoped
             # (/Users/<email>/.bundle or /Workspace/<uuid>/.bundle — legacy staging pattern).
+            # Platform-internal folder (`.db_internal`, `.ide`, `.databricks` — PLAN 16.2 §2): keep
+            # the entry so it stays visible in the inventory, but never fetch its ACL (it 403s on
+            # every user home) and never descend (its children are Databricks-owned).
+            if is_platform_internal(p):
+                out.append({
+                    "path": p, "object_type": otype, "language": safe_str(obj.get("language")),
+                    "object_id": safe_str(obj.get("object_id")),
+                    "resource_id": safe_str(obj.get("resource_id")),
+                    "is_user_root": False, "deployed_by_dab": False, "dab_scope": "",
+                    "platform_internal": True, "migration_note": PLATFORM_INTERNAL_NOTE,
+                    "acl": None,
+                })
+                self.log.debug(f"{p}: platform-internal — recorded, not descended, ACL not read")
+                continue
             dab = dab_path_info(p, getattr(self.config, "dab_bundle_roots", None))
             record = {
                 "path": p,
@@ -166,12 +190,14 @@ class WorkspaceCollector(BaseCollector):
 
         # Primary: per-id detail for git folders discovered during the walk.
         for rid in sorted(self._repo_ids):
+            self.log.debug(f"collecting repo {rid}")
             try:
                 detail = self.client.get(f"api/2.0/repos/{rid}") or {}
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("repo detail failed", repo_id=rid, error=str(exc))
                 detail = {}
             _add(rid, detail if isinstance(detail, dict) else {})
+            self.log.debug(f"collected repo {rid} ({safe_str((detail or {}).get('path'))})")
 
         # Fallback/union: the list API (in case it returns repos the walk didn't reach).
         for extra in ({}, {"path_prefix": "/Workspace"}):

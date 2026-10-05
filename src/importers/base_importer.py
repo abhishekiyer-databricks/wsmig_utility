@@ -41,11 +41,13 @@ from typing import Any, Optional
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
                                    ACTION_FAILED, ACTION_MANUAL, ACTION_NOT_SELECTED,
                                    ACTION_SKIPPED, ACTION_SKIPPED_NO_OBJECT, ACTION_UPDATED,
-                                   CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_SUPPORTED,
-                                   CAT_PERMISSION_DENIED, CAT_PREREQUISITE_MISSING, UpsertAction)
-from src.utils.helpers import (folder_natural_key, home_owner, looks_like_app_id, normalize_ws_path,
-                               safe_str)
-from src.utils.logger import get_logger
+                                   CAT_API_ERROR, CAT_DEPENDENCY_UNRESOLVED, CAT_NOT_APPLIED,
+                                   CAT_NOT_SUPPORTED, CAT_PERMISSION_DENIED,
+                                   CAT_PREREQUISITE_MISSING, UpsertAction)
+from src.state import state_store as _state_mod
+from src.utils.helpers import (folder_natural_key, home_owner, is_platform_internal,
+                               looks_like_app_id, normalize_ws_path, safe_str)
+from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 
 # The single decision a `/Users/<owner>/...` path resolves to (PLAN 9, lifted here in PLAN 11
 # Finding-8 so the workspace importer AND the four folder-placed importers — SQL queries/alerts,
@@ -62,6 +64,8 @@ HomeResolution = namedtuple("HomeResolution", ["target_path", "kind", "note"])
 # Flush the checkpoint every N units. Every write to a UC Volume is a FULL-file rewrite (verified
 # live — memory `uc-volume-file-io-limits`), so per-item flushing is O(n²) bytes; one flush at the
 # end would lose all bookkeeping on a crash. Same batch size and rationale as the export pass.
+# Also flushed once the oldest pending outcome is `state_store.FLUSH_SECONDS` old (PLAN 16.1 §4.4),
+# the same rule as the state table, so after a hard crash the checkpoint is never further behind it.
 CHECKPOINT_BATCH = 200
 
 # API error text → (failure_category, remediation HINT). The hint is only ever APPENDED to the
@@ -153,6 +157,11 @@ class SkippedNoObject(RuntimeError):
         self.category = category
 
 
+class NotApplied(RuntimeError):
+    """The API accepted a write (2xx) but the READ-BACK shows it did not take effect (PLAN 16.2 §4).
+    Filed `not_applied` — the report must be the source of truth, not the HTTP status."""
+
+
 class UnsupportedOperation(RuntimeError):
     """This asset has no REST create path in scope, so the tool never attempts it.
 
@@ -179,6 +188,8 @@ def classify_error(exc: Exception) -> tuple[str, str]:
         return CAT_DEPENDENCY_UNRESOLVED, raw
     if isinstance(exc, UnsupportedOperation):
         return CAT_NOT_SUPPORTED, raw
+    if isinstance(exc, NotApplied):
+        return CAT_NOT_APPLIED, raw
     for marker, category, hint in _ERROR_MAP:
         if marker.lower() in raw.lower():
             # actual server error FIRST, remediation hint appended — the operator sees both.
@@ -277,6 +288,10 @@ class BaseImporter(ABC):
     # be an admin on target. Fingerprint-based SKIP still applies, so a re-run with unchanged
     # membership/grants is still a no-op.
     declarative_asset_types: tuple = ()
+    # asset_types whose ADOPT is a RECONCILE (PLAN 16.2 §4): the object exists on target, but its
+    # attributes must be compared with source and corrected if they differ — `adopt_one()` does it
+    # and says whether it changed anything (→ `updated`) or not (→ `adopted`).
+    reconcile_on_adopt_types: tuple = ()
 
     def __init__(self, client, config, staging, state=None, identity_map=None, dbutils=None,
                  context=None, units_by_type=None, retry_keys=None) -> None:
@@ -300,6 +315,11 @@ class BaseImporter(ABC):
         self.result = ImportResult(self.component)
         self._pending_cp: list[str] = []
         self._pending_cp_results: dict = {}
+        self._cp_since: Optional[float] = None   # when the oldest pending checkpoint entry was queued
+        # Phase progress (set by run(); 0 = _record called outside a phase run, e.g. a unit test).
+        self._phase_total = 0
+        self._phase_done = 0
+        self._phase_t0 = 0.0
 
     # ── properties ────────────────────────────────────────────────────────
     @property
@@ -336,6 +356,28 @@ class BaseImporter(ABC):
         return {"target_id": target_id, "warning":
                 f"{unit.get('asset_type')} has no update API in this tool — the target object was "
                 f"left as it is. Recreate it by hand if the source change matters."}
+
+    def adopt_one(self, unit: dict, target_id: str) -> dict:
+        """RECONCILE an adopted object (only for `reconcile_on_adopt_types`). Return
+        `{"changed": bool, "target_id", "note", "warning"}`; raise on failure."""
+        return {"changed": False, "target_id": target_id}
+
+    # ── optional per-unit hooks (defaults keep the base behaviour unchanged) ──
+    def probe_existing(self, unit: dict, existing: dict) -> None:
+        """A LAZY existence check for one unit, just before its decision: add `key → target_id` to
+        `existing` when it is on target. For units whose existence depends on an object created
+        earlier in the SAME phase (a dashboard's publish state / schedules, PLAN 16.2 §4), which
+        the up-front `existing_keys()` cannot know. Default: nothing (the up-front map decides)."""
+
+    def recheck_unchanged(self, unit: dict, row: Optional[dict]) -> bool:
+        """Whether an UNCHANGED unit (fingerprint match) must still be revisited as an ADOPT — for a
+        unit whose last outcome left work only a re-check can finish (e.g. a schedule whose
+        subscribers were waiting on a target user / destination). Default: never."""
+        return False
+
+    def dry_run_intent(self, unit: dict, action: UpsertAction) -> str:
+        """The `dry run: …` wording for a unit ("" → the generic would CREATE/UPDATE/ADOPT)."""
+        return ""
 
     # ── unit-level helpers subclasses use ─────────────────────────────────
     @staticmethod
@@ -503,9 +545,11 @@ class BaseImporter(ABC):
     # orphaned owner's query would hard-fail while their notebook is preserved.
     def _get_status(self, path: str) -> dict:
         """`workspace/get-status` for a path, or {} if absent. Never raises — absent 404s."""
+        self.log.debug(f"checking {path}")
         try:
             return self.client.get("api/2.0/workspace/get-status", params={"path": path}) or {}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — expected: a 404 means "absent"
+            self.log.debug(f"checked {path} → absent ({str(exc)[:160]})")
             return {}
 
     def _roster_status(self, owner: str) -> str:
@@ -539,8 +583,13 @@ class BaseImporter(ABC):
                                 val = safe_str(e.get("value") if isinstance(e, dict) else e)
                                 if val:
                                     roster.add(val)
-            except Exception:  # noqa: BLE001 — a missing/garbled file just means "unknown"
+            except Exception as exc:  # noqa: BLE001 — a missing/garbled file just means "unknown"
                 have_roster = False
+                self.log.warning("source identity roster unreadable — home owners are treated as "
+                                 "'unknown' (never diverted to backup)", error=str(exc)[:200])
+            if not have_roster and not hasattr(self, "_roster_warned"):
+                self._roster_warned = True
+                self.log.debug("no source identity roster in the bundle — home owners 'unknown'")
             self._roster_cache = (roster if have_roster else None)
         cache = self._roster_cache
         if cache is None:
@@ -604,8 +653,9 @@ class BaseImporter(ABC):
             return
         try:
             self.client.post("api/2.0/workspace/mkdirs", {"path": path})
-        except Exception:  # noqa: BLE001 — idempotent; a real problem resurfaces on the create
-            pass
+        except Exception as exc:  # noqa: BLE001 — idempotent; a real problem resurfaces on create
+            self.log.debug(f"mkdirs {path} failed (the create will surface any real problem): "
+                           f"{str(exc)[:200]}")
 
     def _resolve_home_target(self, path: str) -> HomeResolution:
         """Decide where a `/Users/<owner>/<rest>` path (root OR descendant) should be created.
@@ -715,16 +765,31 @@ class BaseImporter(ABC):
         failing to list is still not a reason to abandon the other families.
         """
         t0 = time.time()
+        phase = f"import {self.component}"
         try:
             units = self.load()
         except Exception as exc:  # noqa: BLE001 — a family that can't even load must not abort
-            self.log.error("importer load failed", component=self.component, error=str(exc))
+            self.log.error(f"{phase}: importer load failed: {exc}", exc_info=True)
             self.result.errors.append(f"{self.component}: load failed: {exc}")
             self.result.elapsed_sec = time.time() - t0
             return self.result
 
+        by_type: dict = {}
+        for u in units:
+            at = safe_str(u.get("asset_type"))
+            by_type[at] = by_type.get(at, 0) + 1
+        self.log.info(f"Phase: {phase} — {len(units):,} units"
+                      + (f" ({fmt_counts(by_type)})" if by_type else ""),
+                      dry_run=self.dry_run)
+
+        # The existence check is one LIST (or one probe per object) — silent before, so a
+        # 20-minute check looked like a hang (QA-2). Start + end lines; probes are DEBUG.
+        t_exist = time.time()
+        self.log.info(f"{phase}: existence check started")
         try:
             existing = self.existing_keys()
+            self.log.info(f"{phase}: existence check done — {len(existing):,} already on target "
+                          f"({fmt_elapsed(time.time() - t_exist)})")
         except Exception as exc:  # noqa: BLE001
             # Failing OPEN here would risk duplicates, so treat "cannot list" as an empty map but
             # say so loudly — the create path's RESOURCE_ALREADY_EXISTS adopt is the safety net.
@@ -735,9 +800,9 @@ class BaseImporter(ABC):
                 f"falls back to RESOURCE_ALREADY_EXISTS handling")
             existing = {}
 
-        self.log.info("importing", component=self.component, units=len(units),
-                      already_on_target=len(existing), dry_run=self.dry_run)
-
+        self._phase_total = len(units)
+        self._phase_done = 0
+        self._phase_t0 = t0
         for unit in units:
             try:
                 self._process_one(unit, existing)
@@ -745,22 +810,44 @@ class BaseImporter(ABC):
                 # Nothing a single unit does may end the run. This is the last line of defence:
                 # _process_one already handles expected API errors, so reaching here means a bug or
                 # an unforeseen shape — still recorded per-unit, still continuing.
+                self.log.error(f"unexpected importer error on {unit.get('asset_type')} "
+                               f"{self.natural_key(unit)}", exc_info=True)
                 self._record(unit, ACTION_FAILED, note=f"unexpected importer error: {exc}",
                              error_raw=str(exc), category=CAT_API_ERROR)
-                self.log.error("unit failed (unexpected)", component=self.component,
-                               natural_key=self.natural_key(unit), error=str(exc))
 
         self.flush_checkpoint()
         self.result.elapsed_sec = time.time() - t0
-        self.log.info("phase done", component=self.component, **{
-            k: v for k, v in self.result.as_dict().items()
-            if k in ("total", "created", "updated", "adopted", "skipped", "failed", "manual")})
+        self.log.info(f"Phase complete: {phase} — {fmt_counts(self._outcome_counts(final=True))} "
+                      f"({fmt_elapsed(self.result.elapsed_sec)})")
+        self._phase_total = 0
         return self.result
+
+    def is_platform_internal_unit(self, unit: dict) -> bool:
+        """Whether this unit is a platform-internal workspace object (PLAN 16.2 §2) — by its export
+        action, or (for a `main`-written bundle without one) by its content path."""
+        if safe_str(unit.get("import_action")) == "skip_internal":
+            return True
+        return (safe_str(unit.get("asset_type")) in ("directory", "notebook", "workspace_file")
+                and is_platform_internal(self.natural_key(unit)))
+
+    def _outcome_counts(self, final: bool = False) -> dict:
+        """The running tally for progress / phase-complete lines (zero buckets omitted, except the
+        two an operator always wants to see)."""
+        r = self.result
+        counts = {"created": r.created, "updated": r.updated, "adopted": r.adopted,
+                  "unchanged": r.skipped, "warned": r.warned, "manual": r.manual,
+                  "no_object": r.skipped_no_object, "not_selected": r.not_selected,
+                  "failed": r.failed}
+        if final and r.dry_run:
+            counts["dry_run"] = r.dry_run
+        return {k: v for k, v in counts.items() if v or k in ("created", "failed")}
 
     def _process_one(self, unit: dict, existing: dict) -> None:
         """Decide and act on ONE unit. Expected API errors are handled here."""
         key = self.natural_key(unit)
         asset_type = safe_str(unit.get("asset_type"))
+        # START line, before any work: a stuck run's last driver-log line names this object.
+        self.log.debug(f"importing {asset_type} {key}")
 
         # 0. retry_mode narrowed the work list and this unit isn't in it. Recorded (in-memory) so
         #    the run's result still ACCOUNTS for every unit, but flagged `retry_out_of_scope` so the
@@ -778,6 +865,7 @@ class BaseImporter(ABC):
                         f"outstanding units; this one was not outstanding",
                 "failure_category": "", "dry_run": self.dry_run,
                 "retry_out_of_scope": True})
+            self._log_outcome(asset_type, key, ACTION_SKIPPED, note="not in this retry's work list")
             return
 
         # 1. Units the bundle already marked as human work (repos, legacy dashboards, secret
@@ -805,6 +893,15 @@ class BaseImporter(ABC):
                          "real customer object; nothing to migrate")
             return
 
+        # 2c. Platform-internal folder (`.db_internal`, `.ide`, `.databricks` — PLAN 16.2 §2):
+        #     Databricks owns it and recreates it itself. Recorded `skipped` with no existence probe
+        #     and no API call, so the report says "Skipped — platform-internal", never "Created".
+        #     Also catches a `main`-written bundle whose unit has no `skip_internal` action.
+        if self.is_platform_internal_unit(unit):
+            self._record(unit, ACTION_SKIPPED, note=_PLATFORM_INTERNAL_SKIP_NOTE,
+                         skip_reason=SKIP_REASON_PLATFORM_INTERNAL)
+            return
+
         # 3. Resume: this attempt already did it. The recorded OUTCOME is restored (not just a
         #    done-flag), because import_results.json is written only at the end and so never
         #    exists after a crash — the checkpoint is the only resumable record.
@@ -815,24 +912,37 @@ class BaseImporter(ABC):
         #    step 4's upsert is idempotent (live existence check + fingerprint + adopt), and it is
         #    the STATE TABLE (reloaded into retry_keys), not the checkpoint, that decides what is
         #    still outstanding, so a crashed retry re-run naturally drops the units that succeeded.
+        #    A prior `skipped_no_object` is NOT "done" (PLAN 16.2 §5b): its object may exist now (a
+        #    retry healed it, or an earlier phase of this re-run created it), so the unit falls
+        #    through to the normal decision — cheap, the object either exists now or not.
         retry_active = self.retry_keys is not None
         if not self.config.imports.force_full_import and not retry_active:
             prior = self.staging.get_results(self._cp_component()).get(key)
-            if prior and self.staging.is_done(self._cp_component(), key):
+            if (prior and self.staging.is_done(self._cp_component(), key)
+                    and safe_str(prior.get("import_status")) != ACTION_SKIPPED_NO_OBJECT):
                 self._record(unit, safe_str(prior.get("import_status")) or ACTION_SKIPPED,
                              target_id=safe_str(prior.get("target_id")),
                              note=safe_str(prior.get("note")) or "already done in this run "
                                                                 "(resumed from checkpoint)",
-                             checkpoint=False)
+                             checkpoint=False, resumed=True)
                 return
 
         # 4. The upsert decision: state row + LIVE existence check.
         fingerprint = safe_str(unit.get("fingerprint"))
+        self.probe_existing(unit, existing)
         exists = key in existing
         action = (self.state.decide(asset_type, key, fingerprint, exists)
                   if self.state is not None else
                   (UpsertAction.ADOPT if exists else UpsertAction.CREATE))
+        # Decision INPUTS (DEBUG): enough to explain any create/adopt/update/skip after the fact.
+        _row = self.state.row(asset_type, key) if self.state is not None else None
+        _fp_same = bool(_row) and safe_str(_row.get("last_source_fingerprint")) == fingerprint
+        self.log.debug(f"decide {asset_type} {key}: state_row={'yes' if _row else 'no'} "
+                       f"exists={'yes' if exists else 'no'} "
+                       f"fingerprint={'same' if _fp_same else 'changed/new'} → {action.name}")
 
+        if action is UpsertAction.SKIP and self.recheck_unchanged(unit, _row):
+            action = UpsertAction.ADOPT
         if action is UpsertAction.SKIP:
             self._record(unit, ACTION_SKIPPED, target_id=existing.get(key, ""),
                          note="unchanged since the last import (fingerprint match)")
@@ -841,8 +951,9 @@ class BaseImporter(ABC):
         if self.dry_run:
             # A dry run makes the real decision and reports it, but mutates nothing — that's what
             # makes a rehearsal's report meaningful rather than a guess.
-            intended = {UpsertAction.CREATE: "would CREATE", UpsertAction.UPDATE: "would UPDATE",
-                        UpsertAction.ADOPT: "would ADOPT (already on target)"}[action]
+            intended = self.dry_run_intent(unit, action) or {
+                UpsertAction.CREATE: "would CREATE", UpsertAction.UPDATE: "would UPDATE",
+                UpsertAction.ADOPT: "would ADOPT (already on target)"}[action]
             self._record(unit, self._dry_status(action), target_id=existing.get(key, ""),
                          note=f"dry run: {intended}", dry=True)
             return
@@ -853,6 +964,9 @@ class BaseImporter(ABC):
             # TO that object. Adopting without performing it would silently migrate nothing.
             if asset_type in self.declarative_asset_types:
                 self._do_declarative(unit, target_id)
+                return
+            if asset_type in self.reconcile_on_adopt_types:
+                self._do_reconcile_adopt(unit, target_id)
                 return
             # Otherwise: adopting isn't the end of it either — the object exists but may be STALE,
             # so compare fingerprints and update if the source has moved on since.
@@ -901,9 +1015,8 @@ class BaseImporter(ABC):
                                   "adopted, not duplicated")
                 return
             category, message = classify_error(exc)
+            # The ERROR outcome line (object + category + raw server error) is logged by _record.
             self._record(unit, ACTION_FAILED, note=message, error_raw=str(exc), category=category)
-            self.log.warning("create failed", component=self.component, natural_key=key,
-                             category=category, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
@@ -928,14 +1041,31 @@ class BaseImporter(ABC):
             category, message = classify_error(exc)
             self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
                          error_raw=str(exc), category=category)
-            self.log.warning("declarative apply failed", component=self.component,
-                             natural_key=key, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
                      target_id=safe_str(out.get("target_id")) or target_id,
                      note=warning or safe_str(out.get("note")),
                      source_detail=safe_str(out.get("source_detail")))
+
+    def _do_reconcile_adopt(self, unit: dict, target_id: str) -> None:
+        """ADOPT for a `reconcile_on_adopt_types` unit: compare + correct via `adopt_one()`."""
+        try:
+            out = self.adopt_one(unit, target_id) or {}
+        except SkippedNoObject as exc:
+            self._record(unit, ACTION_SKIPPED_NO_OBJECT, note=str(exc), category=exc.category)
+            return
+        except Exception as exc:  # noqa: BLE001
+            category, message = classify_error(exc)
+            self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
+                         error_raw=str(exc), category=category)
+            return
+        warning = safe_str(out.get("warning"))
+        status = (ACTION_CREATED_WITH_WARNING if warning else
+                  ACTION_UPDATED if out.get("changed") else ACTION_ADOPTED)
+        self._record(unit, status, target_id=safe_str(out.get("target_id")) or target_id,
+                     note=warning or safe_str(out.get("note")) or
+                     "already existed on target — adopted into the migration state")
 
     def _do_update(self, unit: dict, target_id: str) -> None:
         """The UPDATE path — always against the STORED target id, never a source id."""
@@ -952,8 +1082,6 @@ class BaseImporter(ABC):
             category, message = classify_error(exc)
             self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
                          error_raw=str(exc), category=category)
-            self.log.warning("update failed", component=self.component, natural_key=key,
-                             target_id=target_id, error=str(exc)[:300])
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_UPDATED,
@@ -973,13 +1101,18 @@ class BaseImporter(ABC):
 
     def _record(self, unit: dict, status: str, *, target_id: str = "", note: str = "",
                 error_raw: str = "", category: str = "", dry: bool = False,
-                checkpoint: bool = True, source_detail: str = "") -> None:
+                checkpoint: bool = True, source_detail: str = "", resumed: bool = False,
+                skip_reason: str = "") -> None:
         """Record one outcome in all three places: state table, checkpoint, result rows.
 
         `source_detail` (PLAN 8 Bug 5) is an optional JSON snapshot of the unit's source-side
         members/entitlements/roles, carried into the state row so the NEXT run can diff and name
         exactly what changed. Empty for asset types that don't produce one (state.record carries the
-        prior value forward, so a later record for the same key never blanks it)."""
+        prior value forward, so a later record for the same key never blanks it).
+
+        `resumed` (PLAN 16.2 §1a) marks an outcome RESTORED from the checkpoint rather than done by
+        this run — only the log line changes (report + state carry the restored outcome as before).
+        `skip_reason` refines a `skipped` row's report label (e.g. `platform_internal`)."""
         asset_type = safe_str(unit.get("asset_type"))
         key = self.natural_key(unit)
         row = {
@@ -989,7 +1122,8 @@ class BaseImporter(ABC):
             "source_id": safe_str(unit.get("source_id")),
             "target_id": safe_str(target_id),
             "import_status": status,
-            "action_taken": _ACTION_TAKEN_LABEL.get(status, status),
+            "action_taken": (_SKIP_REASON_LABEL.get(skip_reason)
+                             or _ACTION_TAKEN_LABEL.get(status, status)),
             "fingerprint": safe_str(unit.get("fingerprint")),
             "note": note,
             # The COMPLETE, untruncated server error — the report shows it verbatim so nothing is
@@ -998,7 +1132,11 @@ class BaseImporter(ABC):
             "failure_category": category,
             "dry_run": bool(dry),
         }
+        if skip_reason:
+            row["skip_reason"] = skip_reason
         self.result.add(row)
+        self._log_outcome(asset_type, key, status, target_id=target_id, note=note,
+                          error_raw=error_raw, category=category, dry=dry, resumed=resumed)
 
         if self.state is not None:
             # A FAILED outcome must NOT advance the stored fingerprint. The change never landed on
@@ -1023,15 +1161,65 @@ class BaseImporter(ABC):
         # make the next real run think the work is done.
         if checkpoint and not dry:
             self._pending_cp.append(key)
+            # `asset_type` lets the recovery replay key the row (PLAN 16.1 §4.4): without it the
+            # replay can only infer the type for single-type families, so after a hard crash the
+            # identity/compute/workspace/secrets/sql/misc outcomes were never replayed. Older
+            # checkpoints without it still go through the runner's single-type fallback.
             self._pending_cp_results[key] = {"import_status": status, "target_id": safe_str(target_id),
                                              "fingerprint": safe_str(unit.get("fingerprint")),
                                              "source_id": safe_str(unit.get("source_id")),
+                                             "asset_type": safe_str(unit.get("asset_type")),
                                              "note": note}
-            if len(self._pending_cp) >= CHECKPOINT_BATCH:
+            now = _state_mod.flush_clock()
+            if self._cp_since is None:
+                self._cp_since = now
+            if (len(self._pending_cp) >= CHECKPOINT_BATCH
+                    or now - self._cp_since >= _state_mod.FLUSH_SECONDS):
                 self.flush_checkpoint()
 
+    def _log_outcome(self, asset_type: str, key: str, status: str, *, target_id: str = "",
+                     note: str = "", error_raw: str = "", category: str = "",
+                     dry: bool = False, resumed: bool = False) -> None:
+        """The per-object END line, then `progress()`. ONE level rule everywhere:
+        failed → ERROR; created_with_warning → WARNING; everything else → DEBUG. So failures and
+        warnings reach the cell, successes stay in the driver log.
+
+        A `resumed` outcome (restored from the checkpoint, PLAN 16.2 §1a) says so — otherwise a
+        replayed `created … 187 bytes uploaded` is indistinguishable from real work. Same level rule
+        (a resumed failure is still ERROR, so still visible in the cell)."""
+        what = f"{asset_type} {key}"
+        if resumed:
+            line = (f"{what} → {status} (resumed from checkpoint — no API call this run)"
+                    + (f"  target_id={target_id}" if target_id else ""))
+            if status == ACTION_FAILED:
+                self.log.error(line + (f"  prior error: {safe_str(note)[:300]}" if note else ""))
+            elif status == ACTION_CREATED_WITH_WARNING:
+                self.log.warning(line + (f"  prior warning: {safe_str(note)[:300]}"
+                                         if note else ""))
+            else:
+                self.log.debug(line)
+        elif status == ACTION_FAILED:
+            raw = safe_str(error_raw)
+            line = f"{what} → FAILED {category or CAT_API_ERROR}: {note}"
+            if raw and raw[:200] not in safe_str(note):
+                line += f"  | raw: {raw[:1000]}"
+            self.log.error(line)
+        elif status == ACTION_CREATED_WITH_WARNING:
+            self.log.warning(f"{what} → {status}"
+                             + (f"  target_id={target_id}" if target_id else "")
+                             + (f": {note}" if note else ""))
+        else:
+            self.log.debug(f"{what} → {'(dry run) ' if dry else ''}{status}"
+                           + (f"  target_id={target_id}" if target_id else "")
+                           + (f"  note={safe_str(note)[:300]}" if note else ""))
+        if self._phase_total:
+            self._phase_done += 1
+            self.log.progress(f"import {self.component}", self._phase_done, self._phase_total,
+                              started=self._phase_t0, **self._outcome_counts())
+
     def flush_checkpoint(self) -> None:
-        """Write the pending checkpoint batch. Called per batch, at phase end, and in `finally`."""
+        """Write the pending checkpoint batch. Called per batch / FLUSH_SECONDS, at phase end, and
+        in `finally`."""
         if not self._pending_cp and not self._pending_cp_results:
             return
         try:
@@ -1040,6 +1228,7 @@ class BaseImporter(ABC):
         except Exception as exc:  # noqa: BLE001 — bookkeeping must not break the run
             self.log.warning("checkpoint flush failed", component=self.component, error=str(exc))
         self._pending_cp, self._pending_cp_results = [], {}
+        self._cp_since = None
 
 
 # Human label per status, for the Excel "Action Taken" column. Kept beside the vocabulary so a new
@@ -1054,4 +1243,12 @@ _ACTION_TAKEN_LABEL = {
     ACTION_MANUAL: "Manual step required",
     ACTION_NOT_SELECTED: "Deferred — not selected this run",
     "skipped_no_object": "Skipped — target object absent",
+}
+
+_PLATFORM_INTERNAL_SKIP_NOTE = ("platform-internal directory (Databricks-owned) — not migrated")
+
+# `skip_reason` → a more precise "Action Taken" label for a `skipped` row.
+SKIP_REASON_PLATFORM_INTERNAL = "platform_internal"
+_SKIP_REASON_LABEL = {
+    SKIP_REASON_PLATFORM_INTERNAL: "Skipped — platform-internal",
 }

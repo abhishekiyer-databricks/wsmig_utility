@@ -52,6 +52,19 @@ _STATUS_STYLE = {
     "": ("—", "FFFFFF"),
 }
 
+# A `skipped` row's `skip_reason` → a more precise Import Status label (PLAN 16.2 §2).
+_SKIP_REASON_STYLE = {
+    "platform_internal": ("Skipped — platform-internal", "E5E7EB"),
+}
+
+
+def _status_label(row: dict) -> tuple:
+    """(label, colour) for a row's Import Status cell."""
+    status = safe_str(row.get("import_status"))
+    if status == "skipped" and safe_str(row.get("skip_reason")) in _SKIP_REASON_STYLE:
+        return _SKIP_REASON_STYLE[safe_str(row.get("skip_reason"))]
+    return _STATUS_STYLE.get(status, (status, "FFFFFF"))
+
 _SUMMARY_ORDER = ("created", "updated", "adopted", "skipped", "created_with_warning", "manual",
                   "not_selected", "skipped_no_object", "failed")
 
@@ -83,6 +96,9 @@ _ASSET_TYPE_TO_CARD = {
     "legacy_alert": "sql_alerts", "alert_v2": "sql_alerts",
     "legacy_dashboard": "sql_dashboards",
     "dlt_pipeline": "dlt_pipelines", "lakeview_dashboard": "lakeview_dashboards",
+    # PLAN 16.2 §4: one sheet each → "Dashboard Publish" / "Dashboard Schedules".
+    "lakeview_dashboard_publish": "dashboard_publish",
+    "lakeview_dashboard_schedule": "dashboard_schedules",
     "genie_space": "genie_spaces", "serving_endpoint": "serving_endpoints",
     "secret_scope": "secret_scopes", "secret_value": "secret_scopes",
     "workspace_conf": "workspace_conf", "acl": "object_permissions",
@@ -117,6 +133,7 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     The returned dict carries the ACTUAL paths written, so the notebook reads back the right files.
     """
     rows = _all_rows(results)
+    _LOG.info(f"building import reports from {len(rows):,} unit rows")
     written: dict[str, str] = {}
     # The deleted-in-source finding is discovered by the runner into `context`; fold it into the
     # summary so every renderer below sees one object rather than needing both.
@@ -447,11 +464,13 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
     _del_inline_note = ("on target but no longer in the source bundle — NOT deleted (set "
                         "allow_deletes=true to remove); a source rename shows as this old name "
                         "deleted + the new name created")
+    from src.state.state_store import DELETED_IN_SOURCE_NOTE
     for at, keys in (summary.get("deleted_in_source") or {}).items():
         for key in sorted(keys):
             by_card.setdefault(_card_for_asset_type(at), []).append({
                 "asset_type": at, "natural_key": key, "import_status": "deleted_in_source",
-                "action_taken": "Deleted in source", "note": _del_inline_note,
+                "action_taken": "Deleted in source",
+                "note": DELETED_IN_SOURCE_NOTE.get(at, _del_inline_note),
                 "target_id": "", "source_id": "", "failure_category": "", "error_raw": ""})
 
     # Inventory card order first (so tabs line up with the other workbooks), then any leftover
@@ -477,8 +496,7 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             cc.alignment = centre
             sheet.column_dimensions[get_column_letter(col)].width = w
         for i, x in enumerate(by_card[card], start=2):
-            status = safe_str(x.get("import_status"))
-            _label, colour = _STATUS_STYLE.get(status, (status, "FFFFFF"))
+            _label, colour = _status_label(x)
             for col, (_h, key, _w) in enumerate(cols, 1):
                 cc = sheet.cell(row=i, column=col, value=safe_str(x.get(key)))
                 cc.border = box
@@ -679,7 +697,12 @@ def _render_manual_actions(summary: dict, rows: list[dict]) -> str:
     """
     manual = [r for r in rows if safe_str(r.get("import_status")) == "manual"]
     failed = [r for r in rows if safe_str(r.get("import_status")) == "failed"]
-    warned = [r for r in rows if safe_str(r.get("import_status")) == "created_with_warning"]
+    # A dashboard schedule's warning is a subscriber hand-off (PLAN 16.2 §4) — its own section, ONE
+    # line per schedule (listing every affected subscriber), not mixed into "verify before use".
+    sched_warned = [r for r in rows if safe_str(r.get("import_status")) == "created_with_warning"
+                    and safe_str(r.get("asset_type")) == "lakeview_dashboard_schedule"]
+    warned = [r for r in rows if safe_str(r.get("import_status")) == "created_with_warning"
+              and safe_str(r.get("asset_type")) != "lakeview_dashboard_schedule"]
     no_object = [r for r in rows if safe_str(r.get("import_status")) == "skipped_no_object"]
 
     out = [
@@ -717,6 +740,11 @@ def _render_manual_actions(summary: dict, rows: list[dict]) -> str:
     section("Failures to fix, then retry", failed,
             "Fix the cause, then re-run `04_Import` with `retry_mode=failed_only` — that attempts "
             "ONLY these units and touches nothing else.")
+    section("Dashboard schedule subscribers — recreate by hand", sched_warned,
+            "The schedule exists on target, but these subscribers could not be added by the tool: "
+            "a viewer-credential (Individual data permissions) dashboard only allows each user to "
+            "subscribe THEMSELVES, and a user / notification destination missing on target must "
+            "be created first (destinations are never created by the tool).")
     section("Created but degraded — verify before use", warned,
             "These EXIST on target but a reference could not be fully resolved (most often a "
             "notebook path inside a Git folder that has not been recreated). They will create "

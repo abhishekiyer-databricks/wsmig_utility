@@ -19,7 +19,7 @@ has full information.
 """
 from __future__ import annotations
 
-from src.utils.helpers import safe_str
+from src.utils.helpers import is_platform_internal, safe_str
 
 # principal field on an access_control entry → principal_type.
 _PRINCIPAL_FIELDS = (("user_name", "user"),
@@ -93,6 +93,10 @@ def collect_acls(objects_by_type: dict[str, list]) -> list[dict]:
     _WS_ASSET = {"NOTEBOOK": "notebook", "FILE": "workspace_file", "DIRECTORY": "directory",
                  "REPO": "repo"}
     for w in objects_by_type.get("workspace_object", []) or []:
+        # Platform-internal (`.db_internal` …, PLAN 16.2 §2): Databricks owns these — no ACL entry,
+        # even when an older inventory carried one.
+        if is_platform_internal(w.get("path")):
+            continue
         otype = safe_str(w.get("object_type"))
         add(_WS_ASSET.get(otype, otype.lower()), safe_str(w.get("path")),
             w.get("object_id") or w.get("repo_id"), _WS_PERM.get(otype, "notebooks"), w.get("acl"))

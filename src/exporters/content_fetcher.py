@@ -129,6 +129,9 @@ class ContentFetcher:
         if kind == "notebook":
             params["format"] = "SOURCE"
             cap = NOTEBOOK_CAP
+        # START line (worker thread). The END/outcome line is logged once, by the runner's
+        # consumer loop on the main thread, so every object gets exactly one outcome line.
+        _LOG.debug(f"fetching {path}", kind=kind)
         try:
             data = self.client.download_bytes("api/2.0/workspace/export", params=params,
                                               max_bytes=cap)
@@ -138,7 +141,7 @@ class ContentFetcher:
             if kind == "notebook" and _is_notebook_oversize(exc):
                 # A >10 MB notebook has no API recreate path → skip outright, NO bytes (decision).
                 return self._oversize(path, kind, 0)
-            _LOG.warning("content fetch failed", path=path, error=str(exc))
+            _LOG.debug("content fetch failed", path=path, error=str(exc))
             return FetchResult(status="failure", content_kind=kind, note=f"content fetch: {exc}")
 
         rel_name = self._reserve_name(path, kind, language)
@@ -146,7 +149,7 @@ class ContentFetcher:
         try:
             self.aw.write_bytes(rel, data)
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("content write failed", path=path, error=str(exc))
+            _LOG.debug("content write failed", path=path, error=str(exc))
             return FetchResult(status="failure", content_kind=kind, note=f"content write: {exc}")
         return FetchResult(status="success", content_ref=rel, content_route="direct_download",
                           content_kind=kind, size_bytes=len(data),
@@ -162,7 +165,7 @@ class ContentFetcher:
         else:
             reason = f"file exceeds the {FILE_CAP // (1024*1024)} MB workspace-files API limit"
             recommended = "copy via UC Volume / cloud object storage (out-of-band)"
-        _LOG.warning("content skipped (oversize)", path=path, size=size, kind=kind)
+        _LOG.debug("content skipped (oversize)", path=path, size=size, kind=kind)
         return FetchResult(
             status="skipped_oversize", content_kind=kind, size_bytes=size,
             note=reason,

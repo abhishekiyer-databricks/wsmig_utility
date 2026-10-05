@@ -34,6 +34,9 @@ dbutils.widgets.text("max_workspace_items", "0", "Max workspace items (0 = all)"
 dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unlimited)")
 dbutils.widgets.dropdown("force_full", "false", ["true", "false"],
                          "Force a fresh snapshot (ignore an incomplete bundle to resume)")
+# Cell output level (the driver log — Compute → Driver logs → Standard error — is ALWAYS DEBUG).
+dbutils.widgets.dropdown("log_level", "INFO", ["DEBUG", "INFO", "WARNING", "ERROR"],
+                         "Cell log level (driver log is always DEBUG)")
 
 # COMMAND ----------
 
@@ -85,14 +88,16 @@ def _add_repo_root_to_syspath() -> str:
 
 
 _REPO_ROOT = _add_repo_root_to_syspath()
-print(f"repo root on sys.path: {_REPO_ROOT}")
 
 from src.config.config_manager import Config, STAGE_INVENTORY
 from src.auth.token_manager import build_clients
-from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.collectors.inventory_runner import InventoryRunner
 from src.utils import logger as _logger
+
+# Every line below goes to BOTH outputs: the cell (at `log_level`) and the driver log (always DEBUG).
+_say = _logger.get_logger("notebook").info
+_say(f"repo root on sys.path: {_REPO_ROOT}")
 
 # COMMAND ----------
 
@@ -120,17 +125,17 @@ cfg.run_id = _resolved_run_id
 # themselves are unchanged either way: they just take a `client`.
 source_client, local_client = build_clients(cfg, dbutils=dbutils, spark=spark)
 client = source_client
-print(f"Source workspace : {client.base_url}"
-      + (f"   (read over REST from {cfg.ctx.workspace_url})" if cfg.is_direct else ""))
-print(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
-print(f"Staging          : {cfg.output_path}")
+_say(f"Source workspace : {client.base_url}"
+     + (f"   (read over REST from {cfg.ctx.workspace_url})" if cfg.is_direct else ""))
+_say(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
+_say(f"Staging          : {cfg.output_path}")
 
 # Publish the run_id to a 2-task job's Export task (harmless no-op outside a job). Wrapped so an
 # unusual runtime that doesn't expose jobs.taskValues can never break read-only inventory (§2b).
 try:
     dbutils.jobs.taskValues.set(key="run_id", value=cfg.run_id)
-except Exception as _exc:  # noqa: BLE001
-    print(f"(taskValues.set skipped: {_exc})")
+except Exception as _exc:  # noqa: BLE001 — expected outside a job
+    _say(f"(taskValues.set skipped: {_exc})")
 
 # COMMAND ----------
 
@@ -139,23 +144,22 @@ except Exception as _exc:  # noqa: BLE001
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-# Inventory gets its OWN log file (under misc/, PLAN 7 §D) — it used to share
-# `execution_export.log` with 02_Export, so the two runs' records landed in one file.
-_logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_INVENTORY_LOG))
+# PLAN 16.1: the log is the run output itself — the cell (log_level) + the driver log (always DEBUG).
+# No log file is written.
+_logger.configure_logging(run_id=cfg.run_id, stage="INVENTORY",
+                          level=dbutils.widgets.get("log_level") or "INFO")
 
-result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
+with _logger.live_run("INVENTORY"):
+    result = InventoryRunner(client, cfg, aw, dbutils=dbutils).run()
 
-print("\n=== Inventory complete ===")
+_say("=== Inventory complete ===")
 for k, v in sorted(result["counts"].items()):
-    print(f"  {k:<22} {v:>6}")
-print("\nIdentity classification:", result["identity_summary"])
+    _say(f"  {k:<22} {v:>6}")
+_say(f"Identity classification: {result['identity_summary']}")
 if result["warnings"]:
-    print("\nWarnings:")
+    _say("Warnings:")
     for w in result["warnings"]:
-        print("  -", w)
-print(f"\nArtifacts: {result['output_path']}")
-print("  reports/inventory.xlsx  ·  misc/inventory.json  ·  misc/identity_classification.json")
-
-# Push the last log records to the Volume (the log is appended locally, then mirrored — append
-# straight onto a UC Volume silently fails, which used to truncate the log to one line).
-_logger.flush_log_file()
+        _say(f"  - {w}")
+_say(f"Artifacts: {result['output_path']}")
+_say("  reports/inventory.xlsx  ·  misc/inventory.json  ·  misc/identity_classification.json")
+_say(_logger.FULL_LOG_HINT)

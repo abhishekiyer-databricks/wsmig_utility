@@ -27,7 +27,8 @@
           "max_scim": "0",
           "max_workspace_items": "0",
           "max_ws_api_calls": "0",
-          "force_full": "false"
+          "force_full": "false",
+          "log_level": ""
         }
       }
     },
@@ -61,7 +62,8 @@
           "migrate_dashboards": "true",
           "migrate_serving": "true",
           "migrate_genie": "true",
-          "migrate_misc": "true"
+          "migrate_misc": "true",
+          "log_level": ""
         }
       },
       "depends_on": [
@@ -99,7 +101,8 @@
           "account_id": "",
           "user_domain_mapping": "",
           "user_id_mapping": "",
-          "pause_job_schedules": "true"
+          "pause_job_schedules": "true",
+          "log_level": ""
         }
       },
       "depends_on": [

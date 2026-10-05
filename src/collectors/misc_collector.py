@@ -46,11 +46,14 @@ class MiscCollector(BaseCollector):
         items = []
         for s in raw:
             sid = safe_str(s.get("script_id"))
+            self.log.debug(f"collecting global init script {sid}")
             script = {}
             try:
                 script = self.client.get(f"api/2.0/global-init-scripts/{sid}") or {}
             except Exception as exc:  # noqa: BLE001
                 self.log.warning("gis detail failed", script_id=sid, error=str(exc))
+            self.log.debug(f"collected global init script {sid} "
+                           f"(body={'yes' if script.get('script') else 'NO'})")
             items.append({
                 "misc_type": "global_init_script",
                 "script_id": sid,

@@ -35,6 +35,9 @@ dbutils.widgets.text("max_ws_api_calls", "0", "Max workspace/list calls (0 = unl
 dbutils.widgets.text("content_fetch_workers", "8", "Parallel content-fetch workers")
 dbutils.widgets.dropdown("force_full_export", "false", ["true", "false"],
                          "Ignore checkpoint/resume — re-export everything")
+# Cell output level (the driver log — Compute → Driver logs → Standard error — is ALWAYS DEBUG).
+dbutils.widgets.dropdown("log_level", "INFO", ["DEBUG", "INFO", "WARNING", "ERROR"],
+                         "Cell log level (driver log is always DEBUG)")
 # Per-asset toggles (all default true; set false to skip a family — still recorded as 'skip').
 # These are BUNDLE scope and belong on the source side; import narrows with `import_assets` instead.
 for _t in ["identity", "compute", "workspace", "secrets", "jobs", "sql", "dlt",
@@ -77,15 +80,17 @@ def _add_repo_root_to_syspath() -> str:
 
 
 _REPO_ROOT = _add_repo_root_to_syspath()
-print(f"repo root on sys.path: {_REPO_ROOT}")
 
 from src.config.config_manager import Config, STAGE_EXPORT
 from src.auth.token_manager import build_clients
-from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter
 from src.exporters.bundle_state import resolve_export_run_id
 from src.exporters.export_runner import ExportRunner
 from src.utils import logger as _logger
+
+# Every line below goes to BOTH outputs: the cell (at `log_level`) and the driver log (always DEBUG).
+_say = _logger.get_logger("notebook").info
+_say(f"repo root on sys.path: {_REPO_ROOT}")
 
 # COMMAND ----------
 
@@ -106,9 +111,9 @@ if not _widget_run_id:
         _tv = dbutils.jobs.taskValues.get(taskKey="inventory", key="run_id", debugValue="")
         if _tv:
             _widget_run_id = str(_tv).strip()
-            print(f"run_id taken from Inventory task values: {_widget_run_id}")
-    except Exception as _exc:
-        pass  # not a 2-task job / no task values — fall through to pointer/resume
+            _say(f"run_id taken from Inventory task values: {_widget_run_id}")
+    except Exception as _exc:  # expected: not a 2-task job / no task values → pointer/resume
+        _logger.get_logger("notebook").debug(f"no inventory task value for run_id: {_exc}")
 
 _force_full = (dbutils.widgets.get("force_full_export") or "false").strip().lower() == "true"
 _run_id, _how = resolve_export_run_id(cfg, _widget_run_id, _force_full)
@@ -118,10 +123,10 @@ cfg.run_id = _run_id
 # source_workspace_url in `direct`. The exporter is unchanged either way; only which client it gets.
 source_client, local_client = build_clients(cfg, dbutils=dbutils, spark=spark)
 client = source_client
-print(f"Source workspace : {client.base_url}"
-      + (f"   (read over REST from {cfg.ctx.workspace_url})" if cfg.is_direct else ""))
-print(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
-print(f"Bundle           : {cfg.output_path}")
+_say(f"Source workspace : {client.base_url}"
+     + (f"   (read over REST from {cfg.ctx.workspace_url})" if cfg.is_direct else ""))
+_say(f"Run id           : {cfg.run_id}  (resolved via: {_how})")
+_say(f"Bundle           : {cfg.output_path}")
 
 # COMMAND ----------
 
@@ -130,35 +135,36 @@ print(f"Bundle           : {cfg.output_path}")
 # COMMAND ----------
 
 aw = ArtifactWriter(cfg, dbutils=dbutils, spark=spark)
-_logger.set_log_file(os.path.join(aw.ensure_output_path(), BP.EXECUTION_EXPORT_LOG))
+aw.ensure_output_path()
+# PLAN 16.1: the log is the run output itself — the cell (log_level) + the driver log (always DEBUG).
+# No log file is written.
+_logger.configure_logging(run_id=cfg.run_id, stage="EXPORT",
+                          level=dbutils.widgets.get("log_level") or "INFO")
 
 _workers = int((dbutils.widgets.get("content_fetch_workers") or "8") or 8)
-result = ExportRunner(client, cfg, aw, dbutils=dbutils,
-                      content_fetch_workers=_workers,
-                      force_full_export=_force_full).run()
+with _logger.live_run("EXPORT"):
+    result = ExportRunner(client, cfg, aw, dbutils=dbutils,
+                          content_fetch_workers=_workers,
+                          force_full_export=_force_full).run()
 
-print("\n=== Export complete ===")
-print(f"  total            {result['total']:>6}")
+_say("=== Export complete ===")
+_say(f"  total            {result['total']:>6}")
 for k in ("success", "failure", "skipped_oversize", "manual", "dab", "skip"):
-    print(f"  {k:<16} {result.get(k, 0):>6}")
+    _say(f"  {k:<16} {result.get(k, 0):>6}")
 # Export status says what we CAPTURED; import action says what the target side will DO with it.
 # They're different questions — a "Skipped (DAB)" unit still lands on target, via the customer's
 # bundle redeploy — so print both. Same two columns as every sheet in export_status.xlsx.
-print("\n=== Import actions (what the TARGET side will do) ===")
+_say("=== Import actions (what the TARGET side will do) ===")
 for _act, _n in sorted((result.get("action_counts") or {}).items(), key=lambda kv: -kv[1]):
-    print(f"  {_act or '(none)':<20} {_n:>6}")
-print(f"\nBundle: {result['output_path']}")
-print("  export/ + misc/export_index.json + export/acls.json + reports/export_status.xlsx + "
-      "misc/manifest.json")
+    _say(f"  {_act or '(none)':<20} {_n:>6}")
+_say(f"Bundle: {result['output_path']}")
+_say("  export/ + misc/export_index.json + export/acls.json + reports/export_status.xlsx + "
+     "misc/manifest.json")
 
 # Verify the manifest we just wrote checksums cleanly (handoff-integrity self-check).
 _verify = aw.verify_manifest()
-print(f"\nManifest self-check: {'OK' if _verify['ok'] else 'PROBLEM'}")
+_say(f"Manifest self-check: {'OK' if _verify['ok'] else 'PROBLEM'}")
 if not _verify["ok"]:
-    print("  missing:", _verify["missing"][:10])
-    print("  mismatched:", _verify["mismatched"][:10])
-
-# Push the last log records to the Volume (the log is appended locally, then mirrored — append
-# straight onto a UC Volume silently fails, which used to truncate the log to one line). Runs
-# AFTER the manifest, which is why the manifest deliberately excludes execution_*.log.
-_logger.flush_log_file()
+    _logger.get_logger("notebook").error(f"  missing: {_verify['missing'][:10]}")
+    _logger.get_logger("notebook").error(f"  mismatched: {_verify['mismatched'][:10]}")
+_say(_logger.FULL_LOG_HINT)

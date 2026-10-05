@@ -27,13 +27,22 @@ import time
 from typing import Optional
 
 from src.exporters import bundle_paths as BP
-from src.importers.phases import (FAMILY_ASSET_TYPES, PHASE_ORDER, asset_types_for, ordered,
-                                  validate_selection)
-from src.state.state_store import ACTION_NOT_SELECTED, StateStore
+from src.importers.phases import (FAMILY_ASSET_TYPES, LEGACY_CHECKPOINT_TYPE, PHASE_ORDER,
+                                  asset_types_for, ordered, validate_selection)
+from src.state.state_store import ACTED_STATUSES, ACTION_NOT_SELECTED, StateStore
 from src.utils.helpers import now_iso, safe_str
-from src.utils.logger import get_logger
+from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 
 _LOG = get_logger("import")
+
+
+# run_status when every phase ran but the final state save failed (PLAN 16.1 §4.2): the target was
+# changed, but the source→target id map was NOT persisted. The notebook raises on it so the job
+# goes red; the checkpoint recovery replay re-merges the rows on the next run.
+RUN_STATUS_STATE_NOT_SAVED = "completed_state_not_saved"
+
+
+_DASHBOARD_CHILD_TYPES = ("lakeview_dashboard_publish", "lakeview_dashboard_schedule")
 
 
 class BundleVerificationError(RuntimeError):
@@ -92,7 +101,9 @@ def _has_import_checkpoint(run_dir_path: str) -> bool:
     try:
         with open(p, encoding="utf-8") as f:
             cp = json.load(f) or {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — degraded: an unreadable checkpoint is not resumable
+        _LOG.warning(f"checkpoint unreadable — this run dir is not treated as a resumable import: "
+                     f"{exc}", path=p)
         return False
     return any(str(k).startswith("import:") for k in cp)
 
@@ -125,10 +136,13 @@ class ImportRunner:
         `skip_manifest_verify` exists only for a customer who deliberately hand-pruned a bundle, and
         it stamps a loud warning into the report rather than passing silently.
         """
+        _LOG.info("Phase: verify bundle manifest")
+        t0 = time.time()
         if self.config.imports.skip_manifest_verify:
             _LOG.warning("MANIFEST VERIFICATION SKIPPED by skip_manifest_verify=true — the bundle "
                          "was NOT checked for completeness; a partial upload will present as a "
                          "partial migration")
+            _LOG.info("Phase complete: verify bundle manifest — SKIPPED")
             return {"ok": True, "skipped": True, "missing": [], "mismatched": []}
         verify = self.aw.verify_manifest()
         if not verify["ok"]:
@@ -139,7 +153,10 @@ class ImportRunner:
                 f"  checksum mismatch ({len(verify['mismatched'])}): {verify['mismatched'][:10]}\n"
                 "Re-copy the whole run directory from the source staging location, or set "
                 "skip_manifest_verify=true if you deliberately pruned it.")
-        _LOG.info("bundle verified", files=len(verify["manifest"].get("files", [])))
+        _LOG.info(f"Phase complete: verify bundle manifest — "
+                  f"{len((verify.get('manifest') or {}).get('files', [])):,} files, "
+                  f"{len(verify['missing'])} missing, {len(verify['mismatched'])} mismatched "
+                  f"({fmt_elapsed(time.time() - t0)})")
         return verify
 
     def check_pointer_matches_bundle(self) -> Optional[str]:
@@ -191,20 +208,29 @@ class ImportRunner:
         summary: dict = {}
         try:
             # ── whole-run preconditions, all BEFORE any unit is attempted ──
+            _LOG.info("import run starting", run_id=self.config.run_id,
+                      dry_run=self.config.dry_run, bundle=self.aw.root)
             self.verify_bundle()
             pointer_note = self.check_pointer_matches_bundle()
             if pointer_note:
                 _LOG.info("export pointer note", note=pointer_note)
             self.enforce_preflight()
 
-            index = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
             units_by_type = self._units_from_bundle()
 
             # ── state: ensure + recovery replay BEFORE any decision ────────
             if self.state is not None and self.state.enabled:
+                _LOG.info("Phase: load migration state")
+                t_state = time.time()
                 self.state.ensure_table()
-                self.state.load(force=True)
-                self.state.recovery_replay(self._all_checkpoint_outcomes())
+                self.state.load(force=True)    # count-checked; raises StateLoadError on a gap
+                replayed = self.state.recovery_replay(self._all_checkpoint_outcomes())
+                _LOG.info(f"Phase complete: load migration state — {len(self.state._cache):,} "
+                          f"rows, recovery replay merged {replayed:,} "
+                          f"({fmt_elapsed(time.time() - t_state)})")
+            else:
+                _LOG.info("state store disabled (dry run without state_catalog) — every unit is "
+                          "decided from the live existence check alone")
 
             # ── selection + prerequisite validation ────────────────────────
             selected = list(self.config.imports.selected_families)
@@ -221,7 +247,9 @@ class ImportRunner:
             self._record_not_selected(units_by_type, selected)
 
             # ── phases ────────────────────────────────────────────────────
-            for family in ordered(selected):
+            families = ordered(selected)
+            for i, family in enumerate(families, 1):
+                _LOG.info(f"family {i}/{len(families)}: {family}")
                 self._run_phase(family, units_by_type)
 
             # ── deleted-in-source detection (report only, D5) ─────────────
@@ -232,18 +260,33 @@ class ImportRunner:
             # incomplete, so an aborted run never looks clean.
             self.run_status = "aborted"
             summary["abort_reason"] = str(exc)
-            _LOG.error("import run aborted", error=str(exc))
+            _LOG.error(f"import run aborted: {type(exc).__name__}: {exc}", exc_info=True)
             raise
         finally:
             # Run-level flush (§7a level 3): even a KeyboardInterrupt / job timeout persists the
             # state rows and writes a partial results file marked aborted.
             if self.state is not None:
+                _LOG.info("final state flush")
                 self.state.flush()
+                if getattr(self.state, "flush_failed", False) and self.run_status == "completed":
+                    # Every phase ran, but the id map was NOT saved — the job must go red rather
+                    # than finish green with target objects the state table doesn't know about.
+                    self.run_status = RUN_STATUS_STATE_NOT_SAVED
+                    _LOG.error("the final state save FAILED — run_status=completed_state_not_saved. "
+                               "The target WAS changed; the checkpoint recovery replay re-merges "
+                               "the rows on the next run. Fix the state table, then re-run.")
             summary.update(self._summarize(t0))
             try:
                 self._write_reports(summary)
             except Exception as exc:  # noqa: BLE001 — reporting must not mask the real error
-                _LOG.warning("report writing failed", error=str(exc))
+                _LOG.warning("report writing failed", error=str(exc), exc_info=True)
+            totals = summary.get("totals") or {}
+            _LOG.info(f"import run {summary.get('run_status')} — "
+                      + fmt_counts({k: totals.get(k, 0) for k in
+                                    ("total", "created", "updated", "adopted", "skipped",
+                                     "created_with_warning", "manual", "skipped_no_object",
+                                     "failed")})
+                      + f" ({fmt_elapsed(time.time() - t0)})")
         return summary
 
     # ── bundle reading ────────────────────────────────────────────────────
@@ -254,12 +297,20 @@ class ImportRunner:
         per-asset files carry the payloads. Joining them means a unit with no payload still gets a
         reported outcome rather than vanishing — "never silently skip" (§1.7).
         """
+        from src.exporters.artifact_writer import read_json_or_empty
         from src.exporters.asset_export import ARTIFACT_PATH
-        index = self.aw.read_json(BP.EXPORT_INDEX_JSON) or {}
+        _LOG.info("Phase: read bundle")
+        t0 = time.time()
+        index = read_json_or_empty(self.aw, BP.EXPORT_INDEX_JSON, "NO units (nothing to import)")
         payloads: dict[tuple, dict] = {}
         for rel in sorted(set(ARTIFACT_PATH.values())):
-            doc = self.aw.read_json(rel) or {}
-            for u in doc.get("units", []) or []:
+            # A per-asset payload file is legitimately absent when its family had no auto/content
+            # units, so its absence is DEBUG, not a warning; the index is the ledger.
+            doc = self.aw.read_json(rel)
+            if doc is None:
+                _LOG.debug(f"bundle payload file {rel} absent (no payload-bearing units)")
+                continue
+            for u in (doc or {}).get("units", []) or []:
                 payloads[(safe_str(u.get("asset_type")), safe_str(u.get("natural_key")))] = u
 
         out: dict[str, list] = {}
@@ -280,6 +331,9 @@ class ImportRunner:
             else:
                 unit.setdefault("payload", {})
             out.setdefault(at, []).append(unit)
+        _LOG.info(f"Phase complete: read bundle — {sum(len(v) for v in out.values()):,} units, "
+                  f"{len(payloads):,} payloads ({fmt_elapsed(time.time() - t0)})",
+                  **{at: len(v) for at, v in sorted(out.items())})
         return out
 
     def _all_checkpoint_outcomes(self) -> dict:
@@ -299,16 +353,21 @@ class ImportRunner:
                     # the family maps to exactly ONE type, else skip (better than guessing wrong —
                     # a mis-keyed replay row would write state against the wrong asset_type).
                     types = FAMILY_ASSET_TYPES.get(family, ())
-                    if len(types) != 1:
+                    if len(types) == 1:
+                        at = types[0]
+                    elif family in LEGACY_CHECKPOINT_TYPE:
+                        at = LEGACY_CHECKPOINT_TYPE[family]
+                    else:
                         continue
-                    at = types[0]
                 out[f"{at}|{key}"] = row
         return out
 
     def staging_results(self, component: str) -> dict:
         try:
             return self.aw.get_results(component)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — degraded: nothing to replay for this family
+            _LOG.warning(f"could not read checkpoint outcomes for {component} — none replayed: "
+                         f"{exc}")
             return {}
 
     # ── phases ────────────────────────────────────────────────────────────
@@ -347,6 +406,15 @@ class ImportRunner:
         importer.units_by_type = units_by_type
         importer.retry_keys = (self.state.retry_keys(self.config.imports.retry_mode)
                                if self.state is not None else None)
+        if importer.retry_keys is not None and hasattr(importer, "retry_keys_following"):
+            # PLAN 16.2 §5a: a retry that HEALS an object must also apply its ACL in the same run.
+            # The ACL unit sat as `skipped_no_object` (not in the failed bucket), so without this a
+            # failed_only retry healed 143 objects and applied 0 of their grants (16.1 QA Run 3).
+            extra = importer.retry_keys_following(self._acted_this_run()) - importer.retry_keys
+            if extra:
+                _LOG.info(f"retry: {len(extra):,} {family} unit(s) of objects acted on this run "
+                          f"join the work list")
+                importer.retry_keys = set(importer.retry_keys) | extra
         try:
             self.results.append(importer.run())
         finally:
@@ -354,7 +422,25 @@ class ImportRunner:
             # upward, and a normal phase end flushes so the next phase sees a complete id map.
             importer.flush_checkpoint()
             if self.state is not None:
-                self.state.flush()
+                t_flush = time.time()
+                _LOG.debug(f"state flush after phase {family} started")
+                written = self.state.flush()
+                _LOG.info(f"state flush after phase {family} — {written:,} rows "
+                          f"({fmt_elapsed(time.time() - t_flush)})"
+                          + (" — FAILED, rows still pending"
+                             if getattr(self.state, "flush_failed", False) else ""))
+
+    def _acted_this_run(self) -> set:
+        """`{(asset_type, natural_key)}` of every unit this run created / updated / adopted (incl.
+        created_with_warning) — the objects whose dependents follow them on a retry (§5a)."""
+        out: set = set()
+        for res in self.results:
+            for row in res.units:
+                if row.get("retry_out_of_scope"):
+                    continue
+                if safe_str(row.get("import_status")) in ACTED_STATUSES:
+                    out.add((safe_str(row.get("asset_type")), safe_str(row.get("natural_key"))))
+        return out
 
     def _record_not_selected(self, units_by_type: dict, selected: list) -> None:
         """Record deferred families as `not_selected` — deferred work must be visible, not absent.
@@ -365,6 +451,9 @@ class ImportRunner:
         if self.state is None or not self.state.enabled:
             return
         deferred = [f for f in PHASE_ORDER if f not in selected]
+        if deferred:
+            _LOG.info(f"recording {len(deferred)} deselected families as not_selected",
+                      families=",".join(deferred))
         for family in deferred:
             for at in FAMILY_ASSET_TYPES.get(family, ()):
                 for unit in units_by_type.get(at, []) or []:
@@ -391,9 +480,13 @@ class ImportRunner:
         if self.state is None or not self.state.enabled:
             return
         gone: dict[str, list] = {}
+        dashboards_in_bundle = bool(units_by_type.get("lakeview_dashboard"))
         for at in asset_types_for(selected):
             present = {safe_str(u.get("natural_key")) for u in units_by_type.get(at, []) or []}
-            if not present:
+            # A dashboard's publish/schedule units are legitimately ALL gone when every source
+            # dashboard was unpublished — still compared, as long as the bundle has dashboards
+            # (PLAN 16.2 §4: a source unpublish is flagged, never acted on).
+            if not present and not (at in _DASHBOARD_CHILD_TYPES and dashboards_in_bundle):
                 continue
             missing = self.state.mark_missing_in_source(at, present)
             if missing:
@@ -402,6 +495,8 @@ class ImportRunner:
             self.state.flush()
             _LOG.info("deleted-in-source detected (reported, NOT deleted on target)", **{
                 k: len(v) for k, v in gone.items()})
+        else:
+            _LOG.info("deleted-in-source: none")
         self.context["deleted_in_source"] = gone
 
     # ── summary + reports ─────────────────────────────────────────────────
@@ -444,5 +539,9 @@ class ImportRunner:
                 _LOG.warning("could not read outstanding rows from state", error=str(exc))
         # Record the ACTUAL report paths written (they vary: dry_run / retry_<ts> / canonical) so
         # the notebook reads back the files this run produced rather than a stale canonical name.
+        _LOG.info("Phase: write import reports")
+        t0 = time.time()
         summary["reports"] = write_import_reports(
             self.aw, self.config, summary, self.results, self.context)
+        _LOG.info(f"Phase complete: write import reports ({fmt_elapsed(time.time() - t0)})",
+                  **{k: v for k, v in (summary["reports"] or {}).items() if isinstance(v, str)})

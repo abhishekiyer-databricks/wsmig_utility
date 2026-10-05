@@ -64,12 +64,19 @@ FAMILY_ASSET_TYPES: dict[str, tuple] = {
     "jobs": ("job",),
     "sql": ("sql_warehouse", "legacy_query", "legacy_alert", "legacy_dashboard", "alert_v2"),
     "dlt": ("dlt_pipeline",),
-    "dashboards": ("lakeview_dashboard",),
+    # PLAN 16.2 §4: publish state + schedules are their own units, created AFTER their dashboard.
+    "dashboards": ("lakeview_dashboard", "lakeview_dashboard_publish",
+                   "lakeview_dashboard_schedule"),
     "genie": ("genie_space",),
     "serving": ("serving_endpoint",),
     "misc": ("global_init_script", "cluster_library", "workspace_conf"),
     "acls": ("acl",),
 }
+
+# A checkpoint row written before `asset_type` was carried (a `main` checkpoint) can only be keyed
+# by inferring its type from the family. That needs ONE type per family — except `dashboards`, which
+# gained its publish/schedule types in 16.2: `main` never wrote those, so its rows are dashboards.
+LEGACY_CHECKPOINT_TYPE = {"dashboards": "lakeview_dashboard"}
 
 # The coarse `migrate_*` toggle that governs each family, so import can report "this family is not
 # in the bundle because export was told to skip it" rather than silently doing nothing.

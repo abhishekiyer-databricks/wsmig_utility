@@ -21,6 +21,9 @@ from typing import Optional
 
 from src.exporters import bundle_paths as BP
 from src.utils.helpers import now_iso
+from src.utils.logger import get_logger
+
+_LOG = get_logger("bundle_state")
 
 
 # ── path helpers ───────────────────────────────────────────────────────────
@@ -73,7 +76,8 @@ def read_latest_pointer(config) -> Optional[dict]:
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:  # noqa: BLE001 — a garbled pointer is treated as absent
+    except Exception as exc:  # noqa: BLE001 — degraded: a garbled pointer is treated as absent
+        _LOG.warning(f"LATEST_INVENTORY.json is unreadable — treated as absent: {exc}", path=p)
         return None
 
 
@@ -120,7 +124,8 @@ def read_latest_export_pointer(config) -> Optional[dict]:
     try:
         with open(p, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — degraded: a garbled pointer is treated as absent
+        _LOG.warning(f"LATEST_EXPORT.json is unreadable — treated as absent: {exc}", path=p)
         return None
 
 

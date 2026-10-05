@@ -14,8 +14,9 @@ The step-by-step guide to running a real migration. Follow it top to bottom. Eve
 4. [Path B — `airgap` mode](#-path-b--airgap-mode)
 5. [Reading the outputs](#-reading-the-outputs)
 6. [Handling failures & manual actions](#-handling-failures--manual-actions)
-7. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
-8. [Quick reference card](#-quick-reference-card)
+7. [Dashboards: publish, credentials, schedules](#-dashboards-publish-credentials-schedules)
+8. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
+9. [Quick reference card](#-quick-reference-card)
 
 ---
 
@@ -233,7 +234,9 @@ Fix the cause, then re-run only the outstanding units.
    server message** + a remediation hint).
 2. Fix the cause (grant a permission, assign an identity, create an AKV scope, etc.).
 3. Re-run `04_Import` with **`retry_mode=failed_only`** — only the failed/degraded units re-run.
-   Every re-run still makes the full upsert decision, so a retry can **never** duplicate.
+   Every re-run still makes the full upsert decision, so a retry can **never** duplicate. When a
+   retry **heals** an object, its permissions are applied in the same run (and a healed AI/BI
+   dashboard comes back published and scheduled) — no second `import_assets=acls` pass needed.
 
 **Common manual actions** (from `manual_actions_import.md`):
 
@@ -254,6 +257,68 @@ Fix the cause, then re-run only the outstanding units.
 > warehouse's `CAN_USE` grant is replayed (**ACLs run last**). A plain **`retry_mode=failed_only`**
 > re-run fixes it — the grant is now in place. No manual grant is needed when that `CAN_USE` existed
 > on the source (it's migrated with the warehouse's ACLs).
+
+> 💥 **If the import job died mid-run** (driver out of memory, node lost, job killed or timed out):
+> just re-run it — with the **same `run_id`** if you can, so it resumes from the checkpoint. The state
+> table is saved every **200 objects or 5 minutes**, whichever comes first, plus at the end of every
+> phase, so at most ~5 minutes / < 200 objects of bookkeeping are lost; the re-run finds those objects
+> on the target and adopts them instead of creating them again. **One exception:** AI/BI dashboards,
+> Genie spaces, SQL alerts and legacy SQL queries created in those last minutes can't be told apart by
+> name, so the re-run may create an **exact duplicate**. After a crashed run, check the dashboards /
+> Genie spaces / alerts / queries it created and delete any duplicate by hand.
+
+> 🧾 **`02_Export` refuses to start without an inventory.** If `misc/inventory.json` for the
+> resolved `run_id` is missing, unreadable or incomplete, the export task goes red with the path and
+> `run_id` in the message and writes nothing. Run `01_Inventory` first, or pass the `run_id` of a
+> completed inventory. Export never re-runs the inventory by itself.
+
+> 📁 **`.db_internal`, `.ide` and `.databricks` folders** are Databricks-owned. They are listed in
+> the inventory and reports as **Skipped — platform-internal**, and are never read, copied or
+> permissioned.
+
+---
+
+## 📊 Dashboards: publish, credentials, schedules
+
+AI/BI (Lakeview) dashboards arrive on the target in the **same state as on the source**:
+
+| On the source | On the target |
+|---------------|---------------|
+| Draft only | Draft only |
+| Published | Published, with the **same credentials mode** |
+| Published + scheduled | Published + every schedule (cron, timezone, name, warehouse) + its subscribers |
+| Permissions | Copied as-is. Draft and published share one ACL, so there is nothing extra to copy |
+
+Publish state and schedules show up as their own rows in `import_status.xlsx`, on the
+**Dashboard Publish** and **Dashboard Schedules** sheets.
+
+**What you need to know:**
+
+- **Publisher credentials ("Shared data permissions").** The target dashboard is published **by the
+  migration service principal**, because no API can publish as another user (and the API does not
+  even say who the source publisher was). Viewers of a dashboard published with *publisher
+  credentials* query with the **service principal's** data access, not the original publisher's.
+  To restore the original owner's credentials, **have the owner re-publish it** on the target.
+- **Published content = the source draft.** No API returns the content of a published revision,
+  so the target is published from the source's **current draft**. If the source draft has edits
+  that were never published, the target's published version includes them. The row is flagged
+  `Created (warning)` with "source draft has unpublished changes".
+- **Viewer credentials ("Individual data permissions") subscribers can't be recreated.** On such a
+  dashboard Databricks only lets each user subscribe **themselves**. The schedule row carries ONE
+  note listing every subscriber (also a line in `manual_actions_import.md`). Ask those users to
+  re-subscribe.
+- **Schedules are created PAUSED** when `pause_job_schedules=true` (the default, same rule as jobs):
+  the source keeps running during the migration, and an unpaused copy would refresh twice and email
+  every subscriber twice. Resume them at cutover.
+- **Notification destinations are not created by the tool.** A destination subscriber is matched to
+  a target destination with the same name and type. If there is none, the row says
+  `create notification destination <name> on target, then re-run`. A plain re-run then adds it.
+  The same applies to a subscribed user who is not on the target yet.
+- **Nothing is ever unpublished or deleted.** If the source dashboard is unpublished or a schedule
+  is deleted, the report flags it as **Deleted in source**. Unpublish / delete it by hand if that
+  is intended, even with `allow_deletes=true`.
+- An identical schedule that already exists on the target (same cron, timezone and name, for
+  example one a person recreated by hand) is **adopted**, never duplicated.
 
 ---
 

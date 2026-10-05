@@ -35,6 +35,7 @@ class GenieCollector(BaseCollector):
         items = []
         for s in raw:
             sid = safe_str(s.get("space_id") or s.get("id"))
+            self.log.debug(f"collecting genie space {sid}")
             detail = self._space_detail(sid)
             # Genie spaces expose no deployment field; the list carries only `parent_path`
             # (coarser than dashboards' `path`), so DAB detection keys off that `.bundle/` folder.
@@ -55,6 +56,8 @@ class GenieCollector(BaseCollector):
                 "acl": self.fetch_acl("genie", sid),   # ACLs (Plan 1a §1)
                 "_raw": s,
             })
+            self.log.debug(f"collected genie space {sid} ({items[-1]['title']}, "
+                           f"serialized_space={'yes' if items[-1]['has_serialized_space'] else 'NO'})")
         return items
 
     def _space_detail(self, space_id: str) -> dict:

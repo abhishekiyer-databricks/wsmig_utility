@@ -168,7 +168,8 @@ class ComputeImporter(BaseImporter):
         as_string = isinstance(definition, str)
         try:
             doc = json.loads(definition) if as_string else definition
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:   # expected: leave an unparseable definition as-is
+            self.log.debug(f"policy definition not JSON — left verbatim ({str(exc)[:120]})")
             return definition, []
         if not isinstance(doc, dict):
             return definition, []
@@ -277,5 +278,6 @@ class ComputeImporter(BaseImporter):
         try:
             self.client.post("api/2.0/clusters/pin", {"cluster_id": cluster_id})
             return "re-pinned (as on source)"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — degraded: the cluster exists, unpinned
+            self.log.warning(f"cluster {cluster_id}: could not re-pin: {str(exc)[:200]}")
             return f"could not re-pin ({str(exc)[:100]})"

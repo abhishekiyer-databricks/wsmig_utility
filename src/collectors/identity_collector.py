@@ -145,14 +145,19 @@ class IdentityCollector(BaseCollector):
         """
         if not scim_id:
             return False
+        self.log.debug(f"checking OAuth secrets of service principal {scim_id}")
         try:
             data = self.client.get(
                 f"api/2.0/accounts/servicePrincipals/{scim_id}/credentials/secrets")
-            return bool(data.get("secrets")) if isinstance(data, dict) else False
+            has = bool(data.get("secrets")) if isinstance(data, dict) else False
+            self.log.debug(f"service principal {scim_id} → has_secrets={has}")
+            return has
         except Exception as exc:  # noqa: BLE001
-            # One systemic permission gap would otherwise log once per SP; record it and let the
-            # collector emit a single summary warning at the end of the SP pass.
+            # One systemic permission gap would otherwise WARN once per SP; record it and let the
+            # collector emit a single summary warning at the end of the SP pass (the per-SP detail
+            # stays in the driver log).
             self._secret_check_failures.append((scim_id, str(exc)))
+            self.log.debug(f"service principal {scim_id} → has_secrets=UNKNOWN: {exc}")
             return None
 
     def _groups(self, max_scim: int) -> list[dict]:

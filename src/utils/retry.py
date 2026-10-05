@@ -9,6 +9,10 @@ from __future__ import annotations
 import time
 from typing import Callable, TypeVar
 
+from src.utils.logger import get_logger
+
+_LOG = get_logger("retry")
+
 T = TypeVar("T")
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -52,6 +56,11 @@ def with_retry(
             wait = min(backoff * (2 ** attempt), max_sleep)
             if exc.retry_after is not None:
                 wait = max(wait, exc.retry_after)
+            # Visible BEFORE the sleep, so a run backing off on 429s never looks stuck.
+            what = str(exc).rsplit(" -> ", 1)[0]   # "<METHOD> <url>" (callers' message shape)
+            _LOG.warning(f"retrying {what} after {exc.status} in {wait:g}s "
+                         f"(attempt {attempt + 1}/{max_attempts})")
             sleep_fn(wait)
     assert last_exc is not None
+    _LOG.warning(f"giving up on {last_exc} after {max_attempts} attempts")
     raise last_exc

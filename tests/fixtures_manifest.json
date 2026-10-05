@@ -1,0 +1,70 @@
+{
+  "description": "Medium-size reusable fixture bed for PLAN 16 QA — documents structure, not dynamic IDs",
+  "phases_ordered": [
+    "check", "identity", "warehouses", "uc", "compute", "workspace", "secrets", "akv",
+    "sql", "genie", "dashboards", "jobs", "dlt", "serving", "misc", "dab", "dab_pathless",
+    "bigfiles", "libraries", "b3_policy_family", "b7_dashboards", "orphaned_users", "acls",
+    "incremental"
+  ],
+  "phases": {
+    "check": "Read-only prerequisite report (CLI profiles, identities, catalog)",
+    "identity": "15 Entra users, 3 account SPs, 2 UMI SPs (looked up), 2 Entra groups (looked up), 2 account groups (nested)",
+    "warehouses": "1 Pro SQL warehouse, 1 Serverless SQL warehouse",
+    "uc": "UC tables (trips, zones) for dashboards/Genie/DLT to reference",
+    "compute": "3 instance pools, 2 cluster policies, 1 policy-family policy",
+    "workspace": "Per-user content (/Users/<email>/wsmig/), /Shared tree, git folder (metadata only)",
+    "secrets": "1 Databricks-backed secret scope with 2 secrets and ACLs",
+    "akv": "1 Azure Key Vault-backed secret scope (manual migration expected)",
+    "sql": "1 SQL warehouse (pro), 2 legacy SQL queries, 2 alerts v2",
+    "genie": "2 Genie spaces with UC table references and ACLs",
+    "dashboards": "6 AI/BI dashboards: draft, published (2 credential modes), scheduled (with ACLs)",
+    "jobs": "11 jobs: notebook/sql/python/dbt/run_job/pipeline tasks, scheduled, multi-task, job_clusters",
+    "dlt": "3 DLT pipelines: serverless, classic, continuous",
+    "serving": "1 external-model serving endpoint",
+    "misc": "2 global init scripts, workspace conf (non-default values)",
+    "dab": "2 DAB bundles: one under /Shared, one under user dir, each with job+pipeline+dashboard",
+    "dab_pathless": "DAB bundle without .bundle folder structure",
+    "bigfiles": "1 file > 10 MB (streaming route), 1 notebook > export cap (manual expected)",
+    "libraries": "1 cluster library on a TERMINATED cluster (fail→heal via retry+force_start)",
+    "b3_policy_family": "1 cluster policy created from policy_family_id (PLAN 13 B3 case)",
+    "b7_dashboards": "6 published/scheduled dashboard combinations (PLAN 13 B7 matrix)",
+    "orphaned_users": "2 of 15 users unassigned from workspace (deleted_in_source on import)",
+    "acls": "Cross-user/group/SP grants on all object types",
+    "incremental": "Run 2 seed: edits to existing objects, new user, group membership change"
+  },
+  "identities": {
+    "entra_users": "15 from WSMIG_USERS env (default: 15 Databricks emails)",
+    "account_sps": ["ai27_acc_spn_1", "ai27_acc_spn_2", "ai27_acc_spn_3"],
+    "umi_sps": ["ai27_umi_1", "ai27_umi_2"],
+    "account_groups": {
+      "ai27_account_grp_1": "parent (contains grp_2 nested)",
+      "ai27_account_grp_2": "nested in grp_1"
+    },
+    "entra_groups": ["ai27_entragrp_1", "ai27_entragrp_2"]
+  },
+  "expected_migration_outcome": {
+    "full_migrate": [
+      "All 15 users content (2 orphaned diverted to /Users_Backup per PLAN 9)",
+      "3 account SPs, 2 Entra+2 account groups (assign, never recreate)",
+      "All compute, jobs (all task types), DLT, SQL, Genie, serving, misc",
+      "Workspace conf (non-defaults visible on target)"
+    ],
+    "manual_step": [
+      "AKV secret scope (AAD token not obtainable in notebooks)",
+      "Legacy SQL dashboards + alerts (create API deprecated)",
+      "Git repos (metadata, recreate manually)",
+      "Big files >export cap (streaming upload)"
+    ],
+    "skip_dab": [
+      "DAB-deployed assets (marked skip in export, never imported)"
+    ],
+    "acl_parity": "All cross-user/group/SP grants remapped per identity_map.json"
+  },
+  "env_vars": {
+    "WSMIG_PROFILE": "source workspace CLI profile (default: source_ws)",
+    "WSMIG_ACCT_PROFILE": "account console profile (default: source_acct)",
+    "WSMIG_CATALOG": "UC catalog for fixture tables (default: workspace default catalog)",
+    "WSMIG_USERS": "comma-separated 15 Entra emails (default: 15 Databricks emails)",
+    "WSMIG_CLI": "databricks CLI for bundle deploys (needs >= 1.5.0)"
+  }
+}

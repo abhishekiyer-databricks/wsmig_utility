@@ -34,13 +34,24 @@ def _read_tool_version() -> str:
             v = fh.read().strip()
             if v:
                 return v
-    except Exception:
-        pass
+    except Exception:   # expected + harmless: a stripped install without VERSION → the literal
+        pass            # (runs at import time, before any logger is configured — nothing to log)
     return "1.0.0"
 
 
 TOOL_VERSION = _read_tool_version()
 _LOG = get_logger("artifact_writer")
+
+
+def read_json_or_empty(aw, rel_path: str, fallback: str = "an empty document") -> Any:
+    """`aw.read_json(rel) or {}` — but a MISSING bundle file is logged (WARNING) with the fallback
+    taken, instead of silently looking like an empty one (PLAN 16.1 §3.5, behaviour unchanged)."""
+    doc = aw.read_json(rel_path)
+    if doc is None:
+        _LOG.warning(f"{rel_path} is absent from the bundle — continuing with {fallback}",
+                     bundle=getattr(aw, "root", ""))
+        return {}
+    return doc or {}
 
 
 def _excluded_from_manifest(name: str) -> bool:
@@ -70,6 +81,13 @@ def _excluded_from_manifest(name: str) -> bool:
     if base.startswith("execution") and base.endswith(".log"):
         return True
     return base.startswith(("import_", "preflight_report", "acl_parity_report"))
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:   # expected + harmless: only feeds a DEBUG line
+        return -1
 
 
 class ArtifactWriter:
@@ -104,6 +122,7 @@ class ArtifactWriter:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
+        _LOG.debug(f"wrote {rel_path} ({_size(p):,} bytes)")
 
     def read_json(self, rel_path: str) -> Optional[Any]:
         p = self._abs(rel_path)
@@ -118,6 +137,7 @@ class ArtifactWriter:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(data)
+        _LOG.debug(f"wrote {rel_path} ({len(data):,} bytes)")
 
     def write_text_local_then_copy(self, rel_path: str, render_fn) -> Optional[str]:
         """For openpyxl/xlsx: render to a local /tmp seekable path via `render_fn(local_path)`,
@@ -139,6 +159,7 @@ class ArtifactWriter:
             with open(local, "rb") as src, open(dst, "wb") as out:
                 for chunk in iter(lambda: src.read(1024 * 1024), b""):
                     out.write(chunk)
+            _LOG.info(f"wrote {rel_path} ({os.path.getsize(local):,} bytes)", path=dst)
             return dst
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -176,9 +197,11 @@ class ArtifactWriter:
         }
 
     def write_manifest(self, asset_counts: dict) -> dict:
+        _LOG.info("building manifest (sha256 of every bundle file)")
         manifest = self.build_manifest(asset_counts)
         self.write_json(BP.MANIFEST_JSON, manifest)
-        _LOG.info("manifest written", files=len(manifest["files"]))
+        _LOG.info("manifest written", files=len(manifest["files"]),
+                  bytes=sum(f.get("bytes", 0) for f in manifest["files"]))
         return manifest
 
     def verify_manifest(self) -> dict:
@@ -188,14 +211,22 @@ class ArtifactWriter:
         """
         manifest = self.read_json(BP.MANIFEST_JSON)
         if manifest is None:
+            _LOG.warning(f"manifest verify: {BP.MANIFEST_JSON} is absent", bundle=self._root)
             return {"ok": False, "missing": ["manifest.json"], "mismatched": [], "manifest": None}
+        files = manifest.get("files", [])
+        _LOG.info(f"manifest verify started — {len(files):,} files")
         missing, mismatched = [], []
-        for entry in manifest.get("files", []):
+        for entry in files:
             p = self._abs(entry["path"])
             if not os.path.isfile(p):
                 missing.append(entry["path"])
+                _LOG.debug(f"manifest verify: MISSING {entry['path']}")
             elif self._file_checksum(p) != entry["sha256"]:
                 mismatched.append(entry["path"])
+                _LOG.debug(f"manifest verify: CHECKSUM MISMATCH {entry['path']}")
+        (_LOG.info if not missing and not mismatched else _LOG.warning)(
+            "manifest verify done", files_checked=len(files), missing=len(missing),
+            mismatched=len(mismatched))
         return {"ok": not missing and not mismatched,
                 "missing": missing, "mismatched": mismatched, "manifest": manifest}
 
@@ -240,6 +271,7 @@ class ArtifactWriter:
         if results:
             cp.setdefault(f"{component}:results", {}).update(results)
         self.write_json(BP.CHECKPOINT_JSON, cp)
+        _LOG.debug(f"checkpoint {component}: +{len(item_keys)} done (total {len(existing):,})")
 
     def get_results(self, component: str) -> dict:
         """item_key → recorded outcome dict for `component` (empty if none / older checkpoint)."""

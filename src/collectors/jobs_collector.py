@@ -28,6 +28,7 @@ class JobsCollector(BaseCollector):
         items = []
         for j in raw:
             job_id = safe_str(j.get("job_id"))
+            self.log.debug(f"collecting job {job_id}")
             # `jobs/list` OMITS run-as entirely (verified live: both `settings.run_as` and the
             # top-level `run_as_user_name` come back null on the list surface, exactly like the
             # alerts LIST drops `parent_path`). Only `jobs/get` returns it, so enrich per-id.
@@ -62,6 +63,7 @@ class JobsCollector(BaseCollector):
                 "settings": settings,   # full spec (tasks, job_clusters, schedule, continuous)
                 "_raw": full,
             })
+            self.log.debug(f"collected job {job_id} ({items[-1]['name']})")
         return items
 
     def _get_job(self, job_id: str) -> dict:
@@ -71,7 +73,10 @@ class JobsCollector(BaseCollector):
         try:
             return self.client.get("api/2.1/jobs/get", params={"job_id": job_id}) or {}
         except Exception as exc:  # noqa: BLE001 — never let one job abort discovery
+            # Degraded: the job is kept with its LIST fields (no run-as). Recorded AND logged.
             self._errors.append(f"jobs/get {job_id}: {exc}")
+            self.log.warning(f"job {job_id}: jobs/get FAILED (kept with list fields, no run-as): "
+                             f"{exc}")
             return {}
 
     @staticmethod
