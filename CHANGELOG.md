@@ -10,7 +10,29 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-05
+
+Live-tested end to end on classic compute in `direct` mode, including the upgrade from a
+1.0.0-migrated workspace (PLAN 16.1 + 16.2 QA).
+
+### Upgrade notes (from 1.0.0)
+- **Pull the latest code into the existing Git folder and run the existing jobs — no reinstall.**
+  Jobs installed by 1.0.0 work unchanged; the new `log_level` job parameter is optional (defaults to
+  `INFO`). State tables, bundles and checkpoints written by 1.0.0 are read as-is; no schema change.
+- The first upgraded run publishes the already-migrated dashboards that are published on the
+  source, recreates their schedules (**PAUSED** while `pause_job_schedules=true`, the default) and
+  applies the dashboard / Genie permissions that 1.0.0 skipped. Nothing else is rewritten.
+- Dashboards published with **publisher credentials** are published on the target by the migration
+  service principal — have the owner re-publish to restore their own credentials (Runbook).
+- The standalone import job still defaults to `dry_run=true`; pass `dry_run=false` for a live run.
+
 ### Added
+- **Logging you can debug from** (PLAN 16.1 §3). The notebook cell shows the stage, every phase
+  start/end with counts and elapsed time, a progress line every 500 objects, and every failure /
+  warning with the object, category and the server's own error. The driver log (**Compute → Driver
+  logs → Standard error**, kept 30 days) always carries the full DEBUG trace: one start and one
+  outcome line per object, every API call and decision. New `log_level` widget / job parameter
+  (cell only; default `INFO`).
 - **AI/BI dashboard publish state, schedules and subscriptions are migrated** (PLAN 16.2 §4). A
   source-published dashboard is published on the target with the same credentials mode
   (publisher / viewer); each schedule is recreated (PAUSED when `pause_job_schedules=true`) with its
@@ -39,7 +61,17 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
   restores lost rows for multi-type families (identity, compute, workspace, secrets, SQL, misc), not
   only single-type ones. Older checkpoints still replay as before.
 
+- **The migration state table can no longer be silently mis-read** (PLAN 16.1 §4). Every load
+  compares `count(*)` with the rows read and stops the run if they differ (logged as `state loaded
+  rows=N expected=N`); a failed read raises instead of looking like an empty table (which would have
+  re-created objects and dropped source edits). A MERGE can no longer blank a stored target id or
+  fingerprint, and a failed state save turns the job red (`completed_state_not_saved`).
+- Silent `except` handlers now log what they skipped (DEBUG for expected cases, WARNING when a result
+  is degraded), so gaps are visible in the log.
+
 ### Changed
+- The `execution_*.log` files are no longer written to `misc/` — the job's driver log replaces
+  them (older bundles that contain them still verify).
 - **Import state writes no longer commit once per failed object** (PLAN 16.1 §4.4). The migration
   state table and the import checkpoint are now written every 200 objects **or 5 minutes**, whichever
   comes first, plus at every phase end and run end. Before, every failure forced its own Delta MERGE

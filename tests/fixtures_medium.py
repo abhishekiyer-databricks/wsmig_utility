@@ -2655,6 +2655,196 @@ def phase_dash_matrix():
         "accepts invalid widgets).")
 
 
+DEST_ADOPT = "wsmig_test_dest"            # also pre-created on TARGET → the adopt-by-name path
+DEST_MISSING = "wsmig_test_dest_missing"  # source only → the "create destination on target" line
+
+
+def _ensure_email_destination(client, name: str, email: str) -> str:
+    """Idempotent EMAIL notification destination by display_name → its id."""
+    have = client.api_client.do("GET", "/api/2.0/notification-destinations") or {}
+    for d in have.get("results") or []:
+        if d.get("display_name") == name:
+            return d["id"]
+    d = client.api_client.do("POST", "/api/2.0/notification-destinations", body={
+        "display_name": name, "config": {"email": {"addresses": [email]}}})
+    log(f"  notification destination created: {name} ({d['id']})")
+    return d["id"]
+
+
+def phase_dash_subscriptions():
+    """PLAN 16.2 §8 step 0 — schedule SUBSCRIBERS on the source (the bed had none, F14):
+    • `wsmig_dash_pub_sched` (publisher credentials): user subscriber tanveer.singh + destination
+      subscribers DEST_ADOPT (pre-created on target too → adopted) and DEST_MISSING (source only →
+      manual line).
+    • NEW `wsmig_dash_pub_sched_viewer` (viewer credentials, published, one schedule): the CLI user
+      self-subscribes (the only subscription a viewer-credential dashboard allows, F12) + 2 ACL grants.
+    Idempotent: re-adding a subscriber returns the same subscription (F11)."""
+    print("== dashboard schedule subscriptions ==")
+    from databricks.sdk.service.dashboards import Dashboard, Schedule, CronSchedule
+    wh = _warehouse_id()
+    existing = _active_dashboards()
+    me = w.current_user.me()
+
+    def sub(did, sid, subscriber, label):
+        try:
+            w.api_client.do("POST", f"/api/2.0/lakeview/dashboards/{did}/schedules/{sid}/subscriptions",
+                            body={"subscriber": subscriber})
+            log(f"  subscribed {label}")
+        except Exception as e:
+            log(f"  FLAG subscribe {label}: {str(e)[:160]}")
+
+    def first_schedule(did, cron):
+        have = list(w.lakeview.list_schedules(dashboard_id=did))
+        if have:
+            return have[0].schedule_id
+        return w.lakeview.create_schedule(dashboard_id=did, schedule=Schedule(
+            cron_schedule=CronSchedule(quartz_cron_expression=cron, timezone_id="UTC"))).schedule_id
+
+    # 1. publisher-credential dashboard: user + 2 destinations
+    did = existing.get("wsmig_dash_pub_sched")
+    if not did:
+        log("FLAG: wsmig_dash_pub_sched missing — run dash_matrix first")
+        return
+    sid = first_schedule(did, "0 0 8 * * ?")
+    tanveer = next(iter(w.users.list(filter='userName eq "tanveer.singh@databricks.com"')), None)
+    if tanveer:
+        sub(did, sid, {"user_subscriber": {"user_id": tanveer.id}}, "tanveer.singh → wsmig_dash_pub_sched")
+    else:
+        log("FLAG: tanveer.singh not on source")
+    for name in (DEST_ADOPT, DEST_MISSING):
+        dest = _ensure_email_destination(w, name, me.user_name)
+        sub(did, sid, {"destination_subscriber": {"destination_id": dest}}, f"{name} → wsmig_dash_pub_sched")
+
+    # 2. viewer-credential dashboard, self-subscribed
+    name = "wsmig_dash_pub_sched_viewer"
+    vid = existing.get(name)
+    if not vid:
+        vid = w.lakeview.create(dashboard=Dashboard(display_name=name, warehouse_id=wh,
+                                                    serialized_dashboard=_rich_dashboard_serialized(),
+                                                    parent_path=SHARED)).dashboard_id
+        log(f"  dashboard: {name} ({vid})")
+    try:
+        pub = w.api_client.do("GET", f"/api/2.0/lakeview/dashboards/{vid}/published")
+    except Exception:
+        pub = None
+    if not pub or pub.get("embed_credentials") is not False:
+        w.lakeview.publish(dashboard_id=vid, embed_credentials=False, warehouse_id=wh)
+        log(f"  published {name} (viewer credentials)")
+    vsid = first_schedule(vid, "0 15 7 * * ?")
+    sub(vid, vsid, {"user_subscriber": {"user_id": me.id}}, f"{me.user_name} (self) → {name}")
+    acl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_RUN"}]
+    if len(ENTRA_USERS) > 2:
+        acl.append({"user_name": ENTRA_USERS[2], "permission_level": "CAN_EDIT"})
+    w.api_client.do("PATCH", f"/api/2.0/permissions/dashboards/{vid}", body={"access_control_list": acl})
+    log(f"  ACLs on {name}: {len(acl)} grants")
+
+
+RETRY_JOB = "wsmig_qa_retry_job"
+RETRY_SP = "ai27_acc_spn_2"     # the runner has servicePrincipal.manager but NOT .user on it
+RETRY_GENIE = "wsmig_qa_retry_genie"
+RETRY_TABLE = "retry_tbl"       # created on SOURCE only; on target only by `retry_heal`
+
+
+def phase_retry_seed():
+    """PLAN 16.2 §8 step 4 (user-approved 2026-10-05) — two NEW source objects that FAIL on import
+    until healed, each with its own ACL, so `retry_mode=failed_only` proves the object AND its ACL
+    come back in the same run (§5a):
+      • RETRY_JOB: run_as RETRY_SP; the runner lacks `servicePrincipal.user` on it → create refused.
+      • RETRY_GENIE: uses `<catalog>.wsmig_test.retry_tbl`, which does not exist on target → create fails.
+    Heal = `retry_heal`. Idempotent; EXCLUDED from `all`."""
+    print("== retry seed: run-as job + Genie space that fail on target until healed ==")
+    from databricks.sdk.service import jobs
+    by_name = {j.settings.name: j.job_id for j in w.jobs.list()}
+    sp = next(iter(w.service_principals.list(filter=f'displayName eq "{RETRY_SP}"')), None)
+    if not sp:
+        log(f"FLAG: {RETRY_SP} not on the source workspace")
+        return
+    jid = by_name.get(RETRY_JOB)
+    if jid:
+        log(f"job exists: {RETRY_JOB} ({jid})")
+    else:
+        _ensure_sp_user_role(sp.application_id)        # the CLI user (source creator) only
+        jid = w.jobs.create(name=RETRY_JOB,
+                            run_as=jobs.JobRunAs(service_principal_name=sp.application_id),
+                            tasks=[jobs.Task(task_key="t1",
+                                             notebook_task=jobs.NotebookTask(
+                                                 notebook_path=f"{SHARED}/py_nb"),
+                                             new_cluster=_job_cluster())]).job_id
+        log(f"job: {RETRY_JOB} ({jid}) run_as={RETRY_SP}")
+    acl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_MANAGE_RUN"},
+           {"user_name": ENTRA_USERS[3], "permission_level": "CAN_VIEW"}]
+    w.api_client.do("PATCH", f"/api/2.0/permissions/jobs/{jid}", body={"access_control_list": acl})
+    log(f"  ACLs on {RETRY_JOB}: {len(acl)} grants")
+
+    # Genie space on a source-only table
+    wh = _warehouse_id()
+    fq = f"{CATALOG}.{SCHEMA}.{RETRY_TABLE}"
+    r = w.statement_execution.execute_statement(
+        warehouse_id=wh, wait_timeout="50s",
+        statement=f"CREATE TABLE IF NOT EXISTS {fq} (id INT, label STRING)")
+    log(f"  source table {fq}: {r.status.state.value}")
+    spaces = w.api_client.do("GET", "/api/2.0/genie/spaces").get("spaces", []) or []
+    gid = next((s["space_id"] for s in spaces if s.get("title") == RETRY_GENIE), None)
+    if gid:
+        log(f"genie exists: {RETRY_GENIE} ({gid})")
+    else:
+        import json as _json
+        ser = {"version": 1, "data_sources": {"tables": [{"identifier": fq}]}}
+        gid = w.api_client.do("POST", "/api/2.0/genie/spaces", body={
+            "title": RETRY_GENIE, "description": "PLAN 16.2 retry seed", "warehouse_id": wh,
+            "serialized_space": _json.dumps(ser)})["space_id"]
+        log(f"genie: {RETRY_GENIE} ({gid}) on {fq}")
+    gacl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_RUN"},
+            {"user_name": ENTRA_USERS[4], "permission_level": "CAN_EDIT"}]
+    w.api_client.do("PATCH", f"/api/2.0/permissions/genie/{gid}", body={"access_control_list": gacl})
+    log(f"  ACLs on {RETRY_GENIE}: {len(gacl)} grants")
+
+
+def phase_retry_heal():
+    """Heal for `retry_seed` (user-approved 2026-10-05), run right before the `failed_only` retry:
+    grant the RUNNER `servicePrincipal.user` on RETRY_SP (account level, additive) and create the
+    EMPTY RETRY_TABLE on target. EXCLUDED from `all`."""
+    print("== retry heal ==")
+    runner = "servicePrincipals/f09b29b1-7924-4b53-ac73-15af18c4f087"
+    sp = next(iter(w.service_principals.list(filter=f'displayName eq "{RETRY_SP}"')), None)
+    acct = _acct().config.account_id
+    name = f"accounts/{acct}/servicePrincipals/{sp.application_id}/ruleSets/default"
+    rs = w.api_client.do("GET", "/api/2.0/preview/accounts/access-control/rule-sets",
+                         query={"name": name, "etag": ""})
+    rules = rs.get("grant_rules", []) or []
+    r = next((x for x in rules if x.get("role") == "roles/servicePrincipal.user"), None)
+    if r and runner in (r.get("principals") or []):
+        log("  runner already has servicePrincipal.user")
+    else:
+        if r:
+            r["principals"] = list(r.get("principals") or []) + [runner]
+        else:
+            rules.append({"role": "roles/servicePrincipal.user", "principals": [runner]})
+        w.api_client.do("PUT", "/api/2.0/preview/accounts/access-control/rule-sets",
+                        body={"name": name, "rule_set": {"name": name, "grant_rules": rules,
+                                                         "etag": rs.get("etag", "")}})
+        log(f"  servicePrincipal.user granted to the runner on {RETRY_SP}")
+    tw = WorkspaceClient(profile=TARGET_PROFILE)
+    twh = next(iter(tw.warehouses.list())).id
+    cat = os.environ.get("WSMIG_TARGET_CATALOG") or CATALOG
+    res = tw.statement_execution.execute_statement(
+        warehouse_id=twh, wait_timeout="50s",
+        statement=f"CREATE TABLE IF NOT EXISTS {cat}.{SCHEMA}.{RETRY_TABLE} (id INT, label STRING)")
+    while res.status.state.value in ("PENDING", "RUNNING"):     # warehouse may be starting
+        time.sleep(3)
+        res = tw.statement_execution.get_statement(res.statement_id)
+    log(f"  target table {cat}.{SCHEMA}.{RETRY_TABLE}: {res.status.state.value}")
+
+
+def phase_target_dest():
+    """TARGET side (PLAN 16.2 §8): pre-create DEST_ADOPT so the destination subscriber is adopted by
+    name; DEST_MISSING is deliberately NOT created (→ the manual line)."""
+    print("== target notification destination ==")
+    tw = WorkspaceClient(profile=TARGET_PROFILE)
+    _ensure_email_destination(tw, DEST_ADOPT, tw.current_user.me().user_name)
+    log(f"  target has {DEST_ADOPT}; {DEST_MISSING} intentionally absent")
+
+
 def _obj_id(path: str):
     try:
         return w.workspace.get_status(path).object_id
@@ -2805,6 +2995,7 @@ PHASES = {
     "b3_policy_family": phase_b3_policy_family,
     "b7_dashboards": phase_b7_dashboards,
     "dash_matrix": phase_dash_matrix,
+    "dash_subscriptions": phase_dash_subscriptions,   # PLAN 16.2 — schedule subscribers
     # Orphaned users — runs BEFORE ACLs so their homes are deleted_in_source on import
     "orphaned_users": phase_orphaned_users,
     # ACL matrices LAST — every object they grant on now exists
@@ -2814,6 +3005,9 @@ PHASES = {
     "incremental": phase_incremental,
     # TARGET-side UC prep — EXCLUDED from `all`; run explicitly against the target.
     "target_uc_prep": phase_target_uc_prep,
+    "target_dest": phase_target_dest,
+    "retry_seed": phase_retry_seed,
+    "retry_heal": phase_retry_heal,
 }
 
 if __name__ == "__main__":
@@ -2823,10 +3017,10 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args == ["all"]:
         mode = "run"
-        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep")]
+        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal")]
     elif args == ["--plan"]:
         mode = "plan"
-        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep")]
+        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal")]
     elif args == ["check"]:
         mode = "run"
         requested = ["check"]
