@@ -291,16 +291,19 @@ successes in front of it". But a recorded failure is not a crash. The phase-end 
 `finally` never runs), up to 199 rows are lost today anyway in BOTH the state table and the checkpoint,
 whether or not a failure happened. It only "helps" when a failure happens to land after the successes.
 
-**Change (user decision):** flush when **200 rows are pending (`STATE_BATCH`, unchanged) OR 300 s have
-passed since the last successful state flush, whichever comes first**. Phase-end and run-end (`finally`)
+**Change (user decision):** flush when **200 rows are pending (`STATE_BATCH`, unchanged) OR the oldest
+pending row has waited 300 s, whichever comes first**. Phase-end and run-end (`finally`)
 flushes stay exactly as today. Failures no longer force a flush.
-- `state_store.py`: new `STATE_FLUSH_SECONDS = 300` and `self._last_flush = time.time()` (set at init and
-  after every successful `flush()`). In `record()`: `if len(self._pending) >= STATE_BATCH or
-  time.time() - self._last_flush >= STATE_FLUSH_SECONDS: self.flush()`. `record_identity()` gets the
-  same rule. The check runs only on `record()`; there is no background thread, so an idle phase writes
-  nothing.
-- `base_importer.py`: the checkpoint uses the same rule (`CHECKPOINT_BATCH` 200 OR 300 s since its last
-  flush, per importer), so after a hard crash the checkpoint is never further behind than the state
+- `state_store.py` (as implemented): `FLUSH_SECONDS = 300`, `flush_clock()` (monotonic; a module function
+  so tests can replace it), `self._pending_since` = when the oldest still-pending row was queued (None
+  when nothing is pending). `record()` and `record_identity()` call `_maybe_flush()`: flush if the queue
+  reached `STATE_BATCH` or `now - _pending_since >= FLUSH_SECONDS`. A successful flush clears
+  `_pending_since`. A FAILED flush keeps the rows pending, restarts the timer and disables the
+  batch-size trigger until a flush succeeds, so a broken table is retried once per 300 s, not on every
+  row (on `main` it retried on every row once ≥200 were pending). Checked only when a row is recorded
+  (no background thread), so an idle phase writes nothing.
+- `base_importer.py`: the checkpoint uses the same rule (`CHECKPOINT_BATCH` 200 OR the oldest pending
+  outcome 300 s old, `self._cp_since`, per importer), so after a hard crash the checkpoint is never further behind than the state
   table and the same-`run_id` recovery replay can restore the lost rows.
 - **Replay fix found while implementing (2026-10-04):** checkpoint outcomes did not carry `asset_type`,
   and `ImportRunner._all_checkpoint_outcomes` can only infer it for single-type families, so the
@@ -377,7 +380,7 @@ All step-0 research is complete (results in §3.0, §4.0, §10). Nothing remains
 
 - **§4.4 write cadence:** (a) a `failed` record does NOT flush (199 failures → 0 MERGEs); (b) 200 pending
   rows → one MERGE (successes and failures mixed); (c) fake clock: one row + 300 s → next `record()`
-  flushes, 299 s → no flush; `_last_flush` resets after a successful flush and NOT after a failed one;
+  flushes, 299 s → no flush; the timer clears after a successful flush and restarts after a failed one;
   (d) phase-end and `finally` flushes unchanged; (e) checkpoint follows the same 200/300 s rule; (f) hard
   crash simulation: record N rows, discard the store without flushing, new store + same-`run_id`
   checkpoint → recovery replay restores them and `decide()` returns SKIP/UPDATE, never CREATE; (g)
@@ -385,10 +388,68 @@ All step-0 research is complete (results in §3.0, §4.0, §10). Nothing remains
 
 ## 8. Live QA (Claude, after the user pushes the branch)
 All runs on a **classic job cluster** (no serverless runs).
+
+### 8.0 Execution plan for this round (2026-10-04, commit `c2cde5e`) — SCOPE TRIMMED BY USER
+**User goal (2026-10-04):** behaves exactly like `main` + the new logging + zero state-read issues, so
+incremental is truly incremental and `failed_only` touches failed units only. **Failure drills are NOT
+required** (§8.5, §8.6, the revoke part of §8.7, §8.9, §8.11 dropped for this round). The §8.10 cadence
+is measured passively on Run 2.
+
+**Environment.**
+- **Source** `source_ws` = ws 7405604611768470 (westus metastore 254a8339). Bed rebuilt on catalog
+  `catalog_src_g9c6nd`; logs `~/Desktop/wsmig_runs/plan16_fixtures_v2/`; `check` all ✓.
+- **UMIs** re-created by the user with new appIds (ai27_umi_1 d6533593…, ai27_umi_2 766af198…); ACLs
+  re-applied.
+- **Runner** `ai27_wsmig_runner`: ADMIN on the source; has `servicePrincipal.user` on `ai27_acc_spn_1`.
+- **Target** = new `target_ws` in **westus2** (a different metastore).
+
+**Setup on the target.**
+1. `runner_sp.py ensure source_ws target_ws` + `scope target_ws`; check the ai27_* SPs exist.
+2. UC:
+   - create `catalog_src_g9c6nd` + `wsmig_test` + EMPTY `trips`/`zones`
+     (`WSMIG_PROFILE=target_ws WSMIG_TARGET_CATALOG=catalog_src_g9c6nd fixtures_medium.py target_uc_prep`);
+   - state schema `wsmig_state_16_1` + staging volume `wsmig_staging.staging` in the target's DEFAULT
+     catalog;
+   - grant the runner USE CATALOG + ALL on both; grant myself SELECT on the state schema.
+3. Git folder at `c2cde5e` → `00_Install_Jobs` (direct, scope `wsmig_runner/client_secret`, run_as = runner)
+   → `jobs/reset` each job with the Wave 0 classic cluster (15.4 LTS, D8ds_v5 single node, SINGLE_USER
+   runner) + `cluster_log_conf` to `/Volumes/<default>/wsmig_staging/cluster_logs` (QA only, to download
+   the driver stderr).
+
+**Runs** (stop and report after each; save everything to `~/Desktop/wsmig_runs/plan16_1/runN/` the same way
+as Wave 0).
+- **Run 1:** e2e live on the fresh target.
+  - Golden diff vs `plan16_golden/run1`.
+  - Logging review (§8.4).
+  - State load lines `rows=0 expected=0`.
+  - Expected environmental diffs to name, not file:
+    - `wsmig_test_runas_sp_job` now created;
+    - no `/Users_Backup/<uuid>` dirs;
+    - UMI appIds;
+    - catalog name.
+- **Seed:** `fixtures_medium.py incremental`.
+- **Run 2:** e2e live.
+  - Golden diff vs `plan16_golden/run2`.
+  - State loads `rows=N expected=N`.
+  - **Truly incremental:** the target audit log shows create/update calls ONLY for the seeded changes
+    (+ retried failures).
+  - §8.10 MERGE/OPTIMIZE count + workspace-phase time vs Wave 0.
+- **Run 3:** standalone import, `run_id=<Run 2>`, **`dry_run=false`**, `retry_mode=failed_only`,
+  `library_force_start_clusters=true`. Only `failed` units are acted on (report + audit log).
+- **Backward compat (optional, ~20 min):**
+  - install a `main` Git folder's `import` job against a new `wsmig_state_16_1_compat` on Run 2's bundle
+    (`main` writes the state rows);
+  - then the branch import on the same schema loads them (`rows=N expected=N`) and decides SKIP/ADOPT,
+    with no duplicates.
+- **Close-out:** `plan16_1/FINDINGS.md`, golden-diff verdict, bugs → §10.
+
 1. **Wave 0 golden baseline on `main`** (master plan) if not already done.
-2. Branch at the pushed commit, fresh target, state schema `catalog_ws_xaik9y.wsmig_state_16_1`
-   (direct mode, live only — no dry-run job, per master "QA run model"): live job → seed incremental
-   edits → live job → `retry_mode=failed_only`.
+2. Branch at the pushed commit, fresh target, state schema `<target catalog>.wsmig_state_16_1` + a
+   staging volume in the NEW target's own catalog (`catalog_ws_xaik9y` died with the old target's
+   storage credential, 2026-10-04). Direct mode, live only, no dry-run job (master "QA run model"):
+   Run 1 live job → seed incremental edits → Run 2 live job → Run 3 standalone import
+   `retry_mode=failed_only` **with `dry_run=false` passed explicitly** (the import job pins
+   `dry_run=true`).
 3. **Golden diff:** per-asset-type status counts identical to Wave 0 (expected diff: none).
 4. **Output review**, for each of inventory/export/import:
    - cell: every phase shows `Phase:` + `Phase complete:` and progress lines every 500; the run exports
@@ -437,9 +498,9 @@ All runs on a **classic job cluster** (no serverless runs).
 5. **State write cadence (§4.4, user 2026-10-04):** 200 rows OR 300 s, no flush per failure; a
    possible exact duplicate dashboard/Genie/alert/query after a HARD crash is accepted and documented. Everything else is logging only.
 
-**Prerequisites for LIVE QA (not for dev):** the Wave 0 golden baseline run of `main` (master plan), and
-the user's answer on the QA fixture identity question (workspace-local groups/SPs in the source bed, or
-account-level only per the 2026-10-03 decision; see `plans/qa-testing-agent.md`).
+**Prerequisites for LIVE QA (not for dev):** DONE — the Wave 0 golden baseline of `main` is saved in
+`~/Desktop/wsmig_runs/plan16_golden/` (Run 1 + Run 2), and the fixture identities are account-level only
+(2026-10-03 decision). The source bed was rebuilt on a new source workspace (below, §8.0).
 
 ## 10. Findings during 16.1
 - **2026-10-04 state read on classic (§4.0):** full 21,276/21,276 rows on dedicated (1.1 s) and standard
@@ -463,3 +524,28 @@ account-level only per the 2026-10-03 decision; see `plans/qa-testing-agent.md`)
   base_importer checkpoint 200/300 s + `asset_type`; Runbook crash note; CHANGELOG). 11 new tests in
   `tests/test_plan16_1.py` + rewritten `test_state_store.py` failure test. Mutation-checked: re-adding the
   per-failure flush fails 5 tests, dropping `asset_type` fails 2. Full offline suite 441 passed.
+
+### 10.1 Live QA findings, 2026-10-04/05 (commit `c2cde5e`, evidence `~/Desktop/wsmig_runs/plan16_1/FINDINGS.md`)
+- **QA16.1-1 MEDIUM (logging UX) — ACCEPTED by the user 2026-10-05, no change: DEBUG lines are visible in the notebook output.** Not from the cell handler: the cell's
+  stdout is INFO-only (verified: 1 "DEBUG" hit in ~490 stdout lines, and that is the `Full DEBUG log:` hint). They come from the
+  **stderr panel** Databricks attaches to every cell, a head+tail snippet of the process stderr, where the always-DEBUG driver
+  handler (`sys.__stderr__`) writes. Measured per import run: ~500 KB / ~2,400 lines in the stderr panels (1,889 DEBUG on Run 1).
+  §3.0 recorded the ~50 KB snippet, but §3.1/§9.1 promise "cell = INFO", and the user sees per-API DEBUG lines in the run page.
+  No size risk (the run exports fine; stderr isn't counted toward 30 MB). Fix needs a decision + a live probe of where the driver
+  log can go without surfacing in the cell (e.g. a py4j log4j logger → `log4j-active.log`, also downloadable from Driver logs;
+  or `sys.__stdout__` → driver `stdout`, which would need checking for whether it surfaces in the cell). Repro: any run → cell → stderr panel.
+- **QA16.1-2 LOW → fixed in 16.2 §1a (logging): a checkpoint-resumed unit's outcome line looks like real work.** On a same-`run_id` re-import,
+  `_process_one` step 3 restores the prior outcome + note (unchanged from `main`) and `_log_outcome` prints e.g.
+  `notebook /Users/…/sql_nb → created … note=187 bytes uploaded`, with no `decide` line and no API call (Run 4: 88 such lines,
+  0 objects modified, verified live). Suggest the resumed path logs `→ created (resumed from checkpoint, no API call)`.
+  Behaviour is correct; only the log is misleading for the "what did it do" goal.
+- **QA16.1-3 LOW → fixed in 16.2 §1b (logging): `Phase: verify bundle manifest` has no `Phase complete:` line** (it ends with `bundle verified
+  files=…`). The only unpaired phase across all stages/runs.
+- **Ops note (same as `main`, not a 16.1 change):** after a `retry_mode=failed_only` heal, the ACLs of the healed objects stay
+  `skipped_no_object` on any further import with the SAME run_id (checkpoint resume); they are applied by the next run with a
+  NEW run_id (e2e), which re-evaluates `skipped_no_object`. Worth a RUNBOOK line.
+- Verified PASS: main-equivalence (golden diff, all differences attributed to the new source bed), state loads `rows=N
+  expected=N` on every load of every run, incremental (audit: writes only for seeded changes + retried failures), §4.4 cadence
+  (14 MERGE / 0 OPTIMIZE per import vs 109+92 on `main`; workspace phase 12m34s → 2m17s), `failed_only` acts on exactly the 145
+  failed units, every object has one start + one outcome line in the driver log, every FAILED row has an ERROR line, no
+  `execution_*.log`.
