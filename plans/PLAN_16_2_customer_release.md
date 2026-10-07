@@ -8,7 +8,7 @@
 subscriptions as the source, (5) applies the ACLs of objects
 healed by a retry, (6) refuses to export without an inventory. **The customer has already run `main`**, so every item states its
 upgrade path (master ground rule 7).
-**Deferred by the user (2026-10-05):** bundle directory = job run id (B9) → 16.3. Everything else from the old 16.2 → 16.2b.
+**Deferred by the user (2026-10-05):** bundle directory = job run id (B9) → 16.3. Everything else from the old 16.2 → 16.3 (via 16.2b, merged into 16.3 by the user 2026-10-05).
 
 **Default-behaviour rule:** apart from the six items below, behaviour stays byte-identical to 16.1: same decisions, same
 fingerprints, same natural keys, same state schema. **No fingerprint changes:** no existing unit's fingerprint may move,
@@ -323,7 +323,7 @@ audit + `DESCRIBE HISTORY` queries). Reports → `~/Desktop/wsmig_runs/plan16_2/
 9. Close-out: `plan16_2/FINDINGS.md`, a verdict per item, bugs → §10.
 
 ## 9. Decisions (user, 2026-10-05)
-- Scope = the six items above; B9 → 16.3; other old 16.2 items → 16.2b.
+- Scope = the six items above; B9 → 16.3; other old 16.2 items → 16.3 (16.2b merged into 16.3, user 2026-10-05).
 - `.db_internal`: skip completely (dir, contents, ACLs) but keep it visible in the reports as skipped.
 - Dashboards (user 2026-10-05): draft→draft, published→published, same credentials mode (publisher/viewer), schedules
   + subscriptions migrated, ACLs as-is (verified: one ACL for draft+published, F6). Never unpublish / never delete a schedule
