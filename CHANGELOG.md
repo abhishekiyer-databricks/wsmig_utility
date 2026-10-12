@@ -10,6 +10,21 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-12
+
+Hotfix (PLAN 16.2.1). Import-side only — no change to inventory, export, bundles, fingerprints or the state schema.
+
+### Upgrade notes (from 1.1.0 / 1.0.0)
+- **Pull into the existing Git folder — no reinstall, no re-export.** Then run the existing **import** job with
+  `retry_mode=failed_only`, `dry_run=false` and your last `run_id` (blank = the latest export). In that one run the
+  family-based policies are created, then the jobs and clusters that use them, then their permissions.
+
+### Fixed
+- **Cluster policies built on a policy family** (e.g. *Job Compute*, *Personal Compute*) failed to create with
+  `INVALID_PARAMETER_VALUE policy_family_id and definition cannot be used together`, and every job and cluster using
+  them then failed `prerequisite_missing`. Create and edit now send the family id + its overrides and never the
+  resolved definition; custom (non-family) policies are sent exactly as before.
+
 ## [1.1.0] - 2026-10-05
 
 Live-tested end to end on classic compute in `direct` mode, including the upgrade from a
