@@ -7,7 +7,7 @@ user 2026-10-09: "Option A").
 and project memory). **Claude (this session)** is master and reviewer: reviews the dev diff, then runs the live QA in
 §11. **The user** reviews, commits and pushes; Claude never commits.
 
-**Scope: exactly seven items, in the user's priority order:**
+**Scope: nine items, in the user's priority order** (7b added by the user 2026-10-12 after the customer's Genie failures; 7c added by the user 2026-10-12 after the 1.1.1 QA):
 
 | § | Item | One line |
 |---|---|---|
@@ -18,15 +18,18 @@ and project memory). **Claude (this session)** is master and reviewer: reviews t
 | 5 | **B2** query owner | A migrated SQL query gets its source owner instead of staying owned by the migration SP. |
 | 6 | **CUST-1** pipeline ACLs | When the platform refuses the pipeline-owner change, the ACL is re-sent with the target's current owner, so the other grants still land. |
 | 7 | **CUST-2** synced-table pipelines | Pipelines the API can't create (no source code: synced-table pipelines) become a `manual` step with a clear note. The tool never POSTs them. |
+| 7b | **QA16.2-1** wrong "folder missing" cause | The "folder does not exist" / "not published" messages are shown only after a live check confirms them; otherwise the server's own error is shown. |
+| 7c | **QA16.2.1-1** alerts "updated" every run | An Alert V2 that ran on its schedule on the source is no longer reported (and PATCHed) as `updated` when nothing about it changed. |
 
 **Not in this wave** (back to the backlog, master "Backlog after 16.3"): 16.4 (notification destinations + catalog
-rename), B8 home re-sweep, B1, B12, W0-6, W0-7, QA16.2-1…4, the wider B4 audit of every other mutating call.
+rename), B8 home re-sweep, B1, B12, W0-6, W0-7, QA16.2-2…4, the wider B4 audit of every other mutating call.
 
 **Default-behaviour rule (ground rule 1).**
-- Apart from the seven items, behaviour stays byte-identical to 1.1.0: the same decisions, natural keys and state
+- Apart from the nine items, behaviour stays byte-identical to 1.1.0: the same decisions, natural keys and state
   schema.
-- **No fingerprint changes.** No existing unit's fingerprint may move, otherwise the first upgraded run would
-  mass-UPDATE. Each item below states how it reaches already-migrated objects without one.
+- **No fingerprint changes**, except the one stated in §7c (Alert V2 only, a one-time `updated`). No other unit's
+  fingerprint may move, otherwise the first upgraded run would mass-UPDATE. Each item below states how it reaches
+  already-migrated objects without one.
 - **Upgrade rule (ground rule 7).** The customer runs 1.0.0/1.1.0 today. Every item states what a 1.x-written state
   row, bundle or *installed job* does on the first run after a pull, and has an offline test that seeds that shape.
 
@@ -386,6 +389,139 @@ the skipped/manual retry buckets, so they no longer show in `failed_only`.
 
 ---
 
+## 7b. QA16.2-1 — our message only when the cause is confirmed, otherwise the server's error
+> Added 2026-10-12 (user). The customer hit this on 6 Genie spaces in 6 users' folders: the report said
+> `prerequisite_missing: targets workspace folder /Users/<user>, which does not exist on target yet`, but the folders
+> existed (their dashboards and files imported fine). `failed_only` fixed 1 of 6 and repeated the same message for
+> the other 5. 16.2 QA reproduced it: the server actually said `403 … Table 'cat.schema.retry_tbl' does not exist`
+> (a UC table Genie checks at create time).
+
+**Today.** Two helpers replace the server's error with our own guess whenever certain words appear in it, and the
+server text is then lost from both `note` and `error_raw`:
+- `BaseImporter.missing_parent_prerequisite` (`base_importer.py:530-538`): any error containing `"does not exist"` or
+  `"tree node"` becomes "the folder does not exist". Used by Genie (`genie_importer.py:55`), Lakeview dashboards
+  (`dashboards_importer.py:108`), SQL queries (`sql_importer.py:158`) and Alerts V2 (`sql_importer.py:225`).
+- `DashboardsImporter._not_published_prerequisite` (`dashboards_importer.py:381-387`): any 404 from a schedule create
+  becomes "the dashboard is not published".
+
+**Change (user 2026-10-12): keep our wording, but only when we have CONFIRMED the cause.**
+The rule: show our message only when a live check proves it; in every other case show the server's error unchanged.
+
+- **Folder** (`missing_parent_prerequisite`, all four callers unchanged). When the create error contains
+  `"does not exist"` / `"tree node"`, check the folder right then: `GET workspace/get-status?path=<body parent_path>`
+  (the exact resolved parent, not just the home root; called directly, not through the cached `_home_present`).
+  - **404** → the folder really is missing → raise `PrerequisiteMissing` with **today's message, word for word**
+    (the customer's 1 genuine home case keeps exactly the text in the screenshot).
+  - **200** → the folder exists, so the error is about something else → `return`, and the caller re-raises the
+    original error → `classify_error` shows the server's text verbatim (+ its normal hint).
+  - **any other probe error** (403, 500, timeout) → not sure → the server's original error. Never guess.
+  - Use `is_not_found(exc)` (`helpers.py:79`) to tell a 404 from other errors; don't use `_get_status`, which
+    returns `{}` for every error and would turn a failed check into "folder missing". One DEBUG line with the result.
+- **Not published** (`_not_published_prerequisite`). On a 404 from the schedule create, check
+  `GET lakeview/dashboards/<id>/published` with the existing `_get_published(did)` (`dashboards_importer.py:251`):
+  - it 404s (draft) → raise with **today's message, word for word**;
+  - it returns a published doc, or the check fails → the server's original error.
+  - (`_get_published` returns `{}` for every error too, so the same rule applies: only a confirmed 404 counts.)
+- Cost: one GET, only on a create that already failed with those words. Successful creates make no extra call.
+
+**Why this is safe.**
+- A confirmed missing folder still gets `prerequisite_missing` and the same text as 1.1.0; only the misdiagnosed cases
+  change, and they now show what the server said.
+- `failed_only` re-tries every FAILED row whatever its category (`state_store.py:129`), so the category of the
+  re-labelled rows never affects a retry.
+- No report, sheet or test depends on the removed (wrong) text for the misdiagnosed cases (checked `src/` and
+  `tests/`, 2026-10-12).
+
+**Rest of the importers, checked 2026-10-12, no change needed:** they already pass the server text through
+`classify_error`. The few keyword checks elsewhere only tolerate a known harmless error and never replace a message:
+`"already exists"` on SP create (followed by a lookup), and `"already"` on `clusters/start`. Workspace content and the
+jobs notebook-path check decide "home/path missing" from a `get-status` probe, not from error text.
+
+**Upgrade path.** No state, bundle or fingerprint change. 1.x rows that FAILED with the wrong message stay FAILED;
+the next `failed_only` re-attempts them and records either success or the server's real error.
+
+**Tests** (`tests/test_plan16_3.py`, parametrised over Genie / dashboard / query / alert V2):
+- create fails with `403 … Table 'c.s.t' does not exist`, folder check → 200 → FAILED with the server text in `note`
+  and `error_raw`; no "targets workspace folder" text;
+- create fails with "… does not exist", folder check → 404 → `prerequisite_missing` with **exactly** 1.1.0's message
+  (golden string assert);
+- folder check → 403/500 → the server's original error, not `prerequisite_missing`;
+- create fails with an unrelated error → no folder check (assert on the fake client);
+- successful create → no folder check;
+- the check uses the full parent path: a missing sub-folder under an existing home → 404 → today's message;
+- schedule 404 + published check 404 → today's "not PUBLISHED" message, word for word; published check 200 or 500 →
+  the server's original error;
+- a 1.1-shaped FAILED `genie_space` row under `failed_only` → re-attempted.
+
+---
+
+## 7c. QA16.2.1-1 — an Alert V2 is "updated" on every run although nothing changed
+> Added 2026-10-12 (user). Found in the 1.1.1 hotfix QA (`PLAN_16_2_1` Run 3). Pre-existing: identical on 1.0/1.1.
+
+**What happened (live evidence, bundles on target `7405614409585920`).**
+- Run 3 reported `alert_v2 wsmig_test_alert_v2 → updated` ("source changed since the last import — updated in place"),
+  and the 1.1.0 run before it reported both test alerts V2 `updated`. Nobody edited either alert.
+- Field-by-field diff of the exported payload (`export/sql/alerts_v2.json`) between runs — the ONLY difference:
+
+  | Alert | Previous run → this run | Changed field |
+  |---|---|---|
+  | `wsmig_test_alert_v2` (cron `0 0 9 * * ?`, daily 09:00 UTC) | `20261012_073721` → `20261012_092155` | `evaluation.last_evaluated_at` `2026-10-11T09:00:33Z` → `2026-10-12T09:00:31Z` |
+  | same | `20261006_033735` → `20261012_073721` | `evaluation.last_evaluated_at` `2026-10-05T09:00:32Z` → `2026-10-11T09:00:33Z` |
+  | `wsmig_test_alert_v2_b` | `20261012_073721` → `20261012_092155` | none → fingerprint equal → correctly **skipped** |
+
+- So "updated" fired exactly when the source alert had **run on its schedule** between two migration runs. Nothing a
+  user can set changed.
+
+**Is it a bug? Yes (LOW–MEDIUM).** No data is lost or duplicated, and the PATCH re-sends the same settable content
+(the server ignores the read-only fields). But:
+- the report says `updated` for objects nobody touched. A customer with many scheduled alerts sees every one of them
+  "updated" on every run, which buries real changes and breaks "the report is the source of truth";
+- one needless PATCH per scheduled alert per run;
+- `evaluation.state` (`OK` / `TRIGGERED`) is in the payload too, so a pure state flip does the same.
+
+**Cause.** `STRIP_FIELDS["alert_v2"]` (`src/transform/transforms.py:103`) lists only top-level fields, and
+`strip_runtime` (`:136-147`) strips top-level keys only. The two read-only fields live **inside** `evaluation`
+(`evaluation.state`, `evaluation.last_evaluated_at`), so they stay in the payload and in the fingerprint. The
+collector's GET-by-id enrichment (PLAN 8 Bug 10) is what brings `evaluation` in, which is correct (create needs it).
+The legacy-alert strip list already drops its equivalents (`state`, `trigger_time`).
+
+**Change.**
+- Strip `evaluation.state` and `evaluation.last_evaluated_at` from the `alert_v2` payload at export, before
+  fingerprinting. Keep it small: a nested-path entry in `STRIP_FIELDS["alert_v2"]` (e.g. `"evaluation.state"`) handled
+  by `strip_runtime`, returning a copy (never mutate the record). Every other `evaluation` field (`source`,
+  `comparison_operator`, `threshold`, `notification`, `empty_result_state`, …) stays: they are create/update fields.
+- Also drop the two fields from the create/PATCH body (`_alert_v2_body`) for **1.x bundles** that still carry them.
+  This is defensive and changes nothing on the target (the server ignores them today).
+- **Audit the other families for the same nested-runtime-field pattern** while here: in this bed only Alerts V2 showed
+  false updates (Run 1/3 `updated` rows: the 2 alerts + home folders that genuinely healed + the seeded policy). Add the
+  regression test below for every asset type that has a GET-by-id enrichment (alerts V2, legacy queries, dashboards,
+  Genie, jobs, pipelines).
+
+**Upgrade path (the one allowed fingerprint change, decision D7).**
+- The first 1.2.0 export gives every Alert V2 a new fingerprint (two fields fewer). The first upgraded run therefore
+  records each non-DAB Alert V2 `updated` **once** (a PATCH with the same content). From then on an alert is `updated`
+  only when the source really changed.
+- This is no worse than today: today the same alerts are `updated` on every run in which they evaluated.
+- Airgap with a 1.x **source** side: the bundle's fingerprints come from the old export, so the noise stays until the
+  source-side Git folder is upgraded too. Note it in the CHANGELOG.
+
+**Tests** (`tests/test_plan16_3.py`):
+- two exports of the same alert that differ only in `evaluation.last_evaluated_at` and/or `evaluation.state` → equal
+  fingerprints; the run decides SKIP with zero PATCH calls;
+- a real edit (`threshold`, `comparison_operator`, `query_text`, `schedule`) → fingerprint moves → UPDATE;
+- the stripped payload still has `evaluation.source`, `comparison_operator`, `threshold`, `notification`, and create
+  still sends them (the PLAN 8 Bug 10 test still passes);
+- a 1.x-shaped unit whose payload carries both fields → the create / PATCH body omits them;
+- the strip never mutates the collector record;
+- for every enriched asset type: an export pair differing only in the type's known runtime fields → equal
+  fingerprints (the guard against this class of bug coming back).
+
+**Live QA check (§11).** Run C (and every later run): an Alert V2 that evaluated on the source between runs is
+`skipped`, not `updated` (compare `evaluation.last_evaluated_at` in the two bundles to prove it ran). Run B is the
+one-time `updated` per D7.
+
+---
+
 ## 8. Files touched
 - `notebooks/01_Inventory.py` (job_run_id widget + resolve call)
 - `jobs/direct_end_to_end_live.job.json`, `jobs/direct_end_to_end_dry_run.job.json`, `jobs/inventory.job.json`,
@@ -401,12 +537,14 @@ the skipped/manual retry buckets, so they no longer show in `failed_only`.
 - `src/importers/acl_importer.py` (§6)
 - `src/utils/helpers.py` (`pipeline_not_creatable`)
 - `src/importers/dlt_importer.py` (§7)
+- `src/importers/base_importer.py` (§7b `missing_parent_prerequisite`), `src/importers/dashboards_importer.py` (§7b `_not_published_prerequisite`)
 - docs: `docs/RUNBOOK.md`, `docs/CONFIGURATION_GUIDE.md`, `docs/PERMISSIONS_GUIDE.md` (§10)
 - `CHANGELOG.md`, `VERSION` (§10)
+- `src/transform/transforms.py` (§7c nested strip) and `src/importers/sql_importer.py` (§7c body guard)
 - `tests/test_plan16_3.py` (new)
 
 ## 9. Offline test bar (dev session)
-- Every test listed in §1–§7 goes in `tests/test_plan16_3.py`. Use `tests/fakes.py` (fake client with recorded calls)
+- Every test listed in §1–§7c goes in `tests/test_plan16_3.py`. Use `tests/fakes.py` (fake client with recorded calls)
   as `test_plan16_2.py` does.
 - **Full suite passes:** `python3 -m pytest` (497 today + the new ones).
 - **Mutation check:** for each item, revert the fix locally, confirm at least one new test fails, then restore it.
@@ -429,7 +567,9 @@ Judgment calls, deviations from this plan (with reason), the mutation-check resu
     - the first upgraded run sets query owners (rows read `updated`);
     - workspace settings are re-checked against the target;
     - synced-table pipelines become manual;
-    - a failed report now turns the task red.
+    - a failed report now turns the task red;
+    - Genie / dashboard / query / alert failures now show the server's real error instead of "folder does not exist"; re-run `failed_only` on rows that FAILED with that message.
+    - every Alert V2 reads `updated` once on the first 1.2.0 run (fingerprint fix, §7c); after that only real source edits show as `updated`. In airgap mode this needs the source-side Git folder upgraded too.
   - Added / Fixed / Changed per item.
 - `RUNBOOK.md`:
   - finding a run's folder (= the job run id);
@@ -439,7 +579,8 @@ Judgment calls, deviations from this plan (with reason), the mutation-check resu
   - `not_applied` workspace settings;
   - the pipeline owner needing a metastore admin;
   - synced-table pipelines;
-  - which object types keep their owner.
+  - which object types keep their owner;
+  - a Genie space that fails on a missing / unreadable UC table: create or grant the table (UC is out of scope), then `failed_only`.
 - `CONFIGURATION_GUIDE.md`: the `job_run_id` parameter (set by the job, leave blank).
 - `PERMISSIONS_GUIDE.md`: a UC pipeline owner transfer needs a metastore admin.
 
@@ -492,6 +633,7 @@ Save `golden_snapshot.json`. **Stop.**
   - the other keys are SKIP with no write;
 - **CUST-1:** pipeline ACL rows are unchanged; the owner is still transferred (live GET permissions);
 - **CUST-2:** no change (no such pipeline in the bed);
+- **7b (QA16.2-1):** seed `retry_seed` on the source before this run (`RETRY_GENIE` is built on `retry_tbl`, which is missing on target). Its row is FAILED with the server's `Table … does not exist` text, and **not** "targets workspace folder". (The confirmed-missing-folder path is offline only: homes on the bed are already provisioned.) Then `retry_heal` + `failed_only` → created;
 - **no duplicates:** object counts per type are unchanged apart from the new policy;
 - `logcheck.py` clean.
 
@@ -587,6 +729,10 @@ vs Run A.** Expected diffs only:
   - optional: add a Lakebase instance + synced table to the source bed. That costs money, so it needs the user's OK.
   - Optional add-on: fix the `object_absent` wording on these pipelines' ACLs (part of QA16.2-4, small).
 
+- **D7 — 7c alert fingerprint:** accept the one-time `updated` of every Alert V2 on the first 1.2.0 run (the
+  only way to remove the per-run noise; today the same alerts are already `updated` whenever they evaluated).
+  **Default yes.**
+
 ## 13. Review checklist (Claude, before live QA)
 - Diff touches only the files in §8.
 - Every 1.x fingerprint is unchanged (the test exists and passes).
@@ -597,6 +743,10 @@ vs Run A.** Expected diffs only:
 - CUST-1 retry fires only on the exact marker.
 - The CUST-2 guard runs at both export and import.
 - The report-write failure can't mask an abort.
+- 7b: our message only after a check returns a real 404; a 200 or a failed check → the server's original error;
+  1.1.0's message text unchanged (golden test); no extra call on success.
+- 7c: only `evaluation.state` + `evaluation.last_evaluated_at` are stripped; every other fingerprint unchanged (the
+  stability test covers all asset types except Alert V2).
 - CHANGELOG upgrade notes match §10.
 - The suite and the mutation checks are reported in §9b.
 

@@ -166,3 +166,37 @@ Fixture built on source (policy `00139AD5952831B1` family `job-cluster`; jobs 23
   `wsmig_test_policy_family_job` which is in the bundle but not yet created on target … re-run with retry_mode=failed_only";
 - their 5 ACL rows → `skipped_no_object` ("the object FAILED to import earlier in this run … the ACL follows");
 - target: no family policy, no `polfam` job (18 jobs). Evidence `~/Desktop/wsmig_runs/plan16_2_1/run1/`.
+
+### Run 2 — 1.1.1 `failed_only`, the customer's fix path (2026-10-12) — PASS
+Git folder `wsmig_cust` moved to `hotfix/policy_family` @ `d844e72` (pull only, no reinstall). Standalone `wsmig - import`
+(job 554860399019081), `retry_mode=failed_only`, `dry_run=false`, `run_id=20261012_073721` → job run 938905596072973
+SUCCESS, `run_status=completed`. Report `import_status_retry_20261012_085422.xlsx` (+ json/md) in Run 1's folder; canonical
+`import_status.xlsx` untouched.
+- Work list = 15 units: **10 created** — 2 family policies, the 3 dependent jobs, their 5 ACLs (joined via "ACLs follow a
+  healed object") — and 5 by-design failures re-attempted with unchanged reasons (`wsmig_test_cluster_policied`, 3
+  libraries on TERMINATED clusters, `wsmig_test_ext_endpoint`). Nothing else touched.
+- Live vs source (`run2/live_verify.json`): both policies family + overrides + effective definition **equal**
+  (`job-cluster`, `personal-vm`); all 3 jobs' `policy_id` = the new target policy `000D08F53F9F2D84` (job cluster, 2-task
+  shared cluster, task `new_cluster`); ACLs on all 5 objects **equal** to source (incl. job `IS_OWNER`).
+- State rows: all 10 `created` with target ids. No duplicates: target jobs 18 → 21, policies 7 → 9, all names unique.
+- State roll-up: `failed` 5 (the by-design ones only).
+
+### Run 3 — normal e2e after a source edit to the family policy (2026-10-12) — PASS
+Seed (user-approved): source `wsmig_test_policy_family_job` override `custom_tags.wsmig_policy` `family_job` →
+`family_job_v2` (still family `job-cluster`). `wsmig - direct end-to-end (LIVE)` on 1.1.1 → job run 996922402993745
+SUCCESS, bundle `20261012_092155`, 720 units, `run_status=completed`.
+- `cluster_policy wsmig_test_policy_family_job` → **updated** via the family-shape edit: same target id
+  `000D08F53F9F2D84`, still `job-cluster`, override now `family_job_v2`; overrides + effective definition = source.
+- The other family policy, the 3 jobs (still pointing at `000D08F53F9F2D84`) and all 5 ACLs → **skipped** (unchanged);
+  live ACLs still = source.
+- Roll-up: skipped 643 · updated 2 · adopted 1 · created_with_warning 2 (the 2 dashboard schedules' pending-subscriber
+  re-check, by design) · manual 9 · skipped_no_object 58 · failed 5 (the same by-design ones). No duplicates: jobs 21,
+  policies 9, names unique.
+- **Observation (pre-existing, not this hotfix):** `alert_v2 wsmig_test_alert_v2` reads `updated` with no source edit.
+  It did on 1.1.0 too (Run 1: both alerts V2 `updated`), so it's not caused by this release (no alert code touched).
+  → root-caused 2026-10-12: the nested read-only `evaluation.last_evaluated_at` / `evaluation.state` are in the
+  fingerprint, so every scheduled evaluation on the source looks like an edit. Planned as PLAN_16_3 §7c (QA16.2.1-1).
+
+### Verdict — 1.1.1 READY TO RELEASE
+The customer's chain heals with one `failed_only` run (Run 2), a later edit of a family policy updates it in place
+(Run 3), custom policies and everything else are unchanged, and there are no duplicates.

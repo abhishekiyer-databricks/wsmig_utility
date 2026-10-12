@@ -79,7 +79,7 @@ UC lives in the region metastore and SURVIVES a target rebuild → one **state s
 - **16.4** dashboards + catalog rename (row above) — needs live API checks first (destination secrets) + a user decision on re-pushing already-migrated objects for a catalog rename.
 - **B8** best-effort re-sweep of home-content `prerequisite_missing` units before the ACL phase (+ the optional optimistic home write gate).
 - **B1** source run-as SP for the airgap source job · **B12** widget labels · **W0-6** workspace-conf coverage, REPORT ONLY · **W0-7** no-op creates labelled `skipped`.
-- **QA16.2-1…4** (below).
+- **QA16.2-2…4** (below). (QA16.2-1 moved INTO 16.3 as §7b by the user 2026-10-12, after the customer's 6 Genie failures.)
 - The wider **B4** audit: read-back for the other mutating calls (global init scripts, permission assignments, SCIM entitlements/members, ACL PUT, update calls).
 
 ## 16.3 — findings from 16.2 QA (deferred by the user 2026-10-05; now in the backlog above)
@@ -87,6 +87,7 @@ None of these were caused by 16.2: the code involved is identical on `main`, so 
 with them today and 1.1.0 ships without them. Evidence for each: `~/Desktop/wsmig_runs/plan16_2/FINDINGS.md`.
 
 ### QA16.2-1 (MEDIUM): the report blames the wrong cause when a dashboard / Genie / query create fails
+> **2026-10-12: moved into 16.3 as §7b (`PLAN_16_3_customer_fixes.md`)** after the customer hit it on 6 Genie spaces. The full spec and the audit of the other importers are there.
 - **Scenario.** A Genie space lives in a user's folder (`/Users/alice@x.com/My space`) and is built on a UC
   table that does not exist on the target yet (UC is out of scope). Import tries to create it; the server
   refuses with `403 … Table 'cat.schema.retry_tbl' does not exist`.
