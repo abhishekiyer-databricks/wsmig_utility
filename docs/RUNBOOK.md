@@ -252,6 +252,12 @@ Fix the cause, then re-run only the outstanding units.
 > 🔁 After you fix identities or redeploy a DAB, re-running just **`import_assets=acls`** with
 > `retry_mode=skipped_only` back-fills the permissions that were waiting.
 
+> ⚙️ **A cluster policy built on a policy family** (e.g. Job Compute, Personal Compute) that FAILED on 1.1.0 or
+> earlier with `policy_family_id and definition cannot be used together` — and every job/cluster that uses it,
+> which failed `prerequisite_missing` — is fixed in **1.1.1**. Pull 1.1.1 into the Git folder and re-run the
+> import with **`retry_mode=failed_only`** (`dry_run=false`, same `run_id`, no re-export): the policy is created
+> first, then the jobs/clusters that use it, then their permissions — all in that one run.
+
 > ⚙️ **A job that 403s on a SQL warehouse** ("not authorized to use or monitor this SQL Endpoint")
 > is usually just an **ordering effect**, not a missing permission: jobs are created before the
 > warehouse's `CAN_USE` grant is replayed (**ACLs run last**). A plain **`retry_mode=failed_only`**

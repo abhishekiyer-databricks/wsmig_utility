@@ -2130,6 +2130,68 @@ def phase_b3_policy_family():
         log(f"b3 policy family: {str(e)[:140]}")
 
 
+POLFAM_POLICY = "wsmig_test_policy_family_job"
+POLFAM_JOBS = ("wsmig_test_polfam_job_nb", "wsmig_test_polfam_job_multi",
+               "wsmig_test_polfam_job_newcluster")
+
+
+def phase_policy_family_jobs():
+    """PLAN 16.2.1 (hotfix 1.1.1): the customer's shape — a JOB COMPUTE family policy plus jobs that
+    depend on it. On 1.1.0 the policy fails (400 family_id + definition) and every job that uses it
+    fails `prerequisite_missing`; `failed_only` on 1.1.1 must heal policy → jobs → their ACLs.
+      • POLFAM_POLICY: family `job-cluster` + one override.
+      • 3 jobs covering both remap paths: a shared job cluster (1 task / 2 tasks) and a task-level
+        `new_cluster`, each `policy_id` = POLFAM_POLICY, `apply_policy_default_values=true`.
+      • ACLs on the policy and on every job (additive PATCH). Idempotent."""
+    print("== 16.2.1: Job Compute family policy + dependent jobs ==")
+    from databricks.sdk.service import compute, jobs
+    pol = next((p for p in w.cluster_policies.list() if p.name == POLFAM_POLICY), None)
+    if pol:
+        log(f"policy exists: {POLFAM_POLICY} ({pol.policy_id})")
+    else:
+        overrides = {"custom_tags.wsmig_policy": {"type": "fixed", "value": "family_job"}}
+        pol = w.cluster_policies.create(name=POLFAM_POLICY, policy_family_id="job-cluster",
+                                        policy_family_definition_overrides=json.dumps(overrides))
+        log(f"policy: {POLFAM_POLICY} ({pol.policy_id}) family=job-cluster")
+    pid = pol.policy_id
+    pacl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_USE"},
+            {"user_name": ENTRA_USERS[1], "permission_level": "CAN_USE"}]
+    w.api_client.do("PATCH", f"/api/2.0/permissions/cluster-policies/{pid}",
+                    body={"access_control_list": pacl})
+    log(f"  ACLs on {POLFAM_POLICY}: {len(pacl)} grants")
+
+    def spec():
+        return compute.ClusterSpec(spark_version=SPARK_VERSION, node_type_id=NODE, num_workers=1,
+                                   policy_id=pid, apply_policy_default_values=True)
+
+    def nb_task(key, **kw):
+        return jobs.Task(task_key=key, notebook_task=jobs.NotebookTask(
+            notebook_path=f"{SHARED}/py_nb"), **kw)
+
+    shapes = {
+        POLFAM_JOBS[0]: dict(job_clusters=[jobs.JobCluster(job_cluster_key="pf", new_cluster=spec())],
+                             tasks=[nb_task("t1", job_cluster_key="pf")]),
+        POLFAM_JOBS[1]: dict(job_clusters=[jobs.JobCluster(job_cluster_key="pf", new_cluster=spec())],
+                             tasks=[nb_task("t1", job_cluster_key="pf"),
+                                    nb_task("t2", job_cluster_key="pf",
+                                            depends_on=[jobs.TaskDependency(task_key="t1")])]),
+        POLFAM_JOBS[2]: dict(tasks=[nb_task("t1", new_cluster=spec())]),
+    }
+    by_name = {j.settings.name: j.job_id for j in w.jobs.list()}
+    for i, (name, kw) in enumerate(shapes.items()):
+        jid = by_name.get(name)
+        if jid:
+            log(f"job exists: {name} ({jid})")
+        else:
+            jid = w.jobs.create(name=name, **kw).job_id
+            log(f"job: {name} ({jid}) policy={POLFAM_POLICY}")
+        jacl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_MANAGE_RUN"},
+                {"user_name": ENTRA_USERS[2 + i], "permission_level": "CAN_VIEW"}]
+        w.api_client.do("PATCH", f"/api/2.0/permissions/jobs/{jid}",
+                        body={"access_control_list": jacl})
+        log(f"  ACLs on {name}: {len(jacl)} grants")
+
+
 def phase_b7_dashboards():
     """B7: the AI/BI dashboard publish/schedule matrix.
 
@@ -2993,6 +3055,7 @@ PHASES = {
     "libraries": phase_libraries,
     # B-scenario gap fixtures (PLAN_13) — must run BEFORE ACL matrices
     "b3_policy_family": phase_b3_policy_family,
+    "policy_family_jobs": phase_policy_family_jobs,   # PLAN 16.2.1 — customer's blocked-jobs shape
     "b7_dashboards": phase_b7_dashboards,
     "dash_matrix": phase_dash_matrix,
     "dash_subscriptions": phase_dash_subscriptions,   # PLAN 16.2 — schedule subscribers
