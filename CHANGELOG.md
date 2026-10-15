@@ -48,6 +48,9 @@ Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint
   carried the source `IS_OWNER`, which on a UC pipeline is an owner change, and the PUT is all-or-nothing. The
   tool now never changes a pipeline's owner — it keeps the current owner, gives the source owner `CAN_MANAGE`
   and applies every other grant exactly. ACL Parity reads `match` with a `known_gap` note.
+- **ACL Parity reported queries as `extra_on_target`** after their owner was set (QA16.3-1): changing a query's
+  owner makes Databricks add an explicit `CAN_MANAGE` for the new owner, which a creator-owner on the source
+  doesn't show. That one line is no longer counted as a difference; any other extra grant still is.
 - **Workspace settings reported `Created` that the target never took** (B4). Every write is read back; a key the
   target ignores is `failed` / `not_applied` ("set it in the admin console"), never `Created`.
 - **Synced-table pipelines failed on every run** (`libraries must contain at least one element`, CUST-2). A

@@ -1019,6 +1019,50 @@ def test_pipeline_parity_is_match_with_a_known_gap():
     assert obj["detail"] == obj["known_gap"]
 
 
+def _query_parity_env(target_acl, owner="qa@corp.com"):
+    """A query ACL already applied (state row, same fingerprint → SKIP) whose target list is
+    `target_acl`; the source grants are analysts CAN_RUN only (a creator-owner is not listed)."""
+    from src.transform.transforms import fingerprint
+    env = _bed()
+    entry = {"asset_type": "legacy_query", "natural_key": "/Shared/q1", "source_id": "SQ1",
+             "perm_object_type": "queries",
+             "grants": [{"principal": "analysts", "principal_type": "group",
+                         "permission_level": "CAN_RUN", "inherited": False}]}
+    fp = fingerprint(AclImporter._normalise_grants(None, entry["grants"], remap=False))
+    env.seed("acl", "queries:/Shared/q1", fp=fp, target="TQ1")
+    env.new_run("r2")
+    env.aw.write_json(BP.EXPORT_ACLS_JSON, [entry])
+    env.client.queries["TQ1"] = {"display_name": "q1", "owner_user_name": owner}
+    env.client.perms["queries/TQ1"] = target_acl
+    return env
+
+
+def _grant_entry(field, principal, level):
+    return {field: principal, "all_permissions": [{"permission_level": level, "inherited": False}]}
+
+
+def test_query_owner_can_manage_added_by_an_owner_change_is_not_an_extra():
+    """QA16.3-1 (live 2026-10-15): an owner change adds an explicit CAN_MANAGE for the new owner;
+    the source creator-owner has none → still `match`, and nothing extra is written to the report."""
+    env = _query_parity_env([_grant_entry("group_name", "analysts", "CAN_RUN"),
+                             _grant_entry("user_name", "qa@corp.com", "CAN_MANAGE")])
+    env.run(AclImporter, [])
+    (obj,) = env.context["acl_parity"]["objects"]
+    assert obj["verdict"] == "match"
+    assert "known_gap" not in obj and "detail" not in obj
+    assert obj["extra_on_target"] == []
+
+
+def test_query_extra_can_manage_for_a_non_owner_is_still_reported():
+    env = _query_parity_env([_grant_entry("group_name", "analysts", "CAN_RUN"),
+                             _grant_entry("user_name", "qa@corp.com", "CAN_MANAGE"),
+                             _grant_entry("user_name", "intruder@corp.com", "CAN_MANAGE")])
+    env.run(AclImporter, [])
+    (obj,) = env.context["acl_parity"]["objects"]
+    assert obj["verdict"] == "extra_on_target"
+    assert obj["extra_on_target"] == [["intruder@corp.com", "CAN_MANAGE"]]
+
+
 def test_1x_failed_pipeline_acl_row_is_healed_by_failed_only():
     env = _acl_env()
     entry = _pipe_acl(*_SRC_GRANTS)

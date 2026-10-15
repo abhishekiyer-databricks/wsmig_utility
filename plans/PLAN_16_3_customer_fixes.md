@@ -520,4 +520,46 @@ if this target drops one); §3 report-write failure (offline).
   USE CATALOG 403 through — the tightening guards unseen errors.) Evidence:
   `plan16_3/api_probes/2026-10-14_runas_refusal.json`.
 
+### Run 1 — upgrade to 1.2.0 (2026-10-15) — PASS, 1 new finding (QA16.3-1)
+Git folder `wsmig_cust` → `feature/16_3_customer_fixes` @ `5d17952` (pull only). Seeds: `cust163_seed`,
+`cust163_target_prep`, `cust163_uc_grants` (user-approved), `cust163_alert`. `wsmig - direct end-to-end (LIVE)` → job
+run 976288619533031 SUCCESS (inventory 6.0 / export 0.7 / import 9.2 min), bundle `20261015_063308`, `run_status=completed`,
+state `rows=720 expected=720`. Roll-up: skipped 622 · updated 23 · created 4 · created_with_warning 5 · manual 9 ·
+skipped_no_object 59 · failed 6. Evidence `~/Desktop/wsmig_runs/plan16_3/run1/`.
+- **§1 PASS:** `Run id : 20261015_063308` + `Folder : …/20261015_063308/` are the last lines of inventory, export and import.
+- **§4 PASS:** all 19 queries `updated` "owner set to <source owner> (verified)"; live GET owners = source 19/19
+  (`wsmig_test_query` → tanveer.singh); exactly one PATCH per query (owner only, no content).
+- **§2 PASS:** `enableResultsDownloading` re-applied, row "set to 'false' (verified by read-back)", live = `false`;
+  the other 5 keys `skipped`, one workspace-conf PATCH in the whole run. (Status word is `created`, as the
+  declarative path always reports.)
+- **§5 PASS:** `_cust1` IS_OWNER = runner, runs as the runner, QA user CAN_MANAGE, grants exact; `_cust1_sp` IS_OWNER =
+  runner, runs as `ai27_acc_spn_1`, SP CAN_MANAGE; `_cust1_sp3` → 403 "Cannot bind the service principal provided in
+  'run_as'" → one retry without run_as → `created_with_warning` "grant the runner the Service Principal User role on
+  …", runs as the runner; `wsmig_test_pipeline` + CAN_VIEW applied, owner unchanged. ACL Parity `match` + "owner kept
+  on target" for all four. Pipelines 5 → 8, no duplicates.
+- **§7 PASS:** `wsmig_qa_163_genie` FAILED with the server's `403 … Table 'catalog_src_g9c6nd.wsmig_test.retry_tbl_163'
+  does not exist`, not the folder message.
+- **§8 PASS:** both Alerts V2 `updated` once (D4).
+- Failures = the 5 by-design ones from 1.1.1 + the seeded Genie. `logcheck`: every failed row has an ERROR line; 2
+  start-without-end + 1 double-end, all workspace-content rows garbled by thread interleaving (seen in 16.2 too).
+- **QA16.3-1 (new, report accuracy):** ACL Parity `extra_on_target=18` (every earlier run 0) — all 18 queries whose
+  owner was set from the runner to their creator. **Platform behaviour (verified on both sides):** a query owner
+  TRANSFER adds an explicit `CAN_MANAGE` for the new owner, while a creator-owner has none (source
+  `wsmig_test_query`, transferred to tanveer by the seed, also lists tanveer CAN_MANAGE → that one matches). No access
+  change (the owner manages anyway); it's a false "extra" that persists each run. Proposed fix: in
+  `write_parity_report`, for `queries`, treat the owner's own `CAN_MANAGE` as expected when the source lacks it, with
+  a `known_gap` note.
+- **QA16.3-1 fixed (2026-10-15, user: no new report text — code comment only):** `AclImporter._query_parity` drops
+  `(owner, CAN_MANAGE)` from the target side when the source doesn't list it; owner from the SQL importer's LIST
+  (shared context `legacy_query_target_owners`), else one LIST in the ACL phase. Tests
+  `test_query_owner_can_manage_added_by_an_owner_change_is_not_an_extra` +
+  `test_query_extra_can_manage_for_a_non_owner_is_still_reported` (both fail with the fix removed). 603 pass.
+
+### Run 2 — prep (2026-10-15)
+- `cust163_run2`: `wsmig_test_query` owner → aman.bansal (source GET confirms). Runner granted
+  `servicePrincipal.user` on `ai27_acc_spn_3` (via the workspace rule-set proxy; `source_acct` login had expired).
+- Planted (our test artifacts, remove after Run 3): `wsmig/7405604611768470/20200101_000000/misc/` = Run 1's
+  manifest + an import checkpoint (1.1.1's import would resume it); `…/20200101_000001/misc/checkpoint.json` only
+  (1.1.1's inventory/export would resume it).
+
 (live QA appends here)

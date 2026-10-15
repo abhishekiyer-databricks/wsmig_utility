@@ -707,6 +707,8 @@ class AclImporter(BaseImporter):
             known_gap = ""
             if perm_type == "pipelines":
                 expected, actual, known_gap = self._pipeline_parity(expected, actual)
+            elif perm_type == "queries":
+                actual = self._query_parity(expected, actual, target_id)
 
             expected_set, actual_set = set(expected), set(actual)
             missing = sorted(expected_set - actual_set)
@@ -764,6 +766,35 @@ class AclImporter(BaseImporter):
         expected = sorted({(p, "CAN_MANAGE" if lvl == "IS_OWNER" else lvl) for p, lvl in expected})
         actual = [a for a in actual if a[1] != "IS_OWNER"]
         return expected, actual, "owner kept on target (needs a metastore admin)"
+
+    def _query_parity(self, expected: list, actual: list, target_id: str) -> list:
+        """Drop the query OWNER's own explicit `CAN_MANAGE` from the target side when the source
+        doesn't list it (QA16.3-1). Changing a query's owner makes the platform ADD an explicit
+        `CAN_MANAGE` for the new owner, while a creator-owner has none (verified live on both
+        workspaces 2026-10-15). The owner manages the query either way, so this is no difference
+        in access — without this every creator-owned query reads `extra_on_target` on every run.
+        Any other extra grant is still reported."""
+        owner = self._query_target_owner(target_id)
+        line = (owner, "CAN_MANAGE")
+        if owner and line in actual and line not in expected:
+            return [a for a in actual if a != line]
+        return actual
+
+    def _query_target_owner(self, target_id: str) -> str:
+        """The target query's owner, from the SQL importer's LIST this run (shared context), or one
+        LIST here when the SQL phase didn't run this session. "" when unknown."""
+        owners = self.context.get("legacy_query_target_owners")
+        if owners is None:
+            try:
+                queries = self.client.get_paginated("api/2.0/sql/queries", "results",
+                                                    params={"page_size": 100})
+                owners = {safe_str(q.get("id")): safe_str(q.get("owner_user_name"))
+                          for q in queries if q.get("id")}
+            except Exception as exc:  # noqa: BLE001 — parity then compares the raw lists, as 1.1
+                self.log.debug(f"ACL parity: could not list query owners ({str(exc)[:160]})")
+                owners = {}
+            self.context["legacy_query_target_owners"] = owners
+        return safe_str(owners.get(target_id))
 
     # ── normalisation (both sides, identically) ───────────────────────────
     def _normalise_grants(self, grants: list, remap: bool) -> list:

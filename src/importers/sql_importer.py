@@ -87,6 +87,7 @@ class SqlImporter(BaseImporter):
                    "id": safe_str(q.get("id"))} for q in queries]
         self._target_query_owner.update({safe_str(q.get("id")): safe_str(q.get("owner_user_name"))
                                          for q in queries if q.get("id")})
+        self.context["legacy_query_target_owners"] = self._target_query_owner   # ACL parity
         q_found = self.folder_existing_keys("legacy_query", q_list, "_name", "id")
         self.context.setdefault("legacy_query_target_ids", {}).update(q_found)
         out.update(q_found)
