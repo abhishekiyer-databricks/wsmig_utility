@@ -86,6 +86,36 @@ def is_not_found(exc: BaseException) -> bool:
             or "Unable to find published dashboard" in text)
 
 
+SYNCED_TABLE_PIPELINE_PREFIX = "Synced table:"
+
+
+def pipeline_not_creatable(spec: Any) -> str:
+    """Why a (non-DAB) pipeline spec cannot be recreated through `POST /pipelines`, or "" if it can
+    (PLAN 16.3 §6). A pipeline with no non-empty `libraries` and no `ingestion_definition` has no
+    source code, and the API refuses it (`libraries must contain at least one element`) — e.g. the
+    platform-owned pipeline behind a UC synced table. Shared by export AND import, so a 1.x bundle
+    that still says `create` gets the same answer."""
+    if not isinstance(spec, dict) or not spec:
+        return ""
+    if any(lib for lib in (spec.get("libraries") or [])) or spec.get("ingestion_definition"):
+        return ""
+    if spec.get("gateway_definition"):
+        # A Lakeflow Connect ingestion GATEWAY has no `libraries` by design. It is bound to a UC
+        # connection (+ a staging catalog/schema) — UC is out of scope, so it is a manual recreate.
+        conn = safe_str((spec.get("gateway_definition") or {}).get("connection_name"))
+        return (f"is a Lakeflow Connect ingestion gateway"
+                f"{f' on UC connection `{conn}`' if conn else ''} — the connection is Unity "
+                f"Catalog (out of scope). Create the connection on the target, then recreate the "
+                f"gateway and its ingestion pipeline in Lakeflow Connect.")
+    name = safe_str(spec.get("name"))
+    if name.startswith(SYNCED_TABLE_PIPELINE_PREFIX):
+        fqn = name[len(SYNCED_TABLE_PIPELINE_PREFIX):].strip()
+        return (f"belongs to the synced table `{fqn}` (UC/Lakebase, out of scope) — recreate the "
+                f"synced table on the target and the platform recreates this pipeline.")
+    return ("no source code (`libraries` is empty), so the pipelines API can't recreate it — "
+            "recreate whatever owns it.")
+
+
 def looks_like_app_id(owner: Any) -> bool:
     """A UUID-shaped owner is a service-principal home; an email is a user home."""
     o = safe_str(owner)

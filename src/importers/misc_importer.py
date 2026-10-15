@@ -13,7 +13,11 @@ burning DBUs is not a default.
 **Workspace conf is written key-by-key, from a documented key set only.** `PATCH workspace-conf`
 accepts arbitrary keys, and blanket-writing whatever the source returned could flip a security
 setting (token access, IP-list enforcement) on the target. So each key is applied individually — one
-rejected key doesn't take the others down with it — and the note names what changed.
+rejected key doesn't take the others down with it — and the note names what changed. Every write is
+READ BACK (PLAN 16.3 §2): a 200 alone proves nothing, because which keys a workspace silently
+ignores differs per workspace — a key the target did not take is `failed`/`not_applied`, never
+`Created`. A key whose target value differs from source is re-applied on every run (D2), which heals
+a 1.x row that recorded `Created` on the strength of the 200 alone.
 
 **IP access lists are NOT here**: they are account-level for this customer, so a workspace-scoped tool
 cannot see or migrate them (master §6a) — a customer/account-admin task, out of scope by decision.
@@ -22,7 +26,8 @@ from __future__ import annotations
 
 import json
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing, SkippedNoObject
+from src.importers.base_importer import (BaseImporter, NotApplied, PrerequisiteMissing,
+                                         SkippedNoObject)
 from src.state.state_store import CAT_DEPENDENCY_UNRESOLVED
 from src.utils.helpers import safe_str
 
@@ -62,6 +67,9 @@ class MiscImporter(BaseImporter):
         # once. We only ever stop clusters in this set, so a cluster the customer already had running
         # is never stopped out from under them.
         self._force_started_clusters: set = set()
+        # Target workspace-conf values read by `existing_keys` (PLAN 16.3 §2): an unchanged key whose
+        # target value differs from source is re-applied (`recheck_unchanged`).
+        self._target_conf: dict = {}
 
     def load(self) -> list[dict]:
         """Init scripts → libraries (need clusters) → conf."""
@@ -82,6 +90,7 @@ class MiscImporter(BaseImporter):
                                    params={"keys": ",".join(sorted(KNOWN_CONF_KEYS))}) or {}
             for key, value in (conf.items() if isinstance(conf, dict) else []):
                 out[key] = safe_str(value)
+                self._target_conf[key] = value
         except Exception as exc:  # noqa: BLE001 — a conf read failure must not stop the phase
             self.log.warning("workspace-conf read failed", error=str(exc)[:200])
 
@@ -124,6 +133,25 @@ class MiscImporter(BaseImporter):
             if safe_str(st.get("status")).upper() in _LIBRARY_PRESENT_STATES:
                 labels.add(_library_label(st.get("library")))
         return labels
+
+    def recheck_unchanged(self, unit: dict, row) -> bool:
+        """An unchanged conf key is re-applied when the TARGET value differs from source (§2, D2) —
+        a 1.x false `Created`, or a hand change on target. Matching keys stay SKIP, zero writes."""
+        if safe_str(unit.get("asset_type")) != "workspace_conf":
+            return False
+        payload = unit.get("payload") or {}
+        key = safe_str(payload.get("key")) or self.natural_key(unit)
+        return (key in self._target_conf
+                and _conf_norm(self._target_conf[key]) != _conf_norm(payload.get("value")))
+
+    def dry_run_intent(self, unit: dict, action) -> str:
+        if safe_str(unit.get("asset_type")) != "workspace_conf":
+            return ""
+        payload = unit.get("payload") or {}
+        key = safe_str(payload.get("key")) or self.natural_key(unit)
+        current = self._target_conf.get(key)
+        return (f"would set `{key}` to {safe_str(payload.get('value'))!r} (target currently "
+                f"{safe_str(current)!r})")
 
     def create_one(self, unit: dict) -> dict:
         asset_type = safe_str(unit.get("asset_type"))
@@ -307,7 +335,24 @@ class MiscImporter(BaseImporter):
                 f"Set it by hand if it is wanted: value on source was {value!r}.")
         # One key per call: a single rejected key must not take the others down with it.
         self.client.patch("api/2.0/workspace-conf", {key: safe_str(value)})
-        return {"target_id": key, "note": f"{key} set to {safe_str(value)!r}"}
+        # Read back (§2): a read right after the PATCH sees the new value (verified live), so a
+        # mismatch means this workspace ignores the key through the API. A FAILED row stores no
+        # fingerprint, so it stays red until the target really matches.
+        got = self.client.get("api/2.0/workspace-conf", params={"keys": key}) or {}
+        observed = got.get(key) if isinstance(got, dict) else None
+        if _conf_norm(observed) != _conf_norm(value):
+            raise NotApplied(
+                f"`{key}` was set to {safe_str(value)!r} and the API returned 200, but the target "
+                f"still reads {safe_str(observed)!r} — this workspace ignores it through the API. "
+                f"Set it in the admin console, then re-run.")
+        self._target_conf[key] = observed
+        return {"target_id": key,
+                "note": f"{key} set to {safe_str(value)!r} (verified by read-back)"}
+
+
+def _conf_norm(value) -> str:
+    """Workspace-conf values compare as strings: the GET returns `"true"`/`"30"` or `null` (V3)."""
+    return "" if value is None else safe_str(value).strip().lower()
 
 
 def _library_label(library) -> str:

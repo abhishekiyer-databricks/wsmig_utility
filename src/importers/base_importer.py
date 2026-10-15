@@ -45,8 +45,9 @@ from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATE
                                    CAT_NOT_SUPPORTED, CAT_PERMISSION_DENIED,
                                    CAT_PREREQUISITE_MISSING, UpsertAction)
 from src.state import state_store as _state_mod
-from src.utils.helpers import (folder_natural_key, home_owner, is_platform_internal,
-                               looks_like_app_id, normalize_ws_path, safe_str)
+from src.utils.helpers import (folder_natural_key, home_owner, is_not_found,
+                               is_platform_internal, looks_like_app_id, normalize_ws_path,
+                               safe_str)
 from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 
 # The single decision a `/Users/<owner>/...` path resolves to (PLAN 9, lifted here in PLAN 11
@@ -530,13 +531,28 @@ class BaseImporter(ABC):
 
     def missing_parent_prerequisite(self, exc: Exception, parent_path, natural_key: str) -> None:
         """Turn a create's "parent folder does not exist" into a clean prerequisite (the path is NOT
-        silently dropped) — shared by every folder-placed asset. Re-raise otherwise."""
+        silently dropped) — shared by every folder-placed asset. Returns otherwise (caller re-raises).
+
+        PLAN 16.3 §7: the words alone prove nothing — a Genie create naming a missing UC TABLE says
+        "does not exist" too, and relabelling it "folder missing" hid the real cause. So our message
+        is used ONLY when an uncached `get-status` of the exact parent returns a real 404; a 200 or
+        any other probe error leaves the server's own error to be reported verbatim."""
         msg = str(exc).lower()
-        if parent_path and ("does not exist" in msg or "tree node" in msg):
-            raise PrerequisiteMissing(
-                f"`{natural_key}` targets workspace folder `{parent_path}`, which does not exist on "
-                f"target yet — provision/assign its owner (a user home is created on first login) or "
-                f"import the folder's content family first, then re-run with retry_mode=failed_only.")
+        if not (parent_path and ("does not exist" in msg or "tree node" in msg)):
+            return
+        try:
+            self.client.get("api/2.0/workspace/get-status", params={"path": parent_path})
+        except Exception as probe:  # noqa: BLE001 — only a confirmed 404 changes the outcome
+            if is_not_found(probe):
+                raise PrerequisiteMissing(
+                    f"`{natural_key}` targets workspace folder `{parent_path}`, which does not exist "
+                    f"on target yet — provision/assign its owner (a user home is created on first "
+                    f"login) or import the folder's content family first, then re-run with "
+                    f"retry_mode=failed_only.") from exc
+            self.log.debug(f"parent {parent_path} unverifiable ({str(probe)[:160]}) — the "
+                           f"server's error is reported as-is")
+            return
+        self.log.debug(f"parent {parent_path} exists — the server's error is reported as-is")
 
     # ── the shared home-target resolver (PLAN 9 / PLAN 11 Finding-8) ───────
     # ONE copy, used by the workspace importer (content) AND the folder-placed importers (SQL

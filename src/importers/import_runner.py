@@ -2,8 +2,8 @@
 ImportRunner — orchestrates `04_Import` (TARGET side). Mirror of InventoryRunner/ExportRunner.
 
 Flow:
-  1. **Resolve which bundle to act on** (§3): run_id widget → resume an incomplete import →
-     `LATEST_EXPORT.json` pointer → fail loudly. Never invent a run_id; that would import an empty
+  1. **Resolve which bundle to act on** (§3): run_id widget → `LATEST_EXPORT.json` pointer →
+     fail loudly. Never invent a run_id; that would import an empty
      bundle and report a spuriously clean run.
   2. **Verify the bundle** — a HARD gate (D7). Any checksum mismatch or missing file aborts BEFORE
      a single write: a partial upload must never present as a partial migration.
@@ -41,6 +41,10 @@ _LOG = get_logger("import")
 # goes red; the checkpoint recovery replay re-merges the rows on the next run.
 RUN_STATUS_STATE_NOT_SAVED = "completed_state_not_saved"
 
+# run_status when every phase ran and the state was saved, but a report artifact did not land
+# (PLAN 16.3 §3). The notebook raises on it so a green run can never leave no import_status.xlsx.
+RUN_STATUS_NO_REPORT = "completed_no_report"
+
 
 _DASHBOARD_CHILD_TYPES = ("lakeview_dashboard_publish", "lakeview_dashboard_schedule")
 
@@ -56,56 +60,30 @@ class PrerequisiteError(RuntimeError):
 def resolve_import_run_id(config, explicit_run_id: str = "") -> tuple[str, str]:
     """Which bundle does import act on? Returns (run_id, how). Raises if none resolvable (§3).
 
-    Precedence mirrors Export's so the two behave alike:
       1. explicit run_id (widget or task value) → deliberate control; re-import a specific bundle
-      2. the newest INCOMPLETE import (an import checkpoint present, no import_results.json) →
-         RESUME it, which is what makes a plain re-run continue rather than restart
-      3. `LATEST_EXPORT.json` → the newest bundle whose export COMPLETED (the pointer is written
+      2. `LATEST_EXPORT.json` → the newest bundle whose export COMPLETED (the pointer is written
          after the manifest, so its existence proves completeness)
-      4. fail loudly — never invent a run_id
+      3. fail loudly — never invent a run_id
+
+    PLAN 16.3 §1: there is no "continue any unfinished import" scan any more. An import that crashed
+    in the latest export's folder is in that same folder, so it is still continued (its checkpoint +
+    the state table skip the work already done); the old scan could instead pick a crashed import in
+    an OLDER folder, whose older copy of the source would UPDATE the target back to stale content.
     """
-    from src.exporters.bundle_state import list_run_ids, read_latest_export_pointer, run_dir
-    import os
+    from src.exporters.bundle_state import read_latest_export_pointer, wsmig_root
 
     explicit = (explicit_run_id or "").strip()
     if explicit:
         return explicit, "widget"
 
-    if not config.imports.force_full_import:
-        for rid in list_run_ids(config):
-            d = run_dir(config, rid)
-            started = os.path.isfile(os.path.join(d, BP.CHECKPOINT_JSON))
-            finished = os.path.isfile(os.path.join(d, BP.IMPORT_RESULTS_JSON))
-            # An import that started and never finished is resumable. Requiring a manifest too
-            # keeps us from "resuming" a bundle whose EXPORT never completed.
-            if started and not finished and os.path.isfile(os.path.join(d, BP.MANIFEST_JSON)):
-                if _has_import_checkpoint(d):
-                    return rid, "resume-incomplete-import"
-
     pointer = read_latest_export_pointer(config)
     if pointer and pointer.get("run_id"):
         return safe_str(pointer["run_id"]), "LATEST_EXPORT.json"
 
-    from src.exporters.bundle_state import wsmig_root
     raise RuntimeError(
-        "Cannot resolve which bundle to import: no run_id widget, no incomplete import, and no "
+        "Cannot resolve which bundle to import: no run_id widget and no "
         f"LATEST_EXPORT.json under {wsmig_root(config)}. Run 02_Export first (in `airgap` mode, "
         "check ops copied the whole run dir AND LATEST_EXPORT.json), or pass an explicit run_id.")
-
-
-def _has_import_checkpoint(run_dir_path: str) -> bool:
-    """Whether the checkpoint carries IMPORT progress (not just export's content keys)."""
-    import json
-    import os
-    p = os.path.join(run_dir_path, BP.CHECKPOINT_JSON)
-    try:
-        with open(p, encoding="utf-8") as f:
-            cp = json.load(f) or {}
-    except Exception as exc:  # noqa: BLE001 — degraded: an unreadable checkpoint is not resumable
-        _LOG.warning(f"checkpoint unreadable — this run dir is not treated as a resumable import: "
-                     f"{exc}", path=p)
-        return False
-    return any(str(k).startswith("import:") for k in cp)
 
 
 class ImportRunner:
@@ -276,10 +254,19 @@ class ImportRunner:
                                "The target WAS changed; the checkpoint recovery replay re-merges "
                                "the rows on the next run. Fix the state table, then re-run.")
             summary.update(self._summarize(t0))
+            report_failed = False
             try:
                 self._write_reports(summary)
+                report_failed = bool((summary.get("reports") or {}).get("errors"))
             except Exception as exc:  # noqa: BLE001 — reporting must not mask the real error
-                _LOG.warning("report writing failed", error=str(exc), exc_info=True)
+                report_failed = True
+                _LOG.error(f"report writing failed: {exc}", exc_info=True)
+            if report_failed and self.run_status == "completed":
+                # completed_state_not_saved / aborted keep priority — they are the worse outcome.
+                self.run_status = summary["run_status"] = RUN_STATUS_NO_REPORT
+                _LOG.error("an import report was NOT written — run_status=completed_no_report. The "
+                           "target WAS changed and the state WAS saved; re-run the import with "
+                           f"run_id={self.config.run_id} to rewrite the reports.")
             totals = summary.get("totals") or {}
             _LOG.info(f"import run {summary.get('run_status')} — "
                       + fmt_counts({k: totals.get(k, 0) for k in

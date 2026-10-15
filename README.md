@@ -41,7 +41,8 @@ so the *same pair can be re-run many times* — new assets are **created**, chan
 default).
 
 > ⚠️ **Out of scope:** Unity Catalog assets, Hive metastore, MLflow, Agent Bricks agents, PATs,
-> and IP access lists. Full scope table → [Architecture › Scope](docs/ARCHITECTURE.md#-scope--what-is-and-isnt-migrated).
+> and IP access lists. Lakeflow Connect pipelines (gateway + ingestion) depend on a UC connection, so
+> they are a manual step ([Runbook](docs/RUNBOOK.md)). Full scope table → [Architecture › Scope](docs/ARCHITECTURE.md#-scope--what-is-and-isnt-migrated).
 
 ## 🔀 Two connectivity modes
 

@@ -298,10 +298,12 @@ def test_creator_name_is_not_sent_on_a_warehouse():
 def test_a_uc_pipeline_names_the_uc_dependency_up_front():
     """"the UC migration hasn't run" and "our payload is wrong" need different responses, and the
     raw API error does not distinguish them."""
-    client = RecordingClient()
+    # PLAN 16.3 §6: a pipeline needs source code to be creatable, so the fixture carries one.
+    client = RecordingClient(status_paths={"/Shared/p1"})
     imp, _st, _aw = _make(DltImporter, [
         _unit("dlt_pipeline", "p1", {"name": "p1", "catalog": "prod_cat", "schema": "bronze",
-                                     "libraries": []})], client)
+                                     "libraries": [{"notebook": {"path": "/Shared/p1"}}]})],
+        client)
     res = imp.run()
     assert res.warned == 1
     note = res.units[0]["note"]
@@ -319,10 +321,11 @@ def test_pipeline_source_notebook_missing_on_target_is_flagged():
 
 
 def test_pipeline_cluster_policy_is_remapped_and_server_fields_stripped():
-    client = RecordingClient()
+    client = RecordingClient(status_paths={"/Shared/p1"})
     imp, _st, _aw = _make(DltImporter, [
         _unit("cluster_policy", "pol", {}, source_id="SRC-POL"),
         _unit("dlt_pipeline", "p1", {"name": "p1", "id": "SOURCE-PIPELINE-ID",
+                                     "libraries": [{"notebook": {"path": "/Shared/p1"}}],
                                      "state": "IDLE", "pipeline_type": "WORKSPACE",
                                      "clusters": [{"label": "default", "policy_id": "SRC-POL"}]}),
     ], client, context={"cluster_policy_target_ids": {"pol": "TGT-POL"}})
@@ -650,6 +653,10 @@ def test_an_unknown_workspace_conf_key_is_refused_not_blanket_written():
 def test_a_known_conf_key_is_applied_one_key_per_call():
     """One key per call, so a single rejected key can't take the others down with it."""
     client = RecordingClient()
+    # PLAN 16.3 §2: every write is read back, so the fake target reflects what was PATCHed.
+    client.get_table["api/2.0/workspace-conf"] = lambda params: {
+        k: v for c in client.calls if c[0] == "PATCH" and "workspace-conf" in c[1]
+        for k, v in c[2].items()}
     imp, _st, _aw = _make(MiscImporter, [
         _unit("workspace_conf", "enableTokensConfig",
               {"key": "enableTokensConfig", "value": "false"}),

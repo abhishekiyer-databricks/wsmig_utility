@@ -28,6 +28,7 @@ straight to a FUSE `/Volumes` path corrupts the file (memory `uc-volume-file-io-
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from src.exporters import bundle_paths as BP
@@ -120,7 +121,10 @@ def _all_rows(results: list) -> list[dict]:
 
 
 def write_import_reports(aw, config, summary: dict, results: list, context: dict) -> dict:
-    """Write every import artifact. Never raises — a reporting failure must not fail the run.
+    """Write every import artifact. Never raises — a reporting failure must not mask the run's own
+    outcome. Each artifact that fails, or does not land as a non-empty file, is logged at ERROR and
+    listed under `errors` (`[{artifact, path, error}]`) so the runner can turn the task red
+    (`completed_no_report`, PLAN 16.3 §3) instead of finishing green with no report.
 
     Report FILENAMES vary so a re-run against the SAME run dir never silently clobbers the prior
     report (each import re-uses the same bundle/run_id):
@@ -174,11 +178,17 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
     # On a live retry the results json is tagged too, so the canonical (last full-run) join surface
     # is preserved; dry + full-live write the canonical name.
     json_rel = BP.with_variant(BP.IMPORT_RESULTS_JSON, _variant)
+    errors: list[dict] = []
+
+    def _failed(artifact: str, rel: str, error: str, exc_info: bool = False) -> None:
+        errors.append({"artifact": artifact, "path": rel, "error": error})
+        _LOG.error(f"import report {artifact} NOT written: {rel} — {error}", exc_info=exc_info)
+
     try:
         aw.write_json(json_rel, payload)
         written["json"] = json_rel
-    except Exception as exc:  # noqa: BLE001
-        _LOG.warning("import results json not written", rel=json_rel, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — recorded in `errors`; the runner turns the task red
+        _failed("json", json_rel, str(exc), exc_info=True)
 
     # A1: a rehearsal writes a SEPARATE filename so a later live run never overwrites the dry-run's
     # report; a live retry writes `import_status_retry_<ts>.xlsx`. D-1: the ACL parity result is
@@ -200,17 +210,32 @@ def write_import_reports(aw, config, summary: dict, results: list, context: dict
                                        outstanding))
         if path:
             written["xlsx"] = xlsx_rel
-    except Exception as exc:  # noqa: BLE001 — Excel is a convenience; never fail the run
-        _LOG.warning("import status xlsx not written", rel=xlsx_rel, error=str(exc))
+        else:
+            _failed("xlsx", xlsx_rel, "the workbook rendered nothing")
+    except Exception as exc:  # noqa: BLE001 — recorded in `errors`; the runner turns the task red
+        _failed("xlsx", xlsx_rel, str(exc), exc_info=True)
 
     md_rel = BP.with_variant(BP.MANUAL_ACTIONS_IMPORT_MD, _variant)
     try:
         aw.write_bytes(md_rel, _render_manual_actions(summary, rows).encode("utf-8"))
         written["manual_actions"] = md_rel
-    except Exception as exc:  # noqa: BLE001
-        _LOG.warning("manual_actions_import.md not written", rel=md_rel, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — recorded in `errors`; the runner turns the task red
+        _failed("manual_actions", md_rel, str(exc), exc_info=True)
+
+    # A write that "succeeded" is only trusted once the file is really there with content.
+    for artifact in ("json", "xlsx", "manual_actions"):
+        rel = written.get(artifact)
+        if not rel:
+            continue
+        full = os.path.join(aw.root, rel)
+        size = os.path.getsize(full) if os.path.isfile(full) else -1
+        if size <= 0:
+            written.pop(artifact)
+            _failed(artifact, rel, "missing after the write" if size < 0 else "0 bytes after the write")
 
     _LOG.info("import reports written", **written)
+    if errors:
+        written["errors"] = errors     # only when something failed: a clean run's dict is unchanged
     return written
 
 

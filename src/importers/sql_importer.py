@@ -18,11 +18,15 @@ from __future__ import annotations
 from typing import Optional
 
 from src.importers.base_importer import BaseImporter, HardRemapFailure, UnsupportedOperation
-from src.utils.helpers import safe_str
+from src.utils.helpers import home_owner, looks_like_app_id, safe_str
 
 # The v1 alert `op` vocabulary. The modern `condition.op` uses words; v1 wants symbols.
 _V1_OPS = {"GREATER_THAN": ">", "GREATER_THAN_OR_EQUAL": ">=", "LESS_THAN": "<",
            "LESS_THAN_OR_EQUAL": "<=", "EQUAL": "==", "NOT_EQUAL": "!="}
+
+# Alerts V2 `evaluation` fields the server updates on every scheduled run (PLAN 16.3 §8) — read-only,
+# stripped at export since 1.2.0 and dropped from the body for bundles written before that.
+_ALERT_V2_EVAL_RUNTIME = ("state", "last_evaluated_at")
 
 
 def _legacy_alert_options(condition) -> Optional[dict]:
@@ -47,6 +51,14 @@ class SqlImporter(BaseImporter):
     component = "sql"
     asset_types = ("sql_warehouse", "legacy_query", "legacy_alert", "alert_v2",
                    "legacy_dashboard")
+    # PLAN 16.3 §4: an adopted query's OWNER is reconciled (`adopt_one`), not just recorded.
+    reconcile_on_adopt_types = ("legacy_query",)
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        # `{target query id: owner_user_name}` from the target LIST (`existing_keys`) — what the
+        # owner recheck compares against, at no extra call.
+        self._target_query_owner: dict = {}
 
     def load(self) -> list[dict]:
         """Warehouses → queries → alerts. Legacy dashboards ride along as `manual` units."""
@@ -73,6 +85,8 @@ class SqlImporter(BaseImporter):
                                             params={"page_size": 100})
         q_list = [{"_name": safe_str(q.get("display_name") or q.get("name")),
                    "id": safe_str(q.get("id"))} for q in queries]
+        self._target_query_owner.update({safe_str(q.get("id")): safe_str(q.get("owner_user_name"))
+                                         for q in queries if q.get("id")})
         q_found = self.folder_existing_keys("legacy_query", q_list, "_name", "id")
         self.context.setdefault("legacy_query_target_ids", {}).update(q_found)
         out.update(q_found)
@@ -114,10 +128,11 @@ class SqlImporter(BaseImporter):
             # Redash `/preview/sql/queries/{id}` convention) does NOT exist on modern workspaces and
             # 404s ENDPOINT_NOT_FOUND, so every legacy_query update silently failed. CREATE stays a
             # POST with no id (correct). The mask names exactly the fields the body carries.
-            body, _res = self._query_body(payload)
+            body, res = self._query_body(payload)
             self.client.patch(f"api/2.0/sql/queries/{target_id}",
                               {"query": body, "update_mask": ",".join(sorted(body.keys()))})
-            return {"target_id": target_id}
+            return _merge_outcome({"target_id": target_id},
+                                  self._reconcile_query_owner(unit, target_id, res.kind))
         if asset_type == "legacy_alert":
             self.client.put(f"api/2.0/sql/alerts/{target_id}", self._legacy_alert_body(payload))
             return {"target_id": target_id}
@@ -159,12 +174,87 @@ class SqlImporter(BaseImporter):
             raise
         qid = safe_str(created.get("id"))
         self.context.setdefault("legacy_query_target_ids", {})[self.natural_key(unit)] = qid
+        self._target_query_owner[qid] = safe_str(created.get("owner_user_name"))
         parent = safe_str(body.get("parent_path"))
         # PLAN 11 Finding-8: an orphaned owner's query is preserved under the backup root as
         # created_with_warning (parity with notebooks), never a hard prerequisite_missing failure.
         if res.kind == "backup":
-            return {"target_id": qid, "warning": res.note}
-        return {"target_id": qid, "note": f"created in {parent}" if parent else ""}
+            out = {"target_id": qid, "warning": res.note}
+        else:
+            out = {"target_id": qid, "note": f"created in {parent}" if parent else ""}
+        return _merge_outcome(out, self._reconcile_query_owner(unit, qid, res.kind))
+
+    # ── query owner (PLAN 16.3 §4) ────────────────────────────────────────
+    def _desired_query_owner(self, unit: dict, res_kind: str = "") -> tuple[str, str]:
+        """`(target owner to set, why-not note)`. ("", "") = nothing to do (a 1.x bundle carries no
+        `source_owner`). An owner deleted in source, or a query preserved under the backup root,
+        is left alone with a note — there is no one on target to hand it to."""
+        src = safe_str(unit.get("source_owner"))
+        if not src:
+            return "", ""
+        parent_owner = home_owner((unit.get("payload") or {}).get("parent_path"))
+        if (res_kind == "backup" or self._roster_status(src) == "absent"
+                or (parent_owner and self._roster_status(parent_owner) == "absent")):
+            return "", (f"owner left as the migration identity: source owner `{src}` was deleted in "
+                        f"source")
+        ptype = "service_principal" if looks_like_app_id(src) else "user"
+        return self.resolve_principal(src, ptype), ""
+
+    def _reconcile_query_owner(self, unit: dict, qid: str, res_kind: str = "") -> dict:
+        """Give the target query its SOURCE owner when it differs (the owner is read-only at create,
+        so every created query starts owned by the migration identity). PATCH, then GET and compare.
+        Returns {} when nothing was needed, else `{"note"}` / `{"warning"}` (+ `changed` once a PATCH
+        was sent) — a failed owner change is a warning, never a failure: the query itself exists."""
+        owner, skip = self._desired_query_owner(unit, res_kind)
+        if not owner:
+            return {"note": skip} if skip else {}
+        current = safe_str(self._target_query_owner.get(qid))
+        if current and current.lower() == owner.lower():
+            return {}
+        try:
+            self.client.patch(f"api/2.0/sql/queries/{qid}",
+                              {"query": {"owner_user_name": owner},
+                               "update_mask": "owner_user_name"})
+            got = self.client.get(f"api/2.0/sql/queries/{qid}") or {}
+        except Exception as exc:  # noqa: BLE001 — degraded: surfaced as the unit's WARNING
+            return {"changed": True,
+                    "warning": f"query left owned by the migration SP: setting its owner to "
+                               f"`{owner}` failed: {str(exc)[:300]}"}
+        observed = safe_str(got.get("owner_user_name"))
+        if observed.lower() != owner.lower():
+            return {"changed": True,
+                    "warning": f"query left owned by the migration SP: owner set to `{owner}` but "
+                               f"the target reads `{observed}`"}
+        self._target_query_owner[qid] = observed
+        return {"changed": True, "note": f"owner set to {owner} (verified)"}
+
+    def _query_owner_differs(self, unit: dict, qid: str) -> bool:
+        """Whether an existing target query's owner (from the LIST — no extra call) is not the
+        desired one. An unknown target owner is not "different": nothing is guessed."""
+        owner, _skip = self._desired_query_owner(unit)
+        current = safe_str(self._target_query_owner.get(qid))
+        return bool(owner and current and current.lower() != owner.lower())
+
+    def recheck_unchanged(self, unit: dict, row) -> bool:
+        """An unchanged query whose target owner is not its source owner is revisited (§4) — a 1.x
+        target has every query owned by the migration SP."""
+        if safe_str(unit.get("asset_type")) != "legacy_query":
+            return False
+        key = self.natural_key(unit)
+        qid = (safe_str((self.context.get("legacy_query_target_ids") or {}).get(key))
+               or safe_str((row or {}).get("target_object_id")))
+        return bool(qid) and self._query_owner_differs(unit, qid)
+
+    def adopt_one(self, unit: dict, target_id: str) -> dict:
+        """ADOPT of a query: a moved fingerprint is a full update (+ owner — 1.1.1's stale-update
+        rule); otherwise only the owner is corrected when it differs; otherwise plain adopted."""
+        row = (self.state.row("legacy_query", self.natural_key(unit))
+               if self.state is not None else None)
+        stored_fp = safe_str((row or {}).get("last_source_fingerprint"))
+        if stored_fp not in ("", safe_str(unit.get("fingerprint"))):
+            return {**self.update_one(unit, target_id), "changed": True}
+        return {"changed": False, "target_id": target_id,
+                **self._reconcile_query_owner(unit, target_id)}
 
     def _query_body(self, payload: dict):
         body = dict(payload)
@@ -235,6 +325,11 @@ class SqlImporter(BaseImporter):
         # PLAN 8 Bug 7: keep + remap `parent_path` (was popped) so the alert lands in its folder.
         # PLAN 8 Bug 10: `evaluation` + `schedule` (both REQUIRED by create) now travel because the
         # collector enriches the shallow LIST via GET-by-id — nothing to add here beyond remaps.
+        # PLAN 16.3 §8: a 1.x bundle still carries the read-only evaluation runtime fields.
+        evaluation = body.get("evaluation")
+        if isinstance(evaluation, dict) and any(f in evaluation for f in _ALERT_V2_EVAL_RUNTIME):
+            body["evaluation"] = {k: v for k, v in evaluation.items()
+                                  if k not in _ALERT_V2_EVAL_RUNTIME}
         res = self.remap_parent_path(body)
         self._remap_warehouse(body, referenced_by=f"alert `{safe_str(body.get('display_name'))}`")
         return body, res
@@ -280,3 +375,11 @@ class SqlImporter(BaseImporter):
                 f"{referenced_by or 'this object'} has an empty warehouse_id — no warehouse is "
                 f"configured on source, so there is nothing to remap. Configure it on source and "
                 f"re-export (lift-and-shift does not substitute a warehouse).")
+
+
+def _merge_outcome(out: dict, extra: dict) -> dict:
+    """Fold an owner-step outcome (`note` / `warning`) into a create/update outcome."""
+    for field in ("note", "warning"):
+        if extra.get(field):
+            out[field] = "; ".join(x for x in (safe_str(out.get(field)), extra[field]) if x)
+    return out

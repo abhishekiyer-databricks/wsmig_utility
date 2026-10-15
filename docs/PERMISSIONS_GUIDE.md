@@ -137,6 +137,22 @@ Import does **not** read table data. But if you want to *test* a migrated Genie 
 pipeline that references UC tables by FQN, the run-as SP needs `USE CATALOG` / `USE SCHEMA` +
 `SELECT` on those referenced tables (UC is out of scope, so those tables must pre-exist on target).
 
+### Pipelines the migration identity ends up running *(UC pipelines)*
+
+The tool **never changes a pipeline's owner** (on a UC pipeline that needs a metastore admin), so a
+migrated pipeline is owned by the run-as SP, and a UC pipeline **runs as its owner** unless its spec
+sets `run_as`:
+
+- **User-owned source pipelines run as the run-as SP** on the target — it needs `USE CATALOG` /
+  `USE SCHEMA` + the table privileges those pipelines read and write, until a metastore admin
+  transfers ownership (Runbook › Owners & run-as identities).
+- **SP-owned source pipelines keep running as that SP** (spec `run_as`). To set another SP as
+  `run_as`, the run-as SP **needs the Service Principal User role** on it (*Settings → Identity
+  and access → Service principals → that SP → Permissions*). Workspace admin and Service Principal
+  **Manager** do not include it (verified 2026-10-14). Without it the pipeline is created running
+  as the run-as SP and the row is `created_with_warning` naming the SP. That SP also needs the
+  pipeline's UC privileges — a missing `USE CATALOG` fails the row with the server's message.
+
 ---
 
 ## 🌐 Network & environment prerequisites
@@ -266,6 +282,7 @@ clean manual actions** (in `reports/manual_actions_import.md`) rather than faili
 | **Preflight BLOCKING: migration state table** | State catalog/schema missing, or SP lacks `CREATE TABLE`/`USE` | Pre-create catalog+schema; grant `USE CATALOG`/`USE SCHEMA`/`CREATE TABLE`/`MODIFY`/`SELECT` |
 | **AKV secret scope reported `manual`** | Expected — AKV creation is unautomatable here | Create by hand, then `retry_mode=failed_only` |
 | **Job import 403: "not authorized to use … SQL Endpoint"** | Ordering effect — the job was created before the warehouse's `CAN_USE` grant was replayed (ACLs run last) | **Just re-run `retry_mode=failed_only`** — the warehouse ACL is now in place, so the job's `run_as` can use it. *(No manual grant needed when that `CAN_USE` existed on the source.)* |
+| **Pipeline row `created_with_warning`: "runs as the migration identity; source ran as SP …"** | The run-as SP lacks the **Service Principal User** role on that SP (target said `Cannot bind the service principal provided in 'run_as'`) | Grant the run-as SP the **Service Principal User** role on that SP, then re-run |
 | **Account identities reported as prerequisites** | Not yet assigned to target + no account-admin | Customer IT assigns them (or grant account-admin) |
 
 ---

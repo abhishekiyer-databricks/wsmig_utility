@@ -168,3 +168,8 @@ if not _verify["ok"]:
     _logger.get_logger("notebook").error(f"  missing: {_verify['missing'][:10]}")
     _logger.get_logger("notebook").error(f"  mismatched: {_verify['mismatched'][:10]}")
 _say(_logger.FULL_LOG_HINT)
+
+# PLAN 16.3 §1: the run's folder again at the very END of the output, so the operator does not have
+# to scroll back to the header for it.
+_say(f"Run id : {cfg.run_id}")
+_say(f"Folder : {cfg.output_path.rstrip('/')}/   (reports/ = the xlsx, misc/ = the JSON + logs)")

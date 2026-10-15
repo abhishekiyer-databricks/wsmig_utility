@@ -163,3 +163,8 @@ if result["warnings"]:
 _say(f"Artifacts: {result['output_path']}")
 _say("  reports/inventory.xlsx  ·  misc/inventory.json  ·  misc/identity_classification.json")
 _say(_logger.FULL_LOG_HINT)
+
+# PLAN 16.3 §1: the run's folder again at the very END of the output, so the operator does not have
+# to scroll back to the header for it.
+_say(f"Run id : {cfg.run_id}")
+_say(f"Folder : {cfg.output_path.rstrip('/')}/   (reports/ = the xlsx, misc/ = the JSON + logs)")
