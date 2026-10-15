@@ -589,3 +589,30 @@ skipped_no_object 59 · failed 6 (the same 6 as Run 1). Evidence `~/Desktop/wsmi
   `test_alert_v2_already_on_target_is_found_by_the_live_list_shape_and_skipped` pages the live shape through the
   REAL `ApiClient.get_paginated` (fails before the fix: create instead of skip). 604 pass. Run 3 is `failed_only`
   (alerts out of scope), so the live check is the next full import: both alerts `skipped`, no `POST api/2.0/alerts`.
+
+### Run 3 — standalone `failed_only`, blank run_id (2026-10-15) — PASS
+Git folder @ `603487b` (QA16.3-2 fix). `cust163_heal` created `catalog_src_g9c6nd.wsmig_test.retry_tbl_163` on target.
+`wsmig - import` run 196138743120929 (`dry_run=false`, `retry_mode=failed_only`, `run_id` blank) SUCCESS.
+Evidence `~/Desktop/wsmig_runs/plan16_3/run3/`.
+- **§1 PASS:** `Run id : 20261015_090931 (resolved via: LATEST_EXPORT.json)` = Run 2's folder; retry artifacts
+  `import_status_retry_20261015_095142.xlsx` / `import_results_retry_…json` / `manual_actions_import_retry_…md` written
+  there, Run 2's `import_status.xlsx` kept. State `rows=728 expected=728`.
+- **§7 PASS:** `wsmig_qa_163_genie` `created` (one POST, one space on target) + its ACL `created` (ai27_account_grp_1
+  CAN_RUN).
+- Roll-up created 2 · failed 5 (the by-design 5; the policied cluster's one re-tried POST 400s as before). Writes: exactly
+  those 3. Everything else "not in this retry's work list".
+- **Extra full import for QA16.3-2 (run 333035090423575, `retry_mode=off`) — did NOT exercise the fix:** blank run_id →
+  the same Run 2 folder, whose checkpoint already holds every phase, so all 728 rows replayed "resumed from checkpoint
+  — no API call this run" (zero writes; by design). It re-wrote that folder's `import_status.xlsx`/`import_results.json`
+  with the same statuses. A live check of QA16.3-2 needs a FRESH export folder (an end-to-end run).
+
+### QA16.3-2 live check + cleanup (2026-10-15) — PASS, live QA COMPLETE
+`cust163_cleanup` restored the source `wsmig_test_alert_v2` cron to `0 0 9 * * ?` (a real edit), then
+`wsmig - direct end-to-end (LIVE)` run 744042131314584 SUCCESS, bundle `20261015_111800`. Evidence
+`~/Desktop/wsmig_runs/plan16_3/run4_alerts/`.
+- `wsmig_test_alert_v2`: `exists=yes fingerprint=changed → UPDATE`, one PATCH, `updated`; target cron now `0 0 9 * * ?`.
+- `wsmig_test_alert_v2_b`: `exists=yes fingerprint=same → SKIP`. Zero `POST api/2.0/alerts` (Run 2 had 2 × 409).
+- Other writes = the known pre-16.3 set only (policied cluster 400, 2 permissionassignments, 2 subscriptions).
+- Cleanup done: alert cron restored; planted `20200101_000000`/`20200101_000001` deleted (contents checked first).
+- Log tip: when all tasks share one job cluster the `#seq` restarts per stage — dedup the doubled driver stderr by
+  whole line, not by `#seq`.
