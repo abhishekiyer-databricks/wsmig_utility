@@ -92,7 +92,8 @@ class SqlImporter(BaseImporter):
         self.context.setdefault("legacy_query_target_ids", {}).update(q_found)
         out.update(q_found)
 
-        alerts = self.client.get_paginated("api/2.0/alerts", "results", params={"page_size": 100})
+        # The Alerts V2 LIST returns its items under `alerts` (not `results` like queries) — QA16.3-2.
+        alerts = self.client.get_paginated("api/2.0/alerts", "alerts", params={"page_size": 100})
         a_list = [{"_name": safe_str(a.get("display_name") or a.get("name")),
                    "id": safe_str(a.get("id"))} for a in alerts]
         a_found = self.folder_existing_keys("alert_v2", a_list, "_name", "id")

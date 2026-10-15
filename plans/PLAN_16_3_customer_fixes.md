@@ -562,4 +562,30 @@ skipped_no_object 59 · failed 6. Evidence `~/Desktop/wsmig_runs/plan16_3/run1/`
   manifest + an import checkpoint (1.1.1's import would resume it); `…/20200101_000001/misc/checkpoint.json` only
   (1.1.1's inventory/export would resume it).
 
-(live QA appends here)
+### Run 2 — re-run + cancel + Repair run (2026-10-15) — PASS, 1 pre-existing finding (QA16.3-2)
+Git folder @ `4a50765` (the QA16.3-1 fix). Job run 384144645463303: inventory + export SUCCESS, import cancelled 2 min
+in (checkpoint had `import:identity` + `import:compute` only, no import_results/xlsx), Repair run (import only) SUCCESS.
+Bundle `20261015_090931`. Roll-up: skipped 647 · updated 2 · adopted 2 · created_with_warning 3 · manual 9 ·
+skipped_no_object 59 · failed 6 (the same 6 as Run 1). Evidence `~/Desktop/wsmig_runs/plan16_3/run2/`.
+- **§1 folder PASS:** inventory/export opened a fresh folder (not the planted `20200101_000001`); the repaired import
+  used the same folder (`resolved via: widget`), replayed identity + compute "resumed from checkpoint — no API call
+  this run" (49 rows), wrote ONE `import_status.xlsx`; state `rows=728 expected=728`; 728 units, no duplicate keys.
+  Both planted folders untouched. `LATEST_EXPORT.json` → `20261015_090931`.
+- **§4 PASS:** only `wsmig_test_query` written — one PATCH, "owner set to aman.bansal (verified)", live GET agrees; its
+  ACL re-applied once (source ACL changed with the owner). The other 18 queries skipped.
+- **§5 PASS:** `_cust1_sp3` one PUT, now runs as `ai27_acc_spn_3` (da12f5ae), IS_OWNER still the runner; no refusal,
+  no retry. Other pipelines skipped.
+- **QA16.3-1 fix PASS live:** ACL Parity 262/262 `match` (Run 1: 18 queries `extra_on_target`); Detail empty.
+- **Writes in the repaired import** (all accounted for): the query PATCH + its permissions PUT, the sp3 pipeline PUT,
+  and — identical in Run 1, not 16.3 — 2 `permissionassignments` PUTs (admins/users, idempotent), 2 dashboard
+  subscription POSTs (16.2 behaviour), the seeded Genie's 403, and 2 alert POSTs that 409 (below). The cancelled first
+  attempt made zero writes.
+- **QA16.3-2 (pre-existing on main, NOT fixed — needs a decision):** both Alerts V2 rows are `adopted` "create raced
+  the existence check" instead of `skipped`. `SqlImporter.existing_keys` reads the alerts LIST under key `results`,
+  but `GET /api/2.0/alerts` returns `{"alerts": [...]}` (the collector already uses `"alerts"`) → the target index is
+  always empty → every run POSTs a create, gets 409 ALREADY_EXISTS, and adopts. No duplicate, but one rejected write
+  per alert per run and the wrong status word. Likely related to PLAN_11 BUG-1. Fix = one key + a test.
+- **QA16.3-2 fixed (2026-10-15, user-approved):** `sql_importer.existing_keys` reads `"alerts"`. Test
+  `test_alert_v2_already_on_target_is_found_by_the_live_list_shape_and_skipped` pages the live shape through the
+  REAL `ApiClient.get_paginated` (fails before the fix: create instead of skip). 604 pass. Run 3 is `failed_only`
+  (alerts out of scope), so the live check is the next full import: both alerts `skipped`, no `POST api/2.0/alerts`.

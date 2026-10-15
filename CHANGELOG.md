@@ -51,6 +51,9 @@ Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint
 - **ACL Parity reported queries as `extra_on_target`** after their owner was set (QA16.3-1): changing a query's
   owner makes Databricks add an explicit `CAN_MANAGE` for the new owner, which a creator-owner on the source
   doesn't show. That one line is no longer counted as a difference; any other extra grant still is.
+- **Alerts V2 already on the target were never found** (QA16.3-2): the existence check read the alerts list under
+  the wrong key, so every run re-sent a create, got `ALREADY_EXISTS` and reported the alert `Adopted`. An
+  unchanged alert is now `Skipped` with no write, and a changed one is updated in place.
 - **Workspace settings reported `Created` that the target never took** (B4). Every write is read back; a key the
   target ignores is `failed` / `not_applied` ("set it in the admin console"), never `Created`.
 - **Synced-table pipelines failed on every run** (`libraries must contain at least one element`, CUST-2). A

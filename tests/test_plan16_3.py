@@ -25,7 +25,7 @@ import tempfile
 
 import pytest
 
-from src.auth.token_manager import HTTPStatusError
+from src.auth.token_manager import ApiClient, HTTPStatusError
 from src.exporters import bundle_paths as BP
 from src.exporters import bundle_state as bs
 from src.exporters.asset_export import build_all
@@ -261,6 +261,40 @@ def test_alert_v2_evaluation_only_change_is_skipped_with_zero_patch():
     later = _alert_unit(_alert_record(state="TRIGGERED", last_evaluated_at="2026-10-14T09:00:00Z"))
     res, _ = env.run(SqlImporter, [later])
     assert _rows(res)[later["natural_key"]]["import_status"] == "skipped"
+    assert not env.client.writes("PATCH", "api/2.0/alerts/")
+
+
+class LiveAlertsPage(Bed):
+    """`GET /api/2.0/alerts` returns `{"alerts": [...]}` (verified live 2026-10-15), paged by the
+    REAL `ApiClient.get_paginated` — the plain fakes ignore `result_key`, which hid QA16.3-2."""
+    warnings: list = []
+
+    def get(self, path, params=None):
+        if path == "api/2.0/alerts":
+            return {"alerts": [{"id": k, **v} for k, v in self.alerts.items()]}
+        return super().get(path, params)
+
+    def get_paginated(self, path, result_key, token_key="next_page_token", params=None,
+                      max_pages=100000):
+        if path == "api/2.0/alerts":
+            self.calls.append(("GET_PAGINATED", path, params))
+            return ApiClient.get_paginated(self, path, result_key, token_key=token_key,
+                                           params=params, max_pages=max_pages)
+        return super().get_paginated(path, result_key, token_key, params, max_pages)
+
+
+def test_alert_v2_already_on_target_is_found_by_the_live_list_shape_and_skipped():
+    """QA16.3-2: the existence check read the list under `results`, so every alert looked absent →
+    a create POST every run → 409 → `adopted`. It must be found and skipped with no write."""
+    env = _bed()
+    env.client = LiveAlertsPage()
+    env.seed("sql_warehouse", "wh", target="TWH", source="w1")
+    unit = _alert_unit(_alert_record())
+    env.client.alerts["TA1"] = {"display_name": "al"}
+    env.seed("alert_v2", unit["natural_key"], fp=unit["fingerprint"], target="TA1")
+    res, _ = env.run(SqlImporter, [unit])
+    assert _rows(res)[unit["natural_key"]]["import_status"] == "skipped"
+    assert not env.client.writes("POST", "api/2.0/alerts")
     assert not env.client.writes("PATCH", "api/2.0/alerts/")
 
 
