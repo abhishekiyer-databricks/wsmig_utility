@@ -616,3 +616,28 @@ Evidence `~/Desktop/wsmig_runs/plan16_3/run3/`.
 - Cleanup done: alert cron restored; planted `20200101_000000`/`20200101_000001` deleted (contents checked first).
 - Log tip: when all tasks share one job cluster the `#seq` restarts per stage — dedup the doubled driver stderr by
   whole line, not by `#seq`.
+
+### Upgrade test main (1.1.1) → 1.2.0 on a FRESH target (2026-10-16, in progress)
+User rule: every release is live-tested as an upgrade from the previous version (old releases = their merged
+branches: 1.1.0 `feature/dashboard_publish_and_acl`, 1.1.1 `main`). Evidence `~/Desktop/wsmig_runs/plan16_3/upgrade_test/`.
+- **Target:** `adb-7405607357241881.1` (westus2, metastore fa077131; source is westus). Runner = workspace admin (via
+  the workspace permission-assignment API; `source_acct` login expired), scope `wsmig_runner`. Staging
+  `/Volumes/catalog_4_2yesmc/wsmig_staging/staging`, state `catalog_4_2yesmc.wsmig_state_main` (`catalog_4_2yesmc` =
+  the workspace's own catalog; `catalog_src_g9c6nd`/`catalog_ws_bozvdk` here have lost their storage). Git folder
+  `wsmig_main` @ main 51e3a08; jobs installed by main's `00_Install_Jobs`, then the classic-cluster reset.
+- **Baseline 1.1.1 e2e** run 223176052964558 SUCCESS, bundle `20261016_131652`: created 263 · adopted 19 · warn 10 ·
+  skipped 71 · manual 9 · no-object 209 · failed 150 = 141 user homes not provisioned yet + 5 by design + 1 job
+  ordering (`run_job_task` → a later job) + 3 `polfam` jobs (source fixture drift: tag `family_job` vs the policy's
+  `family_job_v2`). Both metastores' admin = `account users`, so 1.1.1 moved every pipeline's IS_OWNER to the source
+  owner with no 403 — the customer's CUST-1 403 can't be reproduced here.
+- **Source prep (user-approved):** the 3 `polfam` jobs' tag → `family_job_v2` (before-settings saved). Lakebase
+  instance `wsmig-qa-lb` (CU_1) + database catalog `wsmig_lb_cat` + synced table
+  `wsmig_lb_cat.public.zones_synced` (SNAPSHOT, pk `zip`) → platform pipeline
+  `Synced table: wsmig_lb_cat.public.zones_synced Vl02hH` (no `libraries`) = the CUST-2 shape. **Delete after the
+  1.2.0 run** (paid).
+- **Fix found by the live name:** the platform appends a random suffix to the synced-table pipeline name; the
+  §6 note quoted it as part of the table. `pipeline_not_creatable` now takes the first token. Test
+  `test_synced_table_note_drops_the_platforms_random_name_suffix` (fails on the old helper). 605 pass.
+- **Next:** homes provisioned (user checks) → 1.1.1 e2e until only by-design failures (expect the synced pipeline to
+  FAIL `libraries must contain at least one element`) → source edits: `wsmig_test_query` text, SP run-as on
+  `wsmig_test_pipeline`, one NEW SP-owned pipeline, 2 workspace confs → Git folder to 1.2.0 → e2e.

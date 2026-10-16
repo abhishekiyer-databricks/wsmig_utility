@@ -1248,6 +1248,15 @@ def test_export_synced_table_pipeline_is_manual_naming_the_table():
     assert "belongs to the synced table `cat.s.t`" in u["note"]
 
 
+def test_synced_table_note_drops_the_platforms_random_name_suffix():
+    """The live name carries a suffix after the table (2026-10-16); the note names the table only."""
+    spec = {"name": "Synced table: wsmig_lb_cat.public.zones_synced Vl02hH", "catalog": "wsmig_lb_cat",
+            "managed_definition": {}, "pipeline_type": "MANAGED"}
+    note = pipeline_not_creatable(spec)
+    assert "belongs to the synced table `wsmig_lb_cat.public.zones_synced` (" in note
+    assert "Vl02hH" not in note
+
+
 def test_export_empty_libraries_pipeline_gets_the_generic_note():
     (u,) = build_all({"dlt_pipeline": [_pipe_record("odd")]})["dlt_pipeline"]
     assert u["import_action"] == "manual" and "no source code (`libraries` is empty)" in u["note"]

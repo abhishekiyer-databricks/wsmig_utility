@@ -109,7 +109,8 @@ def pipeline_not_creatable(spec: Any) -> str:
                 f"gateway and its ingestion pipeline in Lakeflow Connect.")
     name = safe_str(spec.get("name"))
     if name.startswith(SYNCED_TABLE_PIPELINE_PREFIX):
-        fqn = name[len(SYNCED_TABLE_PIPELINE_PREFIX):].strip()
+        # The platform names it `Synced table: <fqn> <random suffix>` (verified live 2026-10-16).
+        fqn = (name[len(SYNCED_TABLE_PIPELINE_PREFIX):].split() or [""])[0]
         return (f"belongs to the synced table `{fqn}` (UC/Lakebase, out of scope) — recreate the "
                 f"synced table on the target and the platform recreates this pipeline.")
     return ("no source code (`libraries` is empty), so the pipelines API can't recreate it — "
