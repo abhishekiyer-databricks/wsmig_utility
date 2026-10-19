@@ -218,11 +218,35 @@ class AclImporter(BaseImporter):
                              "`admins` grant, so there is no explicit ACL to apply — target access "
                              "already matches by construction")}
 
-        self.client.put(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+        if perm_type == "sql/warehouses" and self._ownerless_warehouse(body, target_id):
+            # A full-replace PUT on a warehouse with no owner is refused ("PUT requests for
+            # warehouse … with no existing owner must provide a new owner", live 2026-10-19 — the
+            # platform-created Serverless Starter Warehouse). Neither side has an owner, so the
+            # grants are ADDED instead: no owner is invented and nothing is taken away.
+            self.client.patch(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+            note = (f"{len(body['access_control_list'])} explicit grant(s) added — the warehouse "
+                    f"has no owner on source or target, so the grants were added rather than "
+                    f"replacing its ACL")
+        else:
+            self.client.put(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+            note = f"{len(body['access_control_list'])} explicit grant(s) applied"
         self._applied.append({"perm_type": perm_type, "target_id": target_id,
                               "object_natural_key": object_key, "grants": grants})
-        return {"target_id": target_id,
-                "note": f"{len(body['access_control_list'])} explicit grant(s) applied"}
+        return {"target_id": target_id, "note": note}
+
+    def _ownerless_warehouse(self, body: dict, target_id: str) -> bool:
+        """Whether neither the PUT body nor the target warehouse names an IS_OWNER. Only read when
+        the body has no owner; an unreadable target ACL keeps the 1.1.x PUT (its error surfaces)."""
+        if any(e.get("permission_level") == "IS_OWNER" for e in body["access_control_list"]):
+            return False
+        try:
+            doc = self.client.get(f"api/2.0/permissions/sql/warehouses/{target_id}") or {}
+        except Exception as exc:  # noqa: BLE001 — fall back to the PUT
+            self.log.warning("warehouse ACL read failed", target_id=target_id, error=str(exc)[:200])
+            return False
+        return not any(p.get("permission_level") == "IS_OWNER" and not p.get("inherited")
+                       for a in doc.get("access_control_list") or []
+                       for p in a.get("all_permissions") or [])
 
     def update_one(self, unit: dict, target_id: str) -> dict:
         """`PUT permissions` is already declarative — an update IS the same call."""

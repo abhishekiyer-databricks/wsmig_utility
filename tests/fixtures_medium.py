@@ -2867,7 +2867,7 @@ def phase_retry_heal():
     grant the RUNNER `servicePrincipal.user` on RETRY_SP (account level, additive) and create the
     EMPTY RETRY_TABLE on target. EXCLUDED from `all`."""
     print("== retry heal ==")
-    runner = "servicePrincipals/f09b29b1-7924-4b53-ac73-15af18c4f087"
+    runner = "servicePrincipals/8233dc03-c86d-4788-973a-499f228662df"
     sp = next(iter(w.service_principals.list(filter=f'displayName eq "{RETRY_SP}"')), None)
     acct = _acct().config.account_id
     name = f"accounts/{acct}/servicePrincipals/{sp.application_id}/ruleSets/default"
@@ -3043,7 +3043,7 @@ C163_QUERY = "wsmig_test_query"
 C163_ALERT = "wsmig_test_alert_v2"
 C163_FREQUENT_CRON = "0 0/15 * * * ?"
 C163_STATE = os.path.expanduser("~/Desktop/wsmig_runs/plan16_3/fixture_state.json")
-RUNNER_APP_ID = "f09b29b1-7924-4b53-ac73-15af18c4f087"
+RUNNER_APP_ID = "8233dc03-c86d-4788-973a-499f228662df"
 
 
 def _c163_state(update: dict | None = None) -> dict:

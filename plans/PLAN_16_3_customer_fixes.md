@@ -641,3 +641,30 @@ branches: 1.1.0 `feature/dashboard_publish_and_acl`, 1.1.1 `main`). Evidence `~/
 - **Next:** homes provisioned (user checks) → 1.1.1 e2e until only by-design failures (expect the synced pipeline to
   FAIL `libraries must contain at least one element`) → source edits: `wsmig_test_query` text, SP run-as on
   `wsmig_test_pipeline`, one NEW SP-owned pipeline, 2 workspace confs → Git folder to 1.2.0 → e2e.
+
+### Upgrade test 1.1.0 → 1.2.0 on FRESH source + target (2026-10-19, in progress — supersedes the 2026-10-16 bed)
+User: baseline = **1.1.0** (`feature/dashboard_publish_and_acl` @ 37996ea) because some BUs never took 1.1.1.
+Source ws 7405609680512510 (westus), target ws 7405609204731078 (westus2), runner `ai27_wsmig_runner` recreated
+(appId 8233dc03…). Evidence `~/Desktop/wsmig_runs/plan16_3/upgrade_110/`.
+- **Run 1 (1.1.0 e2e)** job run 6786418126348, bundle `20261019_084244`: failed 132 = 120 user homes + 2 family
+  policies (B3) + 3 polfam jobs + synced pipeline (`target schema field is required`) + run-as SP job (env) +
+  run_job_task ordering + 2 libraries (cluster stopped) + serving key (by design) + **Starter Warehouse ACL (new)**.
+  All 7 created queries owned by the runner (B2 reproduced). All 8 confs `Created` and read back = source.
+- **Two new findings, fixed on this branch (user-approved, 612 tests; 4 of the 7 new tests fail on the prior code):**
+  - **QA16.3-U1 workspace-conf reads lag writes.** Live on the source: after a PATCH the GET flip-flopped between
+    old and new for ~1–2 min (one key ~5 min). §2's single read-back could report a false `failed`. Fix: a key
+    not visible at once is held; after the phase's last conf row ONE shared loop re-reads all held keys every
+    15 s for up to 3 min (worst case 3 min total, not per key), then each row is recorded verified or failed.
+  - **QA16.3-U2 ownerless warehouse ACL.** New workspaces' Serverless Starter Warehouse is created by a platform
+    SP and has NO IS_OWNER; a full-replace PUT is refused (`400 … with no existing owner must provide a new owner`;
+    earlier beds' starter warehouses had an owner). Fix: when neither the source ACL nor the target warehouse names
+    an owner, PATCH (add) the grants — no owner invented. PATCH verified live on the ownerless warehouse.
+- **Source edits planted for 1.2.0:** `cust163_seed` (query owner → tanveer, pipelines user / spn_1 / spn_3,
+  Genie on a source-only table), `wsmig_test_query` text, `wsmig_test_pipeline` run-as → spn_1, confs
+  `enableWebTerminal` true + `maxTokenLifetimeDays` 20; target `cust163_uc_grants` + conf drift
+  `enableResultsDownloading=true`. Runner granted servicePrincipal.user on spn_1.
+- **Run 2 (1.1.0 failed_only, same bundle)** job run 558695262116710 — see below.
+  Result: SUCCESS in 4.6 min — 232 created + 12 updated (all 120 home items, the run-as SP job, the
+  run_job_task job, 122 ACLs). Still failed = 10, all expected on 1.1.0: 2 family policies + 3 polfam jobs (B3),
+  synced pipeline (CUST-2), Starter Warehouse ACL (U2), 2 libraries, serving key. All 19 target queries are
+  owned by the runner → this is the customer-shaped 1.1.0 state for the 1.2.0 run.

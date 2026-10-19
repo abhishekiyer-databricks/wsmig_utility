@@ -66,6 +66,9 @@ class Bed(FakeTarget):
         super().__init__()
         self.conf: dict = {}                 # workspace-conf key → string value (V3)
         self.ignored_conf: set = set()       # keys the workspace silently ignores
+        self.conf_lag: dict = {}             # key → reads before a write becomes visible
+        self._conf_pending: dict = {}
+        self.warehouse_owner_required = False  # an ownerless warehouse refuses an owner-less PUT
         self.queries: dict = {}              # qid → {display_name, owner_user_name}
         self.owner_patch_error = None        # an exception the owner PATCH raises
         self.owner_ignored = False           # the owner PATCH returns 200 but changes nothing
@@ -82,6 +85,11 @@ class Bed(FakeTarget):
         if path == "api/2.0/workspace-conf":
             self.calls.append(("GET", path, params))
             keys = [k for k in (params or {}).get("keys", "").split(",") if k]
+            for k in keys:
+                if k in self._conf_pending:
+                    self.conf_lag[k] -= 1
+                    if self.conf_lag[k] < 0:
+                        self.conf[k] = self._conf_pending.pop(k)
             return {k: self.conf.get(k) for k in keys}
         if path == "api/2.0/workspace/get-status":
             p = (params or {}).get("path")
@@ -145,6 +153,14 @@ class Bed(FakeTarget):
         return super().post(path, body)
 
     def put(self, path, body):
+        m = re.match(r"api/2.0/permissions/sql/warehouses/([^/]+)$", path)
+        if (m and self.warehouse_owner_required
+                and not _owner_of(self.perms.get(f"sql/warehouses/{m.group(1)}", []))
+                and not any(e["permission_level"] == "IS_OWNER"
+                            for e in body["access_control_list"])):
+            self.calls.append(("PUT", path, body))
+            raise HTTPStatusError(400, f"INVALID_PARAMETER_VALUE: PUT requests for warehouse "
+                                       f"{m.group(1)} with no existing owner must provide a new owner.")
         m = re.match(r"api/2.0/pipelines/([^/]+)$", path)
         if m:
             self.calls.append(("PUT", path, copy.deepcopy(body)))
@@ -170,7 +186,9 @@ class Bed(FakeTarget):
         if path == "api/2.0/workspace-conf":
             self.calls.append(("PATCH", path, body))
             for k, v in body.items():
-                if k not in self.ignored_conf:
+                if k in self.conf_lag:
+                    self._conf_pending[k] = v
+                elif k not in self.ignored_conf:
                     self.conf[k] = v
             return {}
         m = re.match(r"api/2.0/sql/queries/([^/]+)$", path)
@@ -1405,3 +1423,126 @@ def test_1_1_1_state_and_bundle_produce_only_the_declared_changes():
     assert by["bronze"]["import_status"] == "skipped"
     assert by[synced["natural_key"]]["import_status"] == "manual"
     assert not env.client.writes()
+
+
+# ═══════════════════ upgrade-test follow-ups (live 2026-10-19): conf read lag, ownerless warehouse ═══
+
+from src.importers import misc_importer as _misc  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fake_conf_clock(monkeypatch):
+    """The shared conf re-read waits on `_misc._sleep`; a fake clock keeps the suite instant and
+    lets a test count the waits."""
+    clock = {"t": 0.0, "sleeps": 0}
+
+    def _sleep(seconds):
+        clock["t"] += seconds
+        clock["sleeps"] += 1
+    monkeypatch.setattr(_misc, "_now", lambda: clock["t"], raising=False)
+    monkeypatch.setattr(_misc, "_sleep", _sleep, raising=False)
+    return clock
+
+
+def test_conf_key_that_reads_back_late_is_verified_not_failed(_fake_conf_clock):
+    env = _bed()
+    env.client.conf["enableWebTerminal"] = "false"
+    env.client.conf_lag["enableWebTerminal"] = 2          # the first read + one re-read see the old value
+    res, _ = env.run(MiscImporter, [_conf_unit("enableWebTerminal", "true")])
+    (row,) = res.units
+    assert row["import_status"] == "created"
+    assert row["note"] == "enableWebTerminal set to 'true' (verified by read-back after 30 s)"
+    assert _fake_conf_clock["sleeps"] == 2
+    assert env.state.row("workspace_conf", "enableWebTerminal")["last_source_fingerprint"]
+
+
+def test_held_conf_keys_share_one_wait_so_the_worst_case_is_three_minutes(_fake_conf_clock):
+    env = _bed()
+    keys = ["enableExportNotebook", "enableResultsDownloading", "enableWebTerminal",
+            "enableDbfsFileBrowser", "enableUploadDataUis", "maxTokenLifetimeDays"]
+    for k in keys:
+        env.client.conf[k] = "old"
+        env.client.ignored_conf.add(k)
+    res, _ = env.run(MiscImporter, [_conf_unit(k, "new") for k in keys])
+    assert _fake_conf_clock["t"] == _misc.CONF_VERIFY_SECONDS, "one shared wait, not one per key"
+    rereads = [c for c in env.client.calls if c[0] == "GET" and c[1] == "api/2.0/workspace-conf"
+               and set((c[2] or {}).get("keys", "").split(",")) == set(keys)]
+    assert len(rereads) == _misc.CONF_VERIFY_SECONDS // _misc.CONF_POLL_SECONDS, \
+        "one GET for all held keys per poll"
+    by = _rows(res)
+    assert sorted(by) == sorted(keys) and len(res.units) == len(keys), "exactly one row per key"
+    for k in keys:
+        assert by[k]["import_status"] == "failed" and by[k]["failure_category"] == "not_applied"
+        assert "still reads 'old' after 3 min" in by[k]["note"]
+        assert not env.state.row("workspace_conf", k).get("last_source_fingerprint")
+
+
+def test_mixed_conf_keys_each_get_their_own_outcome(_fake_conf_clock):
+    env = _bed()
+    env.client.conf.update({"enableExportNotebook": "true", "enableWebTerminal": "true",
+                            "maxTokenLifetimeDays": "90"})
+    env.client.ignored_conf.add("enableExportNotebook")
+    env.client.conf_lag["maxTokenLifetimeDays"] = 3
+    res, _ = env.run(MiscImporter, [_conf_unit("enableExportNotebook", "false"),
+                                    _conf_unit("enableWebTerminal", "false"),
+                                    _conf_unit("maxTokenLifetimeDays", "30")])
+    by = _rows(res)
+    assert by["enableWebTerminal"]["note"] == "enableWebTerminal set to 'false' (verified by read-back)"
+    assert by["maxTokenLifetimeDays"]["import_status"] == "created"
+    assert "verified by read-back after 45 s" in by["maxTokenLifetimeDays"]["note"]
+    assert by["enableExportNotebook"]["import_status"] == "failed"
+    assert [r["natural_key"] for r in res.units].count("enableExportNotebook") == 1
+
+
+def test_conf_that_reads_back_at_once_adds_no_wait(_fake_conf_clock):
+    env = _bed()
+    res, _ = env.run(MiscImporter, [_conf_unit("enableExportNotebook", "false"),
+                                    _conf_unit("enableWebTerminal", "false")])
+    assert {r["import_status"] for r in res.units} == {"created"}
+    assert _fake_conf_clock["sleeps"] == 0
+
+
+def _wh_env(target_acl, grants=(("analysts", "group", "CAN_USE"),)):
+    env = _bed()
+    env.client.warehouse_owner_required = True
+    env.seed("sql_warehouse", "wh", target="TWH")
+    env.client.perms["sql/warehouses/TWH"] = target_acl
+    env.aw.write_json(BP.EXPORT_ACLS_JSON, [{
+        "asset_type": "sql_warehouse", "natural_key": "wh", "source_id": "w1",
+        "perm_object_type": "sql/warehouses",
+        "grants": [{"principal": p, "principal_type": t, "permission_level": lvl,
+                    "inherited": False} for p, t, lvl in grants]}])
+    return env
+
+
+_USERS_CAN_USE = {"group_name": "users", "all_permissions": [{"permission_level": "CAN_USE",
+                                                              "inherited": False}]}
+
+
+def test_ownerless_warehouse_gets_its_grants_added_with_patch_not_put():
+    env = _wh_env([_USERS_CAN_USE])
+    res, _ = env.run(AclImporter, [])
+    (row,) = res.units
+    assert row["import_status"] == "created", row["note"]
+    assert "added" in row["note"] and "no owner on source or target" in row["note"]
+    assert not env.client.writes("PUT", "permissions/sql/warehouses/TWH")
+    (patch,) = env.client.writes("PATCH", "permissions/sql/warehouses/TWH")
+    assert patch[2]["access_control_list"] == [{"group_name": "analysts",
+                                                "permission_level": "CAN_USE"}]
+
+
+def test_owned_warehouse_keeps_the_full_replace_put():
+    env = _wh_env([_owner_entry("alice@corp.com", "user_name"), _USERS_CAN_USE])
+    res, _ = env.run(AclImporter, [])
+    assert res.units[0]["note"] == "1 explicit grant(s) applied"
+    assert env.client.writes("PUT", "permissions/sql/warehouses/TWH")
+    assert not env.client.writes("PATCH", "permissions/sql/warehouses/TWH")
+
+
+def test_warehouse_acl_that_names_an_owner_is_put_without_reading_the_target():
+    env = _wh_env([_USERS_CAN_USE], grants=(("alice@corp.com", "user", "IS_OWNER"),))
+    env.run(AclImporter, [])
+    assert env.client.writes("PUT", "permissions/sql/warehouses/TWH")
+    reads = [c for c in env.client.calls
+             if c[0] == "GET" and c[1] == "api/2.0/permissions/sql/warehouses/TWH"]
+    assert len(reads) == 1, "only the parity read — no owner probe before the PUT"

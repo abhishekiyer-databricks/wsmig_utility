@@ -56,6 +56,13 @@ Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint
   unchanged alert is now `Skipped` with no write, and a changed one is updated in place.
 - **Workspace settings reported `Created` that the target never took** (B4). Every write is read back; a key the
   target ignores is `failed` / `not_applied` ("set it in the admin console"), never `Created`.
+  Workspace-conf reads lag writes (seen live: up to a few minutes), so a key that does not read back at once is
+  re-read with the others every 15 s for up to 3 min — one shared wait, so the worst case is 3 min in total
+  however many keys are held. A key that reads back late says "verified by read-back after N s".
+- **The ACL of a warehouse with no owner failed** with `400 PUT requests for warehouse … with no existing owner
+  must provide a new owner` (seen live on the platform-created Serverless Starter Warehouse of a new workspace).
+  When neither the source ACL nor the target warehouse has an owner, the grants are now added (PATCH) instead of
+  replacing the ACL; every other warehouse and object keeps the full-replace PUT.
 - **Synced-table pipelines failed on every run** (`libraries must contain at least one element`, CUST-2). A
   pipeline with no source code is `manual` with a note naming its synced table — at export and, for 1.x bundles,
   at import (no API call). A **Lakeflow Connect ingestion gateway** (no `libraries` by design) is `manual` with a
