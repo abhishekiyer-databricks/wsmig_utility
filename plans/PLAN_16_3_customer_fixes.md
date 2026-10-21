@@ -668,3 +668,38 @@ Source ws 7405609680512510 (westus), target ws 7405609204731078 (westus2), runne
   run_job_task job, 122 ACLs). Still failed = 10, all expected on 1.1.0: 2 family policies + 3 polfam jobs (B3),
   synced pipeline (CUST-2), Starter Warehouse ACL (U2), 2 libraries, serving key. All 19 target queries are
   owned by the runner → this is the customer-shaped 1.1.0 state for the 1.2.0 run.
+- **Run 3 (1.2.0 e2e @ 420a650)** job run 22168871247355 SUCCESS (inv 6.7 / exp 0.9 / imp 11.1 min), bundle
+  `20261019_113156`: created 19 · updated 21 · warn 7 · skipped 582 · manual 10 · no-object 60 · **failed 4**
+  (2 libraries — cluster stopped, serving key, Genie on a source-only table = server's 403 verbatim, §7). **PASS.**
+  - B3 (1.1.1 fix via 1.2.0): both family policies + 3 polfam jobs + their ACLs created.
+  - B2: 17 queries `updated` "owner set to … (verified)"; target owners now = source (16 abhishek, wsmig_test_query
+    tanveer). The 2 queries of deleted users (preserved under /Users_Backup) keep the runner, by design.
+  - CUST-1: new user-owned pipeline → owner + run-as runner, source owner CAN_MANAGE; SP-owned → owner runner,
+    run-as spn_1; spn_3 (no role) → runs as runner + the "grant Service Principal User" warning;
+    `wsmig_test_pipeline` (source run-as edited to spn_1) → run-as spn_1, existing owner kept. Pipelines whose
+    owner 1.1.0 already moved: skipped, untouched.
+  - CUST-2: synced pipeline `manual` with the synced-table note, no POST.
+  - B4 + U1: `enableWebTerminal` verified after 120 s, `maxTokenLifetimeDays` after 45 s (U1's shared re-read
+    proven live — the 1.2.0 single read would have FAILED both), target drift `enableResultsDownloading` re-applied
+    + verified, 5 matching keys skipped with no write.
+  - U2: Starter Warehouse ACL `created` via PATCH ("no owner on source or target").
+  - Alerts V2 skipped, not updated once: these alerts never evaluated on the new source (no `evaluation.state`),
+    so the fingerprint did not move — D4 only applies to alerts that have evaluated. Correct.
+  - ACL Parity 251/251 `match`.
+  - Pre-existing cosmetic (main): an UPDATE that carries a warning is labelled "Created — with a warning" (no
+    updated-with-warning status) — `wsmig_test_pipeline` reads that way because UC pipelines always carry the UC
+    note. Backlog.
+  - Source noise: an empty SP home `/Users/fcbf1bea…` (SP not in SCIM) appeared on the source between the runs —
+    recreated under the backup root with the usual warning. Not a tool issue.
+- **Run 4 (1.2.0 e2e, idempotency @ 420a650, 2026-10-21)** job run 359314249532348 SUCCESS (inv 8.5 / exp 0.9 /
+  imp 9.8 min), bundle `20261021_060241`: **created 0 · updated 0** · skipped 626 · manual 10 · no-object 60 ·
+  warn 3 · failed 4 (same 4 expected). Target snapshot before/after identical (object counts, query owners,
+  pipeline run-as, confs) → no duplicates, no owner/conf/run-as flapping. Warnings: `_cust1_sp3` re-attempts its
+  refused run-as every run with the same "grant the Service Principal User role" note (by design — it heals once
+  the role is granted, as on 2026-10-15); the 2 dashboard schedules whose notification destinations are missing
+  on target repeat their warning (pre-existing since 1.1.0). ACL Parity 251/251 `match`.
+- **Verdict (Claude): 1.2.0 certified prod-ready for direct mode.** Caveats (offline-tested only): the CUST-1 403
+  heal of a 1.x-failed pipeline ACL row (both metastores' admin = account users), a conf key the target truly
+  ignores (red after 3 min), the confirmed-missing-folder wording, the dashboard not-published probe, a failed
+  report write, Lakeflow Connect gateways, and airgap mode (mode-agnostic code; needs the source Git folder upgraded
+  too).

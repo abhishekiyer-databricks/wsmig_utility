@@ -43,6 +43,13 @@ Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint
   `servicePrincipal.user`, verified live) triggers the fallback; any other error fails the row as before.
 - Each of `01_Inventory`, `02_Export` and `04_Import` prints the run's folder at the end of its output (B9).
 
+### Docs
+- **PyPI proxy guidance corrected:** both `pypi.org` (the index) and `files.pythonhosted.org` (the downloads) must be
+  allowed — `pypi.org` alone fails at download. On DBR 15.4 LTS only `openpyxl` + `et-xmlfile` are downloaded; the
+  guide now shows how to check a cluster's own list (Permissions guide, Runbook step 3).
+- **Workspace settings are documented as best effort:** set via the API and read back for up to 3 minutes; a
+  workspace admin should review them after the migration.
+
 ### Fixed
 - **Pipeline permissions were lost** with `403 Only metastore admins can change pipeline owner` (CUST-1): the PUT
   carried the source `IS_OWNER`, which on a UC pipeline is an owner change, and the PUT is all-or-nothing. The
@@ -58,7 +65,8 @@ Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint
   target ignores is `failed` / `not_applied` ("set it in the admin console"), never `Created`.
   Workspace-conf reads lag writes (seen live: up to a few minutes), so a key that does not read back at once is
   re-read with the others every 15 s for up to 3 min — one shared wait, so the worst case is 3 min in total
-  however many keys are held. A key that reads back late says "verified by read-back after N s".
+  however many keys are held. A key that reads back late says "verified by read-back after N s". Workspace
+  settings stay **best effort**: the docs now advise a workspace admin to review them after the migration.
 - **The ACL of a warehouse with no owner failed** with `400 PUT requests for warehouse … with no existing owner
   must provide a new owner` (seen live on the platform-created Serverless Starter Warehouse of a new workspace).
   When neither the source ACL nor the target warehouse has an owner, the grants are now added (PATCH) instead of

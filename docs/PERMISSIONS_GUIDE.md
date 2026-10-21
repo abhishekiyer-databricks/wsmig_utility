@@ -164,7 +164,7 @@ They are one-time cluster configuration, not identity grants — but they block 
 |-------------|-----------------|
 | **Compute** | Run on an **all-purpose (classic) cluster** in the workspace's network when the workspace isn't on the public internet and the Databricks serverless IP ranges aren't whitelisted. Serverless may not reach the control plane or the staging Volume. |
 | **Proxy bypass (`no_proxy`)** | If the cluster egresses through an HTTP proxy, set a `no_proxy` / `NO_PROXY` **cluster environment variable** (not Spark config) so Databricks **and** the staging storage bypass the proxy — otherwise Volume writes stall and the bundle lands empty. |
-| **Library availability** | The notebooks use `databricks-sdk`, `openpyxl`, `requests`. If `%pip install` / public PyPI is blocked, pre-install them as **cluster libraries** (or via your Databricks pip-proxy index). |
+| **Library availability** | The notebooks `%pip install` `databricks-sdk`, `openpyxl`, `requests`. On DBR 15.4 LTS only **`openpyxl` + `et-xmlfile`** are actually downloaded — the rest ship with the runtime. Through a proxy, allow **both** `pypi.org` and `files.pythonhosted.org` ([details below](#-python-libraries-through-a-proxy-pypi-allow-list)), or pre-install `openpyxl` as a **cluster library**. |
 
 **`no_proxy` entries by staging Volume type** *(check with `DESCRIBE VOLUME`)*:
 
@@ -173,47 +173,45 @@ They are one-time cluster configuration, not identity grants — but they block 
 | **Managed** | `*.azuredatabricks.net,*.databricks.azure.com,169.254.169.254,127.0.0.1` *(Databricks only)* |
 | **External (ADLS-backed)** | the managed list **plus** `.dfs.core.windows.net,.blob.core.windows.net` *(Azure storage)* |
 
-### 📦 Python dependency whitelist (when the proxy allows PyPI *per library*)
+### 📦 Python libraries through a proxy (PyPI allow-list)
 
-If the proxy allows PyPI **per project** (each library and its own dependencies whitelisted
-individually — not `pypi.org` wholesale), you must whitelist the tool's libraries **and their full
-transitive closure**. The tool declares three direct dependencies (`requirements.txt`); their
-typical closure is below.
+The notebooks run `%pip install databricks-sdk openpyxl requests` (no version pins). pip downloads only what the
+cluster does not already have. On **DBR 15.4 LTS** (verified 2026-10-16) that is exactly two packages:
 
-> ⚠️ **The exact closure depends on the Databricks Runtime's Python version and the resolved package
-> versions — treat this table as a baseline and *regenerate the authoritative list* for your
-> runtime** (command below). Most of these already ship with DBR (`requests`, `databricks-sdk` and
-> their chains are usually present); `openpyxl` + `et-xmlfile` are the ones most often missing.
+| Package | Why | Index page pip reads |
+|---------|-----|----------------------|
+| `openpyxl` | the Excel reports | https://pypi.org/simple/openpyxl/ |
+| `et-xmlfile` | required by `openpyxl` | https://pypi.org/simple/et-xmlfile/ |
 
-| Package | Pulled in by | PyPI project |
-|---------|--------------|--------------|
-| `databricks-sdk` | direct (`requirements.txt`) | https://pypi.org/project/databricks-sdk/ |
-| `openpyxl` | direct (`requirements.txt`) | https://pypi.org/project/openpyxl/ |
-| `requests` | direct (`requirements.txt`) | https://pypi.org/project/requests/ |
-| `certifi` | `requests` | https://pypi.org/project/certifi/ |
-| `charset-normalizer` | `requests` | https://pypi.org/project/charset-normalizer/ |
-| `idna` | `requests` | https://pypi.org/project/idna/ |
-| `urllib3` | `requests` | https://pypi.org/project/urllib3/ |
-| `et-xmlfile` | `openpyxl` | https://pypi.org/project/et-xmlfile/ |
-| `google-auth` | `databricks-sdk` | https://pypi.org/project/google-auth/ |
-| `cachetools` | `google-auth` | https://pypi.org/project/cachetools/ |
-| `pyasn1` | `google-auth` chain | https://pypi.org/project/pyasn1/ |
-| `pyasn1-modules` | `google-auth` | https://pypi.org/project/pyasn1-modules/ |
-| `rsa` | `google-auth` | https://pypi.org/project/rsa/ |
+**Allow both hosts — `pypi.org` alone is not enough.** pip uses the two domains for different jobs:
 
-**Regenerate the exact list for your runtime** — run this once on any host that can reach PyPI (or
-through your Databricks pip-proxy index); the output is precisely what to whitelist, one project per
-line:
+| Host | What pip does there |
+|------|---------------------|
+| `pypi.org` | The package **index**. pip reads `https://pypi.org/simple/<package>/` to find which versions and files exist. |
+| `files.pythonhosted.org` | Where the package **files** (wheels and source archives) are stored. The index links point here, so this is where the actual download happens. |
 
-```bash
-pip install --dry-run --report wsmig_deps.json "databricks-sdk>=0.20" "openpyxl>=3.1" "requests>=2.31"
-python -c "import json;[print(i['metadata']['name'], i['metadata']['version'], 'https://pypi.org/project/'+i['metadata']['name']+'/') for i in json.load(open('wsmig_deps.json'))['install']]"
+If only `pypi.org` is allowed, pip can look packages up but the downloads fail with connection or timeout errors.
+
+> ⚠️ pip reads `/simple/<package>/`, not the `/project/<package>/` web pages. The `files.pythonhosted.org` paths
+> are content hashes, so they can't be allowed per package — allow the whole host.
+
+**Safety net:** also allow https://pypi.org/simple/requests/ and https://pypi.org/simple/databricks-sdk/. A runtime
+that does not ship `databricks-sdk` needs its dependencies too — the check below lists them.
+
+**Check your own cluster** (a notebook on the jobs' cluster):
+
+```python
+%pip install --dry-run --report /tmp/wsmig_deps.json databricks-sdk openpyxl requests
 ```
+```python
+import json
+for i in json.load(open("/tmp/wsmig_deps.json"))["install"]:
+    print(i["metadata"]["name"], i["metadata"]["version"], i["download_info"]["url"])
+```
+An empty list means there is nothing to allow. Re-run it after a runtime upgrade.
 
-> 💡 **Pin the resolved versions** (in `requirements.txt` or a lock file) once whitelisted — a
-> floating `>=` can later resolve a *new* transitive dependency that isn't on the allow-list and
-> breaks the install. Alternatively, side-step the proxy entirely: **pre-install the packages as
-> cluster libraries** (from PyPI or uploaded wheels) so `%pip` is a no-op.
+**Or avoid the proxy entirely:** pre-install `openpyxl` (it brings `et-xmlfile`) as a **cluster library** (from
+PyPI or an uploaded wheel), so `%pip` downloads nothing.
 
 > The step-by-step for all of the above lives in [Runbook › Restricted-network environments](RUNBOOK.md#-restricted-network-environments-read-this-if-egress-is-locked-down).
 

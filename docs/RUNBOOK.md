@@ -64,16 +64,14 @@ Environment variables**:
 > external.
 
 **3. Handle the libraries when `%pip install` is blocked.**
-The notebooks pull `databricks-sdk`, `openpyxl`, and `requests` via `%pip`. Two options:
-- **Pre-install them as cluster libraries** on the all-purpose cluster (from PyPI or uploaded
-  wheels) so the `%pip` cell is a no-op — simplest when PyPI is fully blocked.
-- **Whitelist them on the proxy** — but note a per-project proxy needs each library **and its full
-  transitive dependencies** allow-listed individually. The complete list, plus a one-liner to
-  regenerate the exact closure for your runtime, is in
-  [Permissions › Python dependency whitelist](PERMISSIONS_GUIDE.md#-python-dependency-whitelist-when-the-proxy-allows-pypi-per-library).
-
-`databricks-sdk` and `requests` usually ship with the runtime; `openpyxl` (used for the Excel
-reports) is the one most often missing.
+The notebooks run `%pip install databricks-sdk openpyxl requests`. On DBR 15.4 LTS only `openpyxl` and
+`et-xmlfile` are actually downloaded — the rest ship with the runtime. Two options:
+- **Pre-install `openpyxl`** (it brings `et-xmlfile`) as a cluster library on the all-purpose cluster, so the
+  `%pip` cell downloads nothing — simplest when PyPI is fully blocked.
+- **Allow PyPI on the proxy — BOTH hosts:** `pypi.org` (the index pip looks packages up in) **and**
+  `files.pythonhosted.org` (where the files are downloaded from). With `pypi.org` alone the lookup works but the
+  download fails with connection or timeout errors. Details and a check for your own runtime:
+  [Permissions › Python libraries through a proxy](PERMISSIONS_GUIDE.md#-python-libraries-through-a-proxy-pypi-allow-list).
 
 > 📈 **Very large source workspaces:** for a workspace with hundreds of thousands of assets, give the
 > cluster a **larger-memory driver** (e.g. 64–128 GB). Migrations are infrequent, so size up for the
@@ -206,7 +204,7 @@ Everything lands in the bundle at `<staging_location>/wsmig/<source_workspace_id
 | File | Where | What it tells you |
 |------|-------|-------------------|
 | **`reports/import_status.xlsx`** *(live)* / **`import_status_dry_run.xlsx`** *(dry)* | `reports/` | One sheet **per asset type** — action, status, and notes for every unit. Includes the **ACL Parity** sheet (source-vs-target permission diff). **Read this first.** |
-| **`reports/manual_actions_import.md`** | `reports/` | The checklist of steps only a human can do (secret values, AKV scopes, legacy dashboards, Git repos). |
+| **`reports/manual_actions_import.md`** | `reports/` | The checklist of steps only a human can do (secret values, AKV scopes, legacy dashboards, Git repos). Also have a workspace admin review the **workspace settings** (best effort — see below). |
 | **`misc/preflight_report.json`** | `misc/` | The graded go/no-go verdict. |
 | **`misc/import_results.json`** | `misc/` | Machine-readable per-unit results. |
 | **`misc/execution*.log`** | `misc/` | Full execution log. |
@@ -269,11 +267,18 @@ Fix the cause, then re-run only the outstanding units.
 > import with **`retry_mode=failed_only`** (`dry_run=false`, same `run_id`, no re-export): the policy is created
 > first, then the jobs/clusters that use it, then their permissions — all in that one run.
 
-> ⚙️ **A workspace setting that is `failed` / `not_applied`** ("… the API returned 200, but the target
-> still reads …"): this target ignores that key through the API. Set it by hand in the **admin
-> console**, then re-run — the row turns green once the target really holds the source value. Every
-> setting is read back after the write, and a target value that differs from the source is
-> re-applied on each run (this also reverts a hand change made on the target).
+> ⚙️ **Workspace settings (workspace conf) are best effort — have a workspace admin review them.** The
+> tool sets each setting with an API call and then reads it back. The read can lag the write, so a
+> setting that does not show its new value at once is re-checked every 15 s for **up to 3 minutes**
+> before it is reported. The report then says `set … (verified by read-back)` (or `… after N s`) or
+> `failed` / `not_applied`. A target value that differs from the source is re-applied on each run
+> (this also reverts a hand change made on the target). Because a workspace can ignore a setting
+> through the API, or take longer than 3 minutes to show it, **a workspace admin should check the
+> migrated settings in the admin console after the migration.**
+>
+> **A setting that is `failed` / `not_applied`** ("… the API returned 200, but the target still reads
+> … after 3 min"): the target did not take that key through the API. Set it by hand in the **admin
+> console**, then re-run — the row turns green once the target really holds the source value.
 
 > 🧞 **A Genie space failing with `Table '<catalog>.<schema>.<table>' does not exist`**: Genie checks
 > its Unity Catalog tables when the space is created. UC is out of scope, so create (or grant) the
