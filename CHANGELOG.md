@@ -10,6 +10,88 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-13
+
+Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint change is Alert V2 (below).
+
+### Upgrade notes (from 1.1.x)
+- **Pull into the existing Git folder — no reinstall.** Jobs installed by 1.1.x work unchanged. Each notebook now
+  ends its output with the run's folder (`Run id : …` / `Folder : …`).
+- The first upgraded run **sets each migrated SQL query's owner** to its source owner once (rows read `updated`,
+  "owner set to … (verified)") and **re-checks every workspace setting against the target**: a setting the target
+  does not hold is re-applied and read back.
+- **Every Alert V2 reads `updated` once** on the first 1.2.0 run (a same-content update), then only on real edits.
+  In `airgap` mode this needs the source-side Git folder upgraded too.
+- **Synced-table pipelines become `manual`** (they used to fail on every run) and leave the `failed_only` bucket.
+- **A missing import report now turns the task red** (`completed_no_report`).
+- Failures that said "targets workspace folder … which does not exist" now show the **server's own error** when
+  the folder actually exists — re-run with `retry_mode=failed_only` to see the real cause (often a missing UC table).
+- **Pipelines keep the migration identity as owner.** User-owned pipelines also run as it; SP-owned pipelines keep
+  running as their SP (a one-time `updated` on 1.x targets). The source owner gets `CAN_MANAGE`. A metastore admin
+  can transfer ownership afterwards (Runbook). Pipeline ACL rows that failed on 1.x (`Only metastore admins can
+  change pipeline owner`) heal on the next run or `failed_only`.
+
+### Added
+- **SQL queries keep their source owner** (B2). The owner travels outside the payload and the fingerprint, is set
+  after create/update with a PATCH, and verified with a GET. A failed or ignored owner change is
+  `created_with_warning` ("query left owned by the migration SP"), never a failure. An owner deleted in source is
+  left alone. Unchanged queries are rechecked against the owner the target list already returns (no extra calls).
+- **SP-owned pipelines keep running as their SP** (CUST-1): the spec gets `run_as` = the source SP (remapped through
+  `sp_mapping`). If the target refuses it (e.g. the runner lacks the Service Principal User role), the pipeline is
+  created without it as `created_with_warning`. An explicit source `run_as` naming another user is dropped (the
+  API refuses it). Only the target's exact refusal (`PERMISSION_DENIED` … `'run_as'` …
+  `servicePrincipal.user`, verified live) triggers the fallback; any other error fails the row as before.
+- Each of `01_Inventory`, `02_Export` and `04_Import` prints the run's folder at the end of its output (B9).
+
+### Docs
+- **PyPI proxy guidance corrected:** both `pypi.org` (the index) and `files.pythonhosted.org` (the downloads) must be
+  allowed — `pypi.org` alone fails at download. On DBR 15.4 LTS only `openpyxl` + `et-xmlfile` are downloaded; the
+  guide now shows how to check a cluster's own list (Permissions guide, Runbook step 3).
+- **Workspace settings are documented as best effort:** set via the API and read back for up to 3 minutes; a
+  workspace admin should review them after the migration.
+
+### Fixed
+- **Pipeline permissions were lost** with `403 Only metastore admins can change pipeline owner` (CUST-1): the PUT
+  carried the source `IS_OWNER`, which on a UC pipeline is an owner change, and the PUT is all-or-nothing. The
+  tool now never changes a pipeline's owner — it keeps the current owner, gives the source owner `CAN_MANAGE`
+  and applies every other grant exactly. ACL Parity reads `match` with a `known_gap` note.
+- **ACL Parity reported queries as `extra_on_target`** after their owner was set (QA16.3-1): changing a query's
+  owner makes Databricks add an explicit `CAN_MANAGE` for the new owner, which a creator-owner on the source
+  doesn't show. That one line is no longer counted as a difference; any other extra grant still is.
+- **Alerts V2 already on the target were never found** (QA16.3-2): the existence check read the alerts list under
+  the wrong key, so every run re-sent a create, got `ALREADY_EXISTS` and reported the alert `Adopted`. An
+  unchanged alert is now `Skipped` with no write, and a changed one is updated in place.
+- **Workspace settings reported `Created` that the target never took** (B4). Every write is read back; a key the
+  target ignores is `failed` / `not_applied` ("set it in the admin console"), never `Created`.
+  Workspace-conf reads lag writes (seen live: up to a few minutes), so a key that does not read back at once is
+  re-read with the others every 15 s for up to 3 min — one shared wait, so the worst case is 3 min in total
+  however many keys are held. A key that reads back late says "verified by read-back after N s". Workspace
+  settings stay **best effort**: the docs now advise a workspace admin to review them after the migration.
+- **The ACL of a warehouse with no owner failed** with `400 PUT requests for warehouse … with no existing owner
+  must provide a new owner` (seen live on the platform-created Serverless Starter Warehouse of a new workspace).
+  When neither the source ACL nor the target warehouse has an owner, the grants are now added (PATCH) instead of
+  replacing the ACL; every other warehouse and object keeps the full-replace PUT.
+- **Synced-table pipelines failed on every run** (`libraries must contain at least one element`, CUST-2). A
+  pipeline with no source code is `manual` with a note naming its synced table — at export and, for 1.x bundles,
+  at import (no API call). A **Lakeflow Connect ingestion gateway** (no `libraries` by design) is `manual` with a
+  note naming its UC connection; Lakeflow Connect is documented as a manual step (Runbook).
+- **"Folder does not exist" was shown for errors that had nothing to do with folders** (QA16.2-1) — e.g. a Genie
+  space whose UC table is missing. The folder message is now used only when a live check of that folder returns a
+  real 404; likewise "dashboard is not published" only when `…/published` returns 404. Otherwise the report shows
+  the server's error.
+- **Alert V2 read `updated` on every run without an edit** (QA16.2.1-1): `evaluation.state` and
+  `evaluation.last_evaluated_at` changed with each scheduled evaluation and were part of the fingerprint. They are
+  now stripped (export) and dropped from the body (1.x bundles).
+
+### Changed
+- **A standalone import with a blank `run_id` always uses `LATEST_EXPORT.json`** (B9). It no longer continues an
+  unfinished import found in some older folder (that could update the target back to an older copy of the
+  source). An import that crashed in the latest export's folder is still continued from its checkpoint.
+- **Inventory / export resume only the newest folder** (B9): an older abandoned folder is never picked up.
+- **A report that does not land fails the import task** (B11): each report-write failure is logged at ERROR, the
+  written files are checked for existence and size, and the run ends `completed_no_report` (the notebook raises:
+  "the target WAS changed and the state WAS saved; re-run the import with run_id=<id> to rewrite the reports").
+
 ## [1.1.1] - 2026-10-12
 
 Hotfix (PLAN 16.2.1). Import-side only — no change to inventory, export, bundles, fingerprints or the state schema.

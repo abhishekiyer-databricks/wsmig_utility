@@ -160,14 +160,19 @@ def list_run_ids(config) -> list[str]:
 
 
 def find_latest_incomplete_run(config) -> Optional[str]:
-    """Newest run dir that has started but not finished (checkpoint present, no manifest).
+    """The NEWEST run dir, if it has started but not finished (checkpoint present, no manifest).
 
-    This is the run a whole-job re-run should RESUME (§7a). A run dir with neither a checkpoint
-    nor a manifest is an empty/aborted-before-first-write shell → ignored (nothing to resume).
+    This is the run a whole-job re-run should RESUME (§7a). Only the newest folder is considered
+    (PLAN 16.3 §1): an older unfinished folder was abandoned once a newer run started, and picking
+    it up days later would resume a stale snapshot. A run dir with neither a checkpoint nor a
+    manifest is an empty/aborted-before-first-write shell → nothing to resume.
     """
-    for rid in list_run_ids(config):
-        if not bundle_is_complete(config, rid) and bundle_has_checkpoint(config, rid):
-            return rid
+    ids = list_run_ids(config)
+    if not ids:
+        return None
+    newest = ids[0]
+    if not bundle_is_complete(config, newest) and bundle_has_checkpoint(config, newest):
+        return newest
     return None
 
 

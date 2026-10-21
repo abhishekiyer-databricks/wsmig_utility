@@ -378,8 +378,18 @@ class DashboardsImporter(BaseImporter):
             return f"PAUSED (pause_job_schedules=true; source is {src})"
         return body["pause_status"]
 
-    def _not_published_prerequisite(self, exc: Exception, unit: dict) -> None:
-        if is_not_found(exc):
+    def _not_published_prerequisite(self, exc: Exception, unit: dict, did: str) -> None:
+        """A schedule create 404 means "not published" ONLY when `GET …/published` confirms it with
+        its own 404 (PLAN 16.3 §7); a 200 or any other probe error keeps the server's error."""
+        if not is_not_found(exc):
+            return
+        try:
+            self.client.get(f"api/2.0/lakeview/dashboards/{did}/published")
+        except Exception as probe:  # noqa: BLE001 — only a confirmed 404 changes the outcome
+            if not is_not_found(probe):
+                self.log.debug(f"published state of {did} unverifiable ({str(probe)[:160]}) — the "
+                               f"server's error is reported as-is")
+                return
             raise PrerequisiteMissing(
                 f"dashboard `{safe_str(unit.get('parent_natural_key'))}` is not PUBLISHED on "
                 f"target "
@@ -391,7 +401,7 @@ class DashboardsImporter(BaseImporter):
         try:
             created = self.client.post(f"api/2.0/lakeview/dashboards/{did}/schedules", body) or {}
         except Exception as exc:  # noqa: BLE001
-            self._not_published_prerequisite(exc, unit)
+            self._not_published_prerequisite(exc, unit, did)
             raise
         sid = safe_str(created.get("schedule_id"))
         self._schedules_of(did).append({**body, "schedule_id": sid})

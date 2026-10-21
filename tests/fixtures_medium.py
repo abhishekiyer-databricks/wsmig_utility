@@ -2867,7 +2867,7 @@ def phase_retry_heal():
     grant the RUNNER `servicePrincipal.user` on RETRY_SP (account level, additive) and create the
     EMPTY RETRY_TABLE on target. EXCLUDED from `all`."""
     print("== retry heal ==")
-    runner = "servicePrincipals/f09b29b1-7924-4b53-ac73-15af18c4f087"
+    runner = "servicePrincipals/8233dc03-c86d-4788-973a-499f228662df"
     sp = next(iter(w.service_principals.list(filter=f'displayName eq "{RETRY_SP}"')), None)
     acct = _acct().config.account_id
     name = f"accounts/{acct}/servicePrincipals/{sp.application_id}/ruleSets/default"
@@ -3032,6 +3032,198 @@ def phase_target_uc_prep():
             return
     log(f"target catalog ready: {cat} (= source catalog {CATALOG})")
 
+
+# ─────────────────────────── PLAN 16.3 live QA (3 runs, plan §11) ──────────
+C163_PIPELINES = {"wsmig_test_pipeline_cust1": None,              # owner = the QA user (creator)
+                  "wsmig_test_pipeline_cust1_sp": "ai27_acc_spn_1",
+                  "wsmig_test_pipeline_cust1_sp3": "ai27_acc_spn_3"}  # runner lacks .user on it
+C163_GENIE = "wsmig_qa_163_genie"
+C163_TABLE = "retry_tbl_163"          # created on SOURCE only; on target only by `cust163_heal`
+C163_QUERY = "wsmig_test_query"
+C163_ALERT = "wsmig_test_alert_v2"
+C163_FREQUENT_CRON = "0 0/15 * * * ?"
+C163_STATE = os.path.expanduser("~/Desktop/wsmig_runs/plan16_3/fixture_state.json")
+RUNNER_APP_ID = "8233dc03-c86d-4788-973a-499f228662df"
+
+
+def _c163_state(update: dict | None = None) -> dict:
+    st = json.load(open(C163_STATE)) if os.path.exists(C163_STATE) else {}
+    if update:
+        st.update(update)
+        os.makedirs(os.path.dirname(C163_STATE), exist_ok=True)
+        json.dump(st, open(C163_STATE, "w"), indent=1)
+    return st
+
+
+def _set_query_owner(name: str, owner: str) -> None:
+    qs = w.api_client.do("GET", "/api/2.0/sql/queries", query={"page_size": 100}).get("results", [])
+    q = next((x for x in qs if x.get("display_name") == name), None)
+    if not q:
+        log(f"FLAG: query {name} not on source")
+        return
+    if q.get("owner_user_name") == owner:
+        log(f"query {name} owner already {owner}")
+        return
+    w.api_client.do("PATCH", f"/api/2.0/sql/queries/{q['id']}",
+                    body={"update_mask": "owner_user_name", "query": {"owner_user_name": owner}})
+    got = w.api_client.do("GET", f"/api/2.0/sql/queries/{q['id']}").get("owner_user_name")
+    log(f"query {name} owner → {got}")
+
+
+def phase_cust163_seed():
+    """PLAN 16.3 §11 Run 1 seed (SOURCE). Idempotent; EXCLUDED from `all`."""
+    print("== 16.3 seed: query owner, 3 pipelines (user / SP / SP-without-role), genie ==")
+    from databricks.sdk.service import pipelines
+    _set_query_owner(C163_QUERY, ENTRA_USERS[1])                   # tanveer.singh
+
+    lib = [pipelines.PipelineLibrary(notebook=pipelines.NotebookLibrary(path=f"{SHARED}/dlt_nb"))]
+    have = {p.name: p.pipeline_id for p in w.pipelines.list_pipelines()}
+    sps = {s.display_name: s.application_id for s in w.service_principals.list()}
+    for name, owner_sp in C163_PIPELINES.items():
+        pid = have.get(name)
+        if pid:
+            log(f"dlt pipeline exists: {name} ({pid})")
+        else:
+            pid = w.pipelines.create(
+                name=name, libraries=lib, catalog=CATALOG, target=SCHEMA, development=True,
+                clusters=[pipelines.PipelineCluster(label="default", node_type_id=NODE,
+                                                    num_workers=1)]).pipeline_id
+            log(f"dlt pipeline: {name} ({pid})")
+        acl = [{"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_RUN"},
+               {"user_name": ENTRA_USERS[3], "permission_level": "CAN_VIEW"}]
+        if owner_sp:
+            acl += [{"service_principal_name": sps[owner_sp], "permission_level": "IS_OWNER"},
+                    {"user_name": ME, "permission_level": "CAN_MANAGE"}]
+        else:
+            acl += [{"user_name": ME, "permission_level": "IS_OWNER"}]
+        w.api_client.do("PUT", f"/api/2.0/permissions/pipelines/{pid}",
+                        body={"access_control_list": acl})
+        ra = w.api_client.do("GET", f"/api/2.0/pipelines/{pid}").get("run_as_user_name")
+        log(f"  ACLs on {name}: owner={owner_sp or ME}; runs as {ra}")
+    base = have.get("wsmig_test_pipeline")
+    if base:
+        w.api_client.do("PATCH", f"/api/2.0/permissions/pipelines/{base}", body={
+            "access_control_list": [{"user_name": ENTRA_USERS[4], "permission_level": "CAN_VIEW"}]})
+        log(f"  wsmig_test_pipeline: + CAN_VIEW {ENTRA_USERS[4]}")
+
+    wh = _warehouse_id()
+    fq = f"{CATALOG}.{SCHEMA}.{C163_TABLE}"
+    r = w.statement_execution.execute_statement(
+        warehouse_id=wh, wait_timeout="50s",
+        statement=f"CREATE TABLE IF NOT EXISTS {fq} (id INT, label STRING)")
+    log(f"  source table {fq}: {r.status.state.value}")
+    spaces = w.api_client.do("GET", "/api/2.0/genie/spaces").get("spaces", []) or []
+    gid = next((x["space_id"] for x in spaces if x.get("title") == C163_GENIE), None)
+    if gid:
+        log(f"genie exists: {C163_GENIE} ({gid})")
+    else:
+        ser = {"version": 1, "data_sources": {"tables": [{"identifier": fq}]}}
+        gid = w.api_client.do("POST", "/api/2.0/genie/spaces", body={
+            "title": C163_GENIE, "description": "PLAN 16.3 §7 seed", "warehouse_id": wh,
+            "serialized_space": json.dumps(ser)})["space_id"]
+        log(f"genie: {C163_GENIE} ({gid}) on {fq}")
+    w.api_client.do("PATCH", f"/api/2.0/permissions/genie/{gid}", body={"access_control_list": [
+        {"group_name": ACCOUNT_NESTED_PARENT, "permission_level": "CAN_RUN"}]})
+    log(f"  ACL on {C163_GENIE}: CAN_RUN {ACCOUNT_NESTED_PARENT}")
+
+
+def phase_cust163_alert():
+    """PLAN 16.3 §11 (SOURCE), right before Run 1: the alert evaluates every 15 min, so its runtime
+    `evaluation.*` fields change between Run 1 and Run 2 (§8). Reverted by `cust163_cleanup`."""
+    print("== 16.3 alert: frequent cron ==")
+    alerts = w.api_client.do("GET", "/api/2.0/alerts").get("alerts", []) or []
+    a = next((x for x in alerts if x.get("display_name") == C163_ALERT), None)
+    if a:
+        sched = a.get("schedule") or {}
+        if sched.get("quartz_cron_schedule") != C163_FREQUENT_CRON:
+            _c163_state({"alert_original_schedule": sched})
+            w.api_client.do("PATCH", f"/api/2.0/alerts/{a['id']}", query={"update_mask": "schedule"},
+                            body={"schedule": {**sched, "quartz_cron_schedule": C163_FREQUENT_CRON}})
+        log(f"alert {C163_ALERT}: cron → {C163_FREQUENT_CRON} "
+            f"(original saved: {_c163_state().get('alert_original_schedule')})")
+
+
+
+def phase_cust163_target_prep():
+    """PLAN 16.3 §11 Run 1 (TARGET): the customer's false-`Created` setting drift."""
+    print("== 16.3 target prep: workspace-conf drift ==")
+    tw = WorkspaceClient(profile=TARGET_PROFILE)
+    tw.api_client.do("PATCH", "/api/2.0/workspace-conf", body={"enableResultsDownloading": "true"})
+    got = tw.api_client.do("GET", "/api/2.0/workspace-conf",
+                           query={"keys": "enableResultsDownloading"})
+    log(f"target enableResultsDownloading → {got.get('enableResultsDownloading')} (source = false)")
+
+
+def phase_cust163_uc_grants():
+    """PLAN 16.3 §11 (TARGET, user-approved): a pipeline's run-as SP needs USE CATALOG/USE SCHEMA on
+    the pipeline's catalog (live 403 otherwise). Additive."""
+    print("== 16.3 target UC grants for the run-as SPs ==")
+    tw = WorkspaceClient(profile=TARGET_PROFILE)
+    cat = os.environ.get("WSMIG_TARGET_CATALOG") or CATALOG
+    apps = {s.display_name: s.application_id for s in tw.service_principals.list()}
+    for sp in ("ai27_acc_spn_1", "ai27_acc_spn_3"):
+        for kind, full, priv in (("catalog", cat, "USE_CATALOG"),
+                                 ("schema", f"{cat}.{SCHEMA}", "USE_SCHEMA")):
+            tw.api_client.do("PATCH", f"/api/2.1/unity-catalog/permissions/{kind}/{full}", body={
+                "changes": [{"principal": apps[sp], "add": [priv]}]})
+            log(f"  {priv} on {kind} {full} → {sp}")
+
+
+def _grant_runner_sp_user(sp_name: str) -> None:
+    sp = next(iter(w.service_principals.list(filter=f'displayName eq "{sp_name}"')))
+    acct = _acct().config.account_id
+    name = f"accounts/{acct}/servicePrincipals/{sp.application_id}/ruleSets/default"
+    runner = f"servicePrincipals/{RUNNER_APP_ID}"
+    rs = w.api_client.do("GET", "/api/2.0/preview/accounts/access-control/rule-sets",
+                         query={"name": name, "etag": ""})
+    rules = rs.get("grant_rules", []) or []
+    r = next((x for x in rules if x.get("role") == "roles/servicePrincipal.user"), None)
+    if r and runner in (r.get("principals") or []):
+        log(f"  runner already has servicePrincipal.user on {sp_name}")
+        return
+    if r:
+        r["principals"] = list(r.get("principals") or []) + [runner]
+    else:
+        rules.append({"role": "roles/servicePrincipal.user", "principals": [runner]})
+    w.api_client.do("PUT", "/api/2.0/preview/accounts/access-control/rule-sets",
+                    body={"name": name, "rule_set": {"name": name, "grant_rules": rules,
+                                                     "etag": rs.get("etag", "")}})
+    log(f"  servicePrincipal.user granted to the runner on {sp_name}")
+
+
+def phase_cust163_run2():
+    """PLAN 16.3 §11 Run 2 seed (user-approved): owner change + the runner's role on spn_3."""
+    print("== 16.3 run-2 seed ==")
+    _set_query_owner(C163_QUERY, ENTRA_USERS[3])                   # aman.bansal
+    _grant_runner_sp_user("ai27_acc_spn_3")
+
+
+def phase_cust163_heal():
+    """PLAN 16.3 §11 Run 3 (TARGET): create the Genie space's missing table."""
+    print("== 16.3 heal: target table ==")
+    tw = WorkspaceClient(profile=TARGET_PROFILE)
+    twh = next(iter(tw.warehouses.list())).id
+    cat = os.environ.get("WSMIG_TARGET_CATALOG") or CATALOG
+    res = tw.statement_execution.execute_statement(
+        warehouse_id=twh, wait_timeout="50s",
+        statement=f"CREATE TABLE IF NOT EXISTS {cat}.{SCHEMA}.{C163_TABLE} (id INT, label STRING)")
+    while res.status.state.value in ("PENDING", "RUNNING"):
+        time.sleep(3)
+        res = tw.statement_execution.get_statement(res.statement_id)
+    log(f"  target table {cat}.{SCHEMA}.{C163_TABLE}: {res.status.state.value}")
+
+
+def phase_cust163_cleanup():
+    """PLAN 16.3 §11: restore the alert cron saved by `cust163_seed`."""
+    print("== 16.3 cleanup ==")
+    orig = _c163_state().get("alert_original_schedule")
+    alerts = w.api_client.do("GET", "/api/2.0/alerts").get("alerts", []) or []
+    a = next((x for x in alerts if x.get("display_name") == C163_ALERT), None)
+    if a and orig:
+        w.api_client.do("PATCH", f"/api/2.0/alerts/{a['id']}", query={"update_mask": "schedule"},
+                        body={"schedule": orig})
+        log(f"alert {C163_ALERT}: schedule restored → {orig}")
+
 PHASES = {
     "identity": phase_identity,
     "warehouses": phase_warehouses,
@@ -3071,6 +3263,14 @@ PHASES = {
     "target_dest": phase_target_dest,
     "retry_seed": phase_retry_seed,
     "retry_heal": phase_retry_heal,
+    # PLAN 16.3 live QA — EXCLUDED from `all`; run explicitly, in plan §11 order.
+    "cust163_seed": phase_cust163_seed,
+    "cust163_alert": phase_cust163_alert,
+    "cust163_target_prep": phase_cust163_target_prep,
+    "cust163_uc_grants": phase_cust163_uc_grants,
+    "cust163_run2": phase_cust163_run2,
+    "cust163_heal": phase_cust163_heal,
+    "cust163_cleanup": phase_cust163_cleanup,
 }
 
 if __name__ == "__main__":
@@ -3080,10 +3280,10 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args == ["all"]:
         mode = "run"
-        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal")]
+        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal") and not p.startswith("cust163_")]
     elif args == ["--plan"]:
         mode = "plan"
-        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal")]
+        requested = [p for p in PHASES if p not in ("incremental", "target_uc_prep", "target_dest", "retry_seed", "retry_heal") and not p.startswith("cust163_")]
     elif args == ["check"]:
         mode = "run"
         requested = ["check"]

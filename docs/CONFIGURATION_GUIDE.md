@@ -147,7 +147,7 @@ import selector.
 | `migrate_dashboards` | AI/BI (Lakeview) dashboards | `true` |
 | `migrate_genie` | Genie spaces | `true` |
 | `migrate_serving` | Model serving endpoints | `true` |
-| `migrate_misc` | Global init scripts, cluster libs, workspace conf | `true` |
+| `migrate_misc` | Global init scripts, cluster libs, workspace conf (best effort — set via the API, read back for up to 3 min; an admin should review the settings afterwards) | `true` |
 
 > 🧭 **Toggles vs selector:** `migrate_*` (here) is *bundle scope* — what gets exported, set
 > identically on both airgap sides. `import_assets` (on `04_Import`) is *this session's work list*

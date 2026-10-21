@@ -15,8 +15,9 @@ The step-by-step guide to running a real migration. Follow it top to bottom. Eve
 5. [Reading the outputs](#-reading-the-outputs)
 6. [Handling failures & manual actions](#-handling-failures--manual-actions)
 7. [Dashboards: publish, credentials, schedules](#-dashboards-publish-credentials-schedules)
-8. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
-9. [Quick reference card](#-quick-reference-card)
+8. [Owners & run-as identities](#-owners--run-as-identities)
+9. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
+10. [Quick reference card](#-quick-reference-card)
 
 ---
 
@@ -63,16 +64,14 @@ Environment variables**:
 > external.
 
 **3. Handle the libraries when `%pip install` is blocked.**
-The notebooks pull `databricks-sdk`, `openpyxl`, and `requests` via `%pip`. Two options:
-- **Pre-install them as cluster libraries** on the all-purpose cluster (from PyPI or uploaded
-  wheels) so the `%pip` cell is a no-op — simplest when PyPI is fully blocked.
-- **Whitelist them on the proxy** — but note a per-project proxy needs each library **and its full
-  transitive dependencies** allow-listed individually. The complete list, plus a one-liner to
-  regenerate the exact closure for your runtime, is in
-  [Permissions › Python dependency whitelist](PERMISSIONS_GUIDE.md#-python-dependency-whitelist-when-the-proxy-allows-pypi-per-library).
-
-`databricks-sdk` and `requests` usually ship with the runtime; `openpyxl` (used for the Excel
-reports) is the one most often missing.
+The notebooks run `%pip install databricks-sdk openpyxl requests`. On DBR 15.4 LTS only `openpyxl` and
+`et-xmlfile` are actually downloaded — the rest ship with the runtime. Two options:
+- **Pre-install `openpyxl`** (it brings `et-xmlfile`) as a cluster library on the all-purpose cluster, so the
+  `%pip` cell downloads nothing — simplest when PyPI is fully blocked.
+- **Allow PyPI on the proxy — BOTH hosts:** `pypi.org` (the index pip looks packages up in) **and**
+  `files.pythonhosted.org` (where the files are downloaded from). With `pypi.org` alone the lookup works but the
+  download fails with connection or timeout errors. Details and a check for your own runtime:
+  [Permissions › Python libraries through a proxy](PERMISSIONS_GUIDE.md#-python-libraries-through-a-proxy-pypi-allow-list).
 
 > 📈 **Very large source workspaces:** for a workspace with hundreds of thousands of assets, give the
 > cluster a **larger-memory driver** (e.g. 64–128 GB). Migrations are infrequent, so size up for the
@@ -198,10 +197,14 @@ below.
 
 Everything lands in the bundle at `<staging_location>/wsmig/<source_workspace_id>/<run_id>/`:
 
+> 📍 **Finding a run's folder:** open the job run → click a task → its output **ends** with
+> `Run id : <run_id>` and `Folder : <full path>/` (`reports/` = the xlsx, `misc/` = the JSON + logs).
+> The same two lines are also at the top of the output.
+
 | File | Where | What it tells you |
 |------|-------|-------------------|
 | **`reports/import_status.xlsx`** *(live)* / **`import_status_dry_run.xlsx`** *(dry)* | `reports/` | One sheet **per asset type** — action, status, and notes for every unit. Includes the **ACL Parity** sheet (source-vs-target permission diff). **Read this first.** |
-| **`reports/manual_actions_import.md`** | `reports/` | The checklist of steps only a human can do (secret values, AKV scopes, legacy dashboards, Git repos). |
+| **`reports/manual_actions_import.md`** | `reports/` | The checklist of steps only a human can do (secret values, AKV scopes, legacy dashboards, Git repos). Also have a workspace admin review the **workspace settings** (best effort — see below). |
 | **`misc/preflight_report.json`** | `misc/` | The graded go/no-go verdict. |
 | **`misc/import_results.json`** | `misc/` | Machine-readable per-unit results. |
 | **`misc/execution*.log`** | `misc/` | Full execution log. |
@@ -218,6 +221,12 @@ Everything lands in the bundle at `<staging_location>/wsmig/<source_workspace_id
 | `skipped_no_object` | A permission waiting on an object this run didn't create (normal for DAB/repos) |
 | `not_selected` | Not in this session's `import_assets` list |
 | `failed` | A per-unit failure — fixable, then retry (**does not** mean the run broke) |
+
+> 🟥 **`run_status = completed_no_report`** (import task red): every phase ran and the state **was**
+> saved, but a report file (`import_status.xlsx`, `import_results.json` or `manual_actions_import.md`)
+> did not land — the ERROR line in the output names the file and the cause. The target **was**
+> changed. Fix the cause (usually the staging Volume), then re-run the import with the **same
+> `run_id`**: every object SKIPs and the reports are rewritten.
 
 ---
 
@@ -257,6 +266,42 @@ Fix the cause, then re-run only the outstanding units.
 > which failed `prerequisite_missing` — is fixed in **1.1.1**. Pull 1.1.1 into the Git folder and re-run the
 > import with **`retry_mode=failed_only`** (`dry_run=false`, same `run_id`, no re-export): the policy is created
 > first, then the jobs/clusters that use it, then their permissions — all in that one run.
+
+> ⚙️ **Workspace settings (workspace conf) are best effort — have a workspace admin review them.** The
+> tool sets each setting with an API call and then reads it back. The read can lag the write, so a
+> setting that does not show its new value at once is re-checked every 15 s for **up to 3 minutes**
+> before it is reported. The report then says `set … (verified by read-back)` (or `… after N s`) or
+> `failed` / `not_applied`. A target value that differs from the source is re-applied on each run
+> (this also reverts a hand change made on the target). Because a workspace can ignore a setting
+> through the API, or take longer than 3 minutes to show it, **a workspace admin should check the
+> migrated settings in the admin console after the migration.**
+>
+> **A setting that is `failed` / `not_applied`** ("… the API returned 200, but the target still reads
+> … after 3 min"): the target did not take that key through the API. Set it by hand in the **admin
+> console**, then re-run — the row turns green once the target really holds the source value.
+
+> 🧞 **A Genie space failing with `Table '<catalog>.<schema>.<table>' does not exist`**: Genie checks
+> its Unity Catalog tables when the space is created. UC is out of scope, so create (or grant) the
+> table on the target first, then `retry_mode=failed_only`. The tool only says "targets workspace
+> folder … which does not exist" when a live check of that exact folder returned 404 — otherwise the
+> note is the server's own error.
+
+> 🔄 **Synced-table pipelines** (`Synced table: <catalog>.<schema>.<table>`) are `manual`: the platform
+> creates them, they have no source code, and the pipelines API cannot recreate them. Recreate the
+> **synced table** on the target and the platform recreates its pipeline. Any other pipeline with no
+> source code (`libraries` empty) is `manual` the same way — recreate whatever owns it.
+
+> 🔌 **Lakeflow Connect pipelines are a manual step.** Both halves depend on a Unity Catalog
+> **connection**, and UC is out of scope:
+> - an **ingestion gateway** (spec has `gateway_definition`) is `manual` with a note naming its
+>   connection;
+> - an **ingestion pipeline** (spec has `ingestion_definition`) is still attempted, but fails unless
+>   the same-named connection already exists on the target — and a database-connector one always
+>   fails, because it points at the *source* gateway's pipeline id (`ingestion_gateway_id`), which the
+>   tool does not remap.
+>
+> Create the connection on the target, then recreate the gateway and its ingestion pipeline in
+> Lakeflow Connect. Treat any failed ingestion pipeline row as this manual step.
 
 > ⚙️ **A job that 403s on a SQL warehouse** ("not authorized to use or monitor this SQL Endpoint")
 > is usually just an **ordering effect**, not a missing permission: jobs are created before the
@@ -328,6 +373,44 @@ Publish state and schedules show up as their own rows in `import_status.xlsx`, o
 
 ---
 
+## 👤 Owners & run-as identities
+
+| Object | Owner on the target |
+|--------|--------------------|
+| **SQL queries** | The **source owner** — set after create and verified (`owner set to … (verified)`). If the change is refused the row is `created_with_warning` and the query stays owned by the migration SP. An owner deleted on the source is left alone. |
+| **Jobs, SQL warehouses** | The source owner, through their permissions (`IS_OWNER` travels with the ACLs). |
+| **DLT / Lakeflow pipelines** | The **migration identity** (see below). The source owner gets `CAN_MANAGE`. |
+| **AI/BI dashboards, Genie spaces, clusters, Alerts V2** | The migration identity — there is no owner API; reassign by hand if it matters. |
+
+**Pipelines — why the owner is kept.** On a Unity Catalog pipeline, changing the owner needs a
+**metastore admin**, and the permissions call is all-or-nothing — so asking for the source owner cost
+the pipeline **every** grant (`403 Only metastore admins can change pipeline owner`). The tool never
+asks: it keeps the current owner, gives the source owner `CAN_MANAGE`, and applies every other grant
+exactly. The **ACL Parity** sheet reads `match` with the note *owner kept on target (needs a metastore
+admin)*.
+
+A UC pipeline **runs as its owner** unless its spec sets `run_as`:
+
+| Source pipeline ran as | Target runs as |
+|------------------------|----------------|
+| a **user** | the **migration identity** (a user can't be set as run-as) — so it needs access to the pipeline's tables |
+| a **service principal** | **the same SP** (remapped if it was recreated), via the spec's `run_as` |
+
+To set an SP as run-as, the migration identity needs the **Service Principal User** role on that SP
+— being a workspace admin, or holding Service Principal **Manager**, is not enough. Without it the
+target refuses (`403 PERMISSION_DENIED Cannot bind the service principal provided in 'run_as' field
+… must have 'servicePrincipal.user' role`), and the pipeline is created without it, as
+`created_with_warning` with the fix in the note; grant the role and re-run. Any other error (e.g.
+the SP lacks `USE CATALOG`) fails the row with the server's message, so the pipeline never silently
+runs as the wrong identity.
+
+**Transferring a pipeline to its source owner afterwards** (a metastore admin): open the pipeline →
+**Permissions** → make the source owner **Is Owner**; or call `PUT /api/2.0/permissions/pipelines/<id>`
+naming the new `IS_OWNER` plus every other grant. The next import run keeps that owner (it is now the
+current owner) and changes nothing.
+
+---
+
 ## ♻️ Re-running (incremental migrations)
 
 Re-runs are **expected and safe** — the same pair is migrated repeatedly over its life. Every asset
@@ -349,11 +432,25 @@ Just run the live job again. Each run emits a fresh change report. See
 Import doesn't ask which bundle to act on — it **resolves one automatically**, in this order:
 
 1. An **explicit `run_id`** you pass (deliberate control — re-import a specific bundle).
-2. Otherwise, the newest **incomplete** import for this pair → **resume** it (this is what makes a
-   plain re-run continue rather than restart).
-3. Otherwise, the **`LATEST_EXPORT.json`** pointer → the newest bundle whose export *completed*.
-4. Otherwise it **fails loudly** — a `run_id` is never invented (that would import an empty bundle
+2. Otherwise, the **`LATEST_EXPORT.json`** pointer → the newest bundle whose export *completed*. An
+   import that crashed in that folder is **continued** from its checkpoint (work already done is
+   skipped). An unfinished import in an *older* folder is never picked up — it holds an older copy of
+   the source.
+3. Otherwise it **fails loudly** — a `run_id` is never invented (that would import an empty bundle
    and report a falsely clean run).
+
+Inventory and export with a blank `run_id` continue the **newest** folder only if it is unfinished;
+otherwise inventory starts a fresh folder and export uses `LATEST_INVENTORY.json`.
+
+**Standalone `retry_mode=failed_only`:** `run_id` can stay **blank** — it then uses the latest export.
+What is retried comes from the state table, not from the folder.
+
+**Repair run vs Run now (job runs):**
+
+- **Repair run** (re-run only the failed tasks of a job run) keeps the inventory task's values, so the
+  repaired export / import use the **same `run_id` and folder** and continue from the checkpoint.
+- **Run now** starts a new job run: the inventory continues the newest folder only if its export
+  never finished; otherwise it starts a **new** folder, then a fresh export and the import.
 
 **When do you set `run_id` yourself?**
 
@@ -388,7 +485,7 @@ Import doesn't ask which bundle to act on — it **resolves one automatically**,
 |------|---------------|
 | Rehearse, write nothing | `dry_run=true` |
 | Go live | `dry_run=false` (+ `state_catalog`/`state_schema`) |
-| Retry only failures | `retry_mode=failed_only` |
+| Retry only failures | `retry_mode=failed_only` (`run_id` can stay blank) |
 | Replay only permissions | `import_assets=acls` (+ `retry_mode=skipped_only`) |
 | Skip an asset family (bundle scope) | `migrate_<family>=false` on `02_Export` |
 | Limit this session's work | `import_assets=identity,compute,…` on `04_Import` |

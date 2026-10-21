@@ -34,8 +34,10 @@ from typing import Any, Iterable
 # Keys are the fine-grained `asset_type`. Values are field patterns removed from the payload
 # before it is written / fingerprinted. A pattern is either an exact top-level key or a glob
 # (fnmatch) — globs let us catch families like every `*_time` / `*_by_user*` on a cluster
-# without listing each one. Only TOP-LEVEL keys are matched (runtime cruft lives at the top of
+# without listing each one. Only TOP-LEVEL keys are glob-matched (runtime cruft lives at the top of
 # these API objects); nested specs (tasks, definition, serialized_dashboard) are preserved whole.
+# A DOTTED pattern (`evaluation.state`, PLAN 16.3 §8) names ONE exact nested key — for the rare
+# read-only field that sits inside an otherwise create-ready block.
 # ---------------------------------------------------------------------------
 
 STRIP_FIELDS: dict[str, list[str]] = {
@@ -100,8 +102,12 @@ STRIP_FIELDS: dict[str, list[str]] = {
     "legacy_dashboard": ["id", "created_at", "updated_at", "user",
                          "create_time", "update_time", "owner_user_name", "lifecycle_state"],
     # `effective_run_as` is the server-resolved identity (the settable field is `run_as`).
+    # PLAN 16.3 §8: `evaluation.state` / `evaluation.last_evaluated_at` move every time the alert
+    # runs on its schedule — left in, every evaluation looked like an edit (a false `updated` and a
+    # needless PATCH per alert per run). The rest of `evaluation` is create/update content.
     "alert_v2": ["id", "create_time", "update_time", "lifecycle_state", "owner_user_name",
-                 "trigger_state", "effective_run_as", "run_as_user_name"],
+                 "trigger_state", "effective_run_as", "run_as_user_name",
+                 "evaluation.state", "evaluation.last_evaluated_at"],
     # ── DLT (payload = spec) ──────────────────────────────────────────────
     # The pipeline SPEC nests the pipeline id as `id` (not `pipeline_id`), and
     # `pipeline_type` is server-derived — carrying either to target creates a conflict.
@@ -133,18 +139,36 @@ def _matches_any(key: str, patterns: Iterable[str]) -> bool:
     return False
 
 
+def _without_path(obj: Any, parts: list) -> Any:
+    """`obj` minus the nested key at `parts` — copy-on-write along the path, so the caller's record
+    is never mutated. A path that isn't there returns `obj` unchanged."""
+    if not isinstance(obj, dict) or parts[0] not in obj:
+        return obj
+    if len(parts) == 1:
+        return {k: v for k, v in obj.items() if k != parts[0]}
+    child = _without_path(obj[parts[0]], parts[1:])
+    if child is obj[parts[0]]:
+        return obj
+    return {**obj, parts[0]: child}
+
+
 def strip_runtime(asset_type: str, payload: dict) -> dict:
     """Return a shallow copy of `payload` with this asset's runtime fields removed.
 
     Unknown asset types strip nothing (safe default — better to over-carry than to drop a
     field we didn't anticipate; a missing strip only makes a fingerprint slightly noisier).
+    Dotted patterns remove one nested key; the record passed in is never mutated.
     """
     if not isinstance(payload, dict):
         return payload
     patterns = STRIP_FIELDS.get(asset_type, [])
     if not patterns:
         return dict(payload)
-    return {k: v for k, v in payload.items() if not _matches_any(k, patterns)}
+    top = [p for p in patterns if "." not in p]
+    out = {k: v for k, v in payload.items() if not _matches_any(k, top)}
+    for dotted in (p for p in patterns if "." in p):
+        out = _without_path(out, dotted.split("."))
+    return out
 
 
 def _canonical(value: Any) -> Any:

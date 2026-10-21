@@ -1,754 +1,705 @@
 # PLAN 16.3 — Customer fixes, wave 2 (release 1.2.0)
 
-**Status:** DRAFT FOR USER REVIEW 2026-10-09. Master: [PLAN_16_master.md](PLAN_16_master.md) (16.3 row, rescoped by the
-user 2026-10-09: "Option A").
-**Base:** `main` @ `c3421bb` (1.1.0, live-certified). **Branch:** `feature/16_3_customer_fixes`, cut from `main`.
-**Roles:** a **dev session** builds the code and offline tests from this file alone (plus `CLAUDE.md`, the master plan
-and project memory). **Claude (this session)** is master and reviewer: reviews the dev diff, then runs the live QA in
-§11. **The user** reviews, commits and pushes; Claude never commits.
+**Status:** READY FOR DEV once the user approves (rewritten 2026-10-12, updated 2026-10-13: B9 slimmed, CUST-1 run-as rule). Every API fact the code relies on is verified live (§0); nothing is left for the dev to probe. Master: [PLAN_16_master.md](PLAN_16_master.md).
+**Base:** `main` @ 1.1.1 (after the `hotfix/policy_family` merge). **Branch:** `feature/16_3_customer_fixes`.
+**Roles:**
+- **Dev session:** builds the code and the offline tests from this file (plus `CLAUDE.md` and the master plan).
+- **Claude (this session):** reviews the diff (§13), then runs the live QA (§11).
+- **The user:** reviews, commits and pushes. Claude never commits.
 
-**Scope: nine items, in the user's priority order** (7b added by the user 2026-10-12 after the customer's Genie failures; 7c added by the user 2026-10-12 after the 1.1.1 QA):
+## Start here (dev session)
+1. **Read:** this file, `CLAUDE.md`, and `plans/PLAN_16_master.md` (ground rules).
+2. **Branch:** `git checkout main && git pull`. Confirm `VERSION` = `1.1.1`, then `git checkout -b feature/16_3_customer_fixes`.
+3. **Baseline:** `python3 -m pytest` → **507 passed**. pip needs the proxy: `pip3 install --index-url https://pypi-proxy.cloud.databricks.com/simple <pkg>`.
+4. **Build order** (smallest blast radius first; run the full suite after each item):
+   - §8 alert strip
+   - §7 error wording
+   - §3 report write
+   - §2 settings
+   - §6 synced pipelines
+   - §1 run folder
+   - §4 query owner
+   - §5 pipelines
+5. **Rules:**
+   - **No live calls:** offline tests only, using the fakes in `tests/test_plan16_2.py` / `tests/test_plan16_2_1.py`.
+   - **No git:** don't commit, push or edit the live bed.
+   - **No surprises:** don't touch files outside §9 or add anything not in this plan. If something here is wrong or ambiguous, write it in §9b and stop for review rather than guess.
+6. **Done when:**
+   - every test listed in this plan exists and passes;
+   - the full suite passes;
+   - the mutation check is recorded per item in §9b;
+   - the fingerprint-stability test passes;
+   - the CHANGELOG, VERSION and docs are updated per §10.
 
-| § | Item | One line |
+   Then hand back to Claude for the review (§13).
+
+| § | Item | What changes for the customer |
 |---|---|---|
-| 1 | **B9** run-id folder | The bundle folder is named after the Jobs-UI job run id, not a timestamp. A repair run writes into the same folder. |
-| 2 | ~~**B3** policy family~~ → **hotfix 1.1.1** (PLAN_16_2_1) | Cluster policies built on a policy family create and update instead of failing with a 400. |
-| 3 | **B4** workspace-conf read-back | Each workspace setting is read back after it is written. If the target didn't change, the row is `failed — not applied`, never `Created`. |
-| 4 | **B11** report write | If `import_status.xlsx` (or the results JSON / runbook) doesn't land, the task goes red with `completed_no_report`. |
-| 5 | **B2** query owner | A migrated SQL query gets its source owner instead of staying owned by the migration SP. |
-| 6 | **CUST-1** pipeline ACLs | When the platform refuses the pipeline-owner change, the ACL is re-sent with the target's current owner, so the other grants still land. |
-| 7 | **CUST-2** synced-table pipelines | Pipelines the API can't create (no source code: synced-table pipelines) become a `manual` step with a clear note. The tool never POSTs them. |
-| 7b | **QA16.2-1** wrong "folder missing" cause | The "folder does not exist" / "not published" messages are shown only after a live check confirms them; otherwise the server's own error is shown. |
-| 7c | **QA16.2.1-1** alerts "updated" every run | An Alert V2 that ran on its schedule on the source is no longer reported (and PATCHed) as `updated` when nothing about it changed. |
+| 1 | **B9** find the run's folder | Each notebook also prints the run's folder path at the **end** of its output (today it's only at the top). A standalone import always uses the latest export; no run ever continues an old abandoned folder. |
+| 2 | **B4** workspace settings | Each setting is read back after the write. If the target didn't change, the row is `failed`, not `Created`. |
+| 3 | **B11** report write | If `import_status.xlsx` doesn't land, the task goes red (`completed_no_report`). |
+| 4 | **B2** query owner | A migrated SQL query gets its source owner, not the migration SP. |
+| 5 | **CUST-1** pipeline ACLs | The tool never tries to change a pipeline's owner, so the other grants always land. An SP-owned pipeline keeps running as that SP. |
+| 6 | **CUST-2** synced-table pipelines | Pipelines the API can't create become a `manual` step. Today they fail on every run. |
+| 7 | **QA16.2-1** wrong "folder missing" | "Folder does not exist" is shown only when a check proves it. Otherwise the report shows the server's real error. |
+| 8 | **QA16.2.1-1** alerts "updated" | An Alert V2 that only ran on its schedule is `skipped`, not `updated`. |
 
-**Not in this wave** (back to the backlog, master "Backlog after 16.3"): 16.4 (notification destinations + catalog
-rename), B8 home re-sweep, B1, B12, W0-6, W0-7, QA16.2-2…4, the wider B4 audit of every other mutating call.
+Cluster-policy families (B3) shipped in 1.1.1. **Not in this wave:**
+- 16.4 (notification destinations, catalog rename);
+- B1, B8, B12;
+- W0-6, W0-7;
+- QA16.2-2…4;
+- the wider B4 audit.
 
-**Default-behaviour rule (ground rule 1).**
-- Apart from the nine items, behaviour stays byte-identical to 1.1.0: the same decisions, natural keys and state
-  schema.
-- **No fingerprint changes**, except the one stated in §7c (Alert V2 only, a one-time `updated`). No other unit's
-  fingerprint may move, otherwise the first upgraded run would mass-UPDATE. Each item below states how it reaches
-  already-migrated objects without one.
-- **Upgrade rule (ground rule 7).** The customer runs 1.0.0/1.1.0 today. Every item states what a 1.x-written state
-  row, bundle or *installed job* does on the first run after a pull, and has an offline test that seeds that shape.
+**Ground rules:**
+- **Everything else stays byte-identical to 1.1.1:** decisions, natural keys and state schema.
+- **No fingerprint changes, except Alert V2 (§8).** Any other fingerprint change would mass-UPDATE on the first upgraded run.
+- **Upgrade safe.** The customer runs 1.1.x. Each item says what a 1.x state row, bundle or installed job does on the first upgraded run, and has an offline test that seeds that shape.
+- **No new silent `except`.** Log expected cases at DEBUG and degraded ones at WARNING/ERROR.
 
 ---
 
-## 0. Verified live 2026-10-09 (Claude) — the dev builds on these facts, no further probing needed
-Evidence: `~/Desktop/wsmig_runs/plan16_3/api_probes/2026-10-09_premises.md`. Probes ran on scratch objects that were
-deleted afterwards.
+## 0. Verified live facts (the dev builds on these; no more probing needed)
+The evidence is in `~/Desktop/wsmig_runs/plan16_3/api_probes/2026-10-09_premises.md`. All probes used scratch objects, which were deleted afterwards.
 
-| # | Fact | Used by |
+| # | Fact | § |
 |---|---|---|
-| V1 | `base_parameters {"job_run_id": "{{job.run_id}}"}` gives every task the **job run id** (e.g. `818095769358527`). A **Repair run** gives the repaired task the **same** value, and `taskValues.get(taskKey="t1")` still returns the value set by the first, not-re-run task. | §1 |
-| V2 | **Job run ids are NOT time-ordered.** One daily job got `298288963013477`, `612344363020761`, `345818061134240`, `570225755438119`, `655319886577201` on 5 consecutive days. 16.2 QA Run A `640341627917106` came before Run B `226010421041587` (same job). So "newest = highest name" breaks once folders are named by run id. | §1c |
-| V3 | `os.path.getmtime` on a `/Volumes/...` file returns its write time (the Files API also returns `last_modified` for files). | §1c |
-| V4 | Cluster-policy **edit** with `{policy_id, name, policy_family_id, policy_family_definition_overrides}` → 200. With `policy_family_id` + `definition` → 400 `policy_family_id and definition cannot be used together`. Create has the same rule (verified 2026-10-01, PLAN_13 B3). | §2 |
-| V5 | `GET /api/2.0/sql/queries` (the LIST) returns `owner_user_name` for every query. Today every migrated target query is owned by the runner SP (5/5 on the current target). Query permission levels are `CAN_READ/RUN/EDIT/MANAGE` (no `IS_OWNER`); the owner shows up as an *inherited* `CAN_MANAGE`. The owner PATCH `{query:{owner_user_name}, update_mask:"owner_user_name"}` changes the owner (verified 2026-10-01, PLAN_13 B2). | §5 |
-| V6 | The shared sandbox metastore's owner is the `account users` group, so every account identity, including our runner, is a metastore admin. **CUST-1's 403 cannot be reproduced on this bed**; that path is covered offline. | §6, §11 |
-| V7 | On a pipeline, `PUT permissions` with **no `IS_OWNER` entry → 400 `The pipeline must have exactly one owner.`** A PUT with `IS_OWNER` = the **current** owner plus the other grants → 200: the owner is unchanged and the grants are exact. So "just leave the owner out" (the master plan's old option (a)) does **not** work. | §6 |
-| V8 | Workspace-conf GET returns string values (`"true"`, `"false"`, `"30"`) or `null` for unset keys. Re-verified PATCH→GET read-back is immediate (PLAN_13 B4, 2026-10-01). Whether a key is silently dropped depends on the workspace: `enableWebTerminal` was dropped on one, `enableExportNotebook` on the customer's. | §3 |
-| V9 | `jobs/*.job.json` token substitution only matches `{{UPPER_CASE}}` (`job_templates._TOKEN`), so a lowercase `{{job.run_id}}` passes through `render_template` untouched and is **not** a leftover-token error. A non-blank template value is a pin the installer never overwrites. | §1a |
+| V1 | A *Repair run* keeps the job's task values, so a repaired export/import gets the same `run_id` from the inventory task and continues in the same folder. | 1, 11 |
+| V2 | Job run ids are **not** in time order, which is one reason folders keep their timestamp names. | 1 |
+| V3 | Workspace-conf GET returns strings (`"true"`, `"30"`) or `null`. A read right after a PATCH sees the new value. Which keys a workspace silently ignores differs per workspace. | 2 |
+| V4 | The query LIST returns `owner_user_name`. Queries have no `IS_OWNER` level. The PATCH `{query:{owner_user_name}, update_mask:"owner_user_name"}` changes the owner. | 4 |
+| V5 | Pipeline `PUT permissions` with no `IS_OWNER` → 400 `The pipeline must have exactly one owner.` A PUT with `IS_OWNER` = the **current** owner plus the other grants → 200, applied exactly. | 5 |
+| V6 | **(2026-10-12)** A UC pipeline **runs as its owner** unless the spec sets `run_as`: changing the owner changed `run_as_user_name`. Spec `run_as` = another **user** → 400 `You can only set run_as to yourself, a service principal, or a group`. Spec `run_as` = an **SP** → 200; it runs as that SP and the owner stays the creator. A **group** can never own a pipeline (`Owner cannot be changed to a group`). **Not verified:** the caller here is a metastore admin, so it is unknown whether a non-admin runner may set `run_as` to another SP (it may need the Service Principal User role on it). | 5 |
+| V7 | **(2026-10-13)** The pipelines LIST (`GET /api/2.0/pipelines`) returns `run_as_user_name` per pipeline (source 5/5, target 5/5). The collector keeps that LIST entry as `_raw`. An SP shows as its application id (a UUID). | 5 |
+| V8 | On this bed every account identity is a metastore admin (the metastore owner is `account users`), so the customer's 403 can't be reproduced here. With §5 that no longer matters: the tool never asks for an owner change. | 5, 11 |
 
 ---
 
-## 1. B9 — the bundle folder is named by the job run id
-**Today.**
-- A blank `run_id` widget mints `YYYYMMDD_HHMMSS` (`config_manager.py:382`). `01_Inventory` publishes it as a task
-  value, and export/import read it back (`02_Export.py:108-120`, `04_Import.py:163-174`).
-- The Jobs UI shows run `#681909549084095` while the folder is `20261006_033735`. Nothing links the two, so an operator
-  can't find a run's reports or know which `run_id` to pass to a standalone `failed_only`.
+## 1. B9 — say where the run's folder is (folders keep their timestamp names)
+**Decision (user, 2026-10-13): keep it simple.**
+- No folder renaming.
+- No job-run-id recording.
+- No template or installer change.
 
-**1a. Templates + widget.**
-- Add `"job_run_id": "{{job.run_id}}"` to the **inventory task's** `base_parameters` in every template that has one:
-  `direct_end_to_end_live`, `direct_end_to_end_dry_run`, `inventory`, `airgap_source`.
-- Do **not** add it to export/import tasks. A standalone export/import job is its own job run, so its job run id is
-  *not* the bundle's id.
-- `01_Inventory` gets `dbutils.widgets.text("job_run_id", "", "Job run id (set by the job — leave blank)")`.
-- The installer needs no code change (V9). Add a test that `render_template` keeps the pin, adds no other key, and
-  doesn't raise.
-
-**1b. Resolution** (`bundle_state.resolve_inventory_run_id`, new arg `job_run_id=""`). Precedence:
-1. explicit `run_id` widget → `widget` (unchanged);
-2. **`job_run_id`**, if it matches `^\d+$` → `job-run-id`. Anything else (blank, a literal `{{job.run_id}}` from an
-   interactive copy) is ignored with a DEBUG line. **A job run id beats "resume the newest incomplete run"
-   (decision D2):** a new *Run now* gets a new folder, and resuming is what *Repair run* is for (V1);
-3. newest incomplete run → `resume` (unchanged; only reached without a job run id);
-4. fresh timestamp → `fresh` (unchanged; interactive runs).
-
-The notebook prints `Run id : 681909549084095 (resolved via: job-run-id)`. The task-value publish is unchanged, so
-export and import in the same job use the same id with no change.
-
-**1c. Run-folder ordering by time, not by name** (needed because of V2).
-- `bundle_state.list_run_ids` sorts newest-first by **time**: the max `os.path.getmtime` of whichever of
-  `misc/{checkpoint,manifest,inventory,import_results}.json` exist, else the directory's own mtime, else 0. Ties break
-  by name, descending. Update the module docstring (line 14 says timestamps sort lexicographically).
-- **Resume considers only the newest run.** This stops a stale, abandoned folder from hijacking a later run. Abandoned
-  folders become common once a new *Run now* no longer resumes (D2). Today's newest-first scan returns the *first*
-  incomplete folder, even one older than the latest completed run.
-  - Inventory/export resume: only the newest run folder is a candidate. Resume it if it's incomplete (checkpoint
-    present, no manifest); otherwise fall through to the pointer.
-  - Import resume (`import_runner.resolve_import_run_id`): only the newest run folder **that has a manifest** is a
-    candidate. Resume it if its import started and didn't finish (unchanged test); otherwise use `LATEST_EXPORT.json`.
-- **Mixed folders** (old `2026…` timestamp folders next to new numeric folders) order correctly because only times
-  are compared.
-
-**1d. Actionable manifest-missing error** (`ImportRunner.verify_bundle`).
-- When the manifest itself is absent, the message must say: bundle `<run_id>` has no `manifest.json`, so its export
-  did not finish.
-- It must name the last completed export from `LATEST_EXPORT.json`: "pass run_id=`<id>`, or Repair the job run so
-  its export finishes".
-- Missing/mismatched *files* keep today's message.
-- Reuse `ImportRunner.verify_bundle` and its test from the `plan13-backlog-b1-b13` branch.
-
-**Upgrade path.**
-- Jobs installed by 1.0/1.1 have no `job_run_id` parameter, so they keep timestamp folders: pull-only upgrades behave
-  exactly as today.
-- To switch on run-id folders, the customer re-runs `00_Install_Jobs` (create-or-reset by name: same job ids, history
-  kept). Decision D4.
-- Old timestamp folders stay readable (explicit `run_id`, `LATEST_*` pointers) and order correctly next to new ones
-  (1c). The state table doesn't depend on the folder name.
-
-**Tests** (`tests/test_plan16_3.py`):
-- precedence: widget > job_run_id > resume > fresh;
-- non-numeric or `{{…}}` job_run_id ignored;
-- a job run id is used even when an older incomplete run exists (D2);
-- `list_run_ids` orders by mtime: numeric ids out of order, mixed with timestamp folders;
-- resume ignores an old abandoned incomplete folder when a newer complete one exists (inventory, export and import);
-- the newest folder incomplete → resumed (unchanged);
-- the manifest-missing message names `LATEST_EXPORT`'s run id;
-- every inventory-carrying template has the pin, and no export/import task has it;
-- `render_template` keeps it and doesn't raise;
-- 1.1-shaped installed job params (no `job_run_id`) → the timestamp path is unchanged.
-
----
-
-## 2. B3 — policy-family cluster policies
-> **MOVED OUT 2026-10-12 (user, urgent): shipped alone as hotfix 1.1.1, `PLAN_16_2_1_policy_family_hotfix.md`.** 16.3 is built on top of 1.1.1 and skips this section; its QA still re-checks the policy rows in the golden diff.
-
-**Today.**
-- `compute_importer._create_policy` (`:137-149`) copies `definition` **and** `policy_family_id` into the create body,
-  so every family-based policy fails with a 400.
-- `update_one` (`:112-117`) sends `definition` only, which for a family policy either 400s or silently turns it into a
-  custom policy.
-- The fixture `wsmig_test_policy_family` has FAILED on every QA run so far.
-
-**Change.** Take `ComputeImporter._put_policy_shape(body, payload)` from the `plan13-backlog-b1-b13` branch (its diff
-is in that branch) and call it from both create and edit:
-- `policy_family_id` present → send `policy_family_id` + `policy_family_definition_overrides` and drop `definition`;
-- otherwise → send `definition`.
-
-`description`, `libraries` and `max_clusters_per_user` stay as today on create. The pool-id remap
-(`_remap_policy_body_ids`) already covers `policy_family_definition_overrides`.
-- Keep `main`'s DEBUG line in `_remap_policy_definition`. The branch version deleted it; don't copy that part.
-
-**Upgrade path.** Family policies have a FAILED state row, and FAILED never advances the fingerprint. So the next
-normal run (or `failed_only`) re-decides CREATE and heals them. Custom policies: the request body is byte-identical
-(test). No fingerprint change.
-
-**Tests:**
-- family create body has family_id + overrides and no `definition`; custom create body is byte-identical to 1.1.0;
-- family edit body (V4 shape) and custom edit unchanged;
-- a pool id inside the overrides is remapped;
-- a 1.1-shaped FAILED row + family unit → CREATE with the correct body.
-
----
-
-## 3. B4 — workspace-conf read-back (the report must be the truth)
-**Today.**
-- `misc_importer._set_conf` (`:293-310`) PATCHes one key and returns `note="<key> set to '<v>'"` from the HTTP 200
-  alone.
-- The unit is recorded `Created` with its fingerprint, so every later run SKIPs it, even when the platform ignored the
-  write.
-- That is exactly the customer's case: `enableExportNotebook` reported `false`, while the target stayed `true`.
-
-**3a. Read-back.**
-- After the PATCH, `GET api/2.0/workspace-conf?keys=<key>` and compare: `str(v).strip().lower()` on both sides,
-  `None` = `""`.
-- On a mismatch, raise the existing `NotApplied` (16.2, category `not_applied`) with: "`<key>` was set to `<intended>`
-  and the API returned 200, but the target still reads `<observed>` — this workspace ignores it through the
-  workspace-conf API. Set it in the admin console, then re-run."
-- FAILED never advances the fingerprint, so every run re-attempts it and the report stays red until the target really
-  matches.
-- On a match: `note="<key> set to '<v>' (verified by read-back)"`.
-- Take `_read_conf_key` from the branch. Don't add `verify_applied` / `VerificationFailed`: `NotApplied` already does
-  the job.
-
-**3b. Heal the 1.x false "Created" rows** (needed for the upgrade).
-- `existing_keys` already reads every known key's live target value (`:79-86`). Keep it in `self._target_conf`.
-- Implement `recheck_unchanged(unit, row)` for `workspace_conf`: return True when the live target value differs from
-  the unit's source value. The SKIP then becomes ADOPT → `_do_declarative` → `_set_conf` → PATCH + read-back.
-- Matching keys stay SKIP with zero writes.
-- **Decision D3:** this also puts back a setting someone changed by hand on the target. Recommended, because it's the
-  only way the customer's existing wrong row ever gets fixed or reported.
-- Dry run intent: "would set `<key>` to `<v>` (target currently `<observed>`)".
-
-**Upgrade path.**
-- First upgraded run: keys whose target value already matches → SKIP, no write.
-- A key that drifted, or was silently dropped earlier → re-PATCH + read-back. The result is `created` (verified), or
-  `failed — not_applied` where the workspace really ignores the key. The customer's `enableExportNotebook` row turns
-  truthful.
-
-**Tests:**
-- match → created with the "(verified by read-back)" note;
-- mismatch → FAILED `not_applied` with intended + observed, and no fingerprint stored;
-- a 1.1 row `created` + same fingerprint + target differs → recheck → PATCH + verify;
-- same but target matches → SKIP, zero PATCH calls (assert on the fake client);
-- normalisation (`"False"` vs `"false"`, `null` vs `""`);
-- an unknown key is still `PrerequisiteMissing` (unchanged);
-- dry run makes no PATCH.
-
----
-
-## 4. B11 — a failed report write turns the task red
-**Today.**
-- `write_import_reports` (`import_report.py:122-210`) swallows each artifact's failure as a WARNING: the results
-  JSON, the xlsx and the runbook md.
-- `ImportRunner.run` (`:279-282`) swallows anything else the same way.
-- So a clean-looking green run can leave no `import_status.xlsx`.
+**Today:**
+- Every notebook already prints `Run id : <run_id>` at the top.
+- `02_Export` and `04_Import` also print `Bundle : <full folder path>`; `01_Inventory` prints `Staging : <full folder path>`.
+- **Which folder does a stage use?**
+  - **Inside the e2e job:** export and import always use the folder the inventory task just made (passed as a task value). A *Repair run* keeps it.
+  - **A standalone import with a blank `run_id`:** 1.1.1 first looks for *any* folder whose import started and didn't finish and continues that one; only if there is none does it use `LATEST_EXPORT.json`.
+  - **A standalone or e2e inventory/export with a blank `run_id`:** 1.1.1 continues *any* unfinished folder, or starts fresh.
+- `failed_only` works from the state table, so the folder never decides what is retried.
+- **What's missing:** the folder line is only at the *top* of a long output, so the operator has to scroll back for it.
 
 **Change.**
-- **4a.** `write_import_reports` still writes every artifact it can, so one failure doesn't stop the others.
-  - It now logs each failure at **ERROR** with the traceback, the artifact and the path.
-  - It returns `written["errors"] = [{"artifact", "path", "error"}]`.
-  - After writing, it checks that each written file exists on the Volume with size > 0
-    (`os.path.getsize(aw._abs(rel))`); a missing or empty file is added to `errors`.
-- **4b.** `ImportRunner.run` `finally`:
-  - If the report has errors, or the writer raised, **and** `run_status == "completed"` → set
-    `run_status = "completed_no_report"` (new constant `RUN_STATUS_NO_REPORT`) and log ERROR.
-  - `completed_state_not_saved` keeps priority (it is more serious); the report error is still logged at ERROR.
-  - On an aborting run the original exception is still re-raised; the report failure is logged at ERROR, never
-    WARNING.
-- **4c.** `04_Import` raises at the end when `run_status == completed_no_report`, next to the existing
-  `completed_state_not_saved` raise. The message names the missing files and says: "the target WAS changed and the
-  state WAS saved; re-run the import with run_id=`<id>` (it replays from the checkpoint and rewrites the reports) —
-  see the driver log for the error".
-- Out of scope: inventory/export report writes.
+1. **Print the folder at the end too.** The last lines of `01_Inventory`, `02_Export` and `04_Import` print:
+   ```
+   Run id : <run_id>
+   Folder : <staging>/wsmig/<source_ws_id>/<run_id>/   (reports/ = the xlsx, misc/ = the JSON + logs)
+   ```
+   This uses the same `cfg.output_path` the header already prints. It is a notebook-only change.
+2. **A standalone import with a blank `run_id` always uses `LATEST_EXPORT.json`** (user, 2026-10-13).
+   - Delete the "continue an unfinished import" scan from `resolve_import_run_id`. The order becomes: explicit `run_id` → `LATEST_EXPORT.json` → error.
+   - **Nothing is lost.** An import that crashed in the latest export's folder is in that same folder, so it is still continued: that folder's checkpoint and the state table skip the work already done.
+   - **Why the old scan was harmful:** it could pick an import that crashed in an *older* folder. That folder holds an older copy of the source, so its objects would be UPDATEd on the target back to that older content.
+3. **Inventory/export: continue only the newest folder** (`find_latest_incomplete_run`).
+   - With a blank `run_id`, continue the **newest** folder if it is unfinished; otherwise do what 1.1.1 does next (inventory: start fresh; export: `LATEST_INVENTORY.json`).
+   - This stops a folder abandoned days ago from being picked up after newer runs finished.
 
-**Upgrade path.** None needed: no state or bundle change.
+**Dropped (user, 2026-10-13):** a clearer "export didn't finish" message. Import already refuses such a bundle, so this was wording only:
+- in the e2e job, import `depends_on` export, so it never starts after a failed export;
+- a blank `run_id` resolves to `LATEST_EXPORT.json`, which only ever names a completed export;
+- an explicit `run_id` of a failed export is stopped by the manifest gate (`verify_bundle`).
+
+**Upgrade.** Nothing changes in the state, the bundle or the jobs.
 
 **Tests:**
-- the xlsx render raises → `completed_no_report`, an ERROR log line, and json + md still written;
-- the file is written but has size 0 → `completed_no_report`;
-- a clean write → `completed`, byte-identical summary keys;
-- an aborting run whose report write also fails → the ORIGINAL exception is re-raised;
-- `completed_state_not_saved` + a report failure → `completed_state_not_saved`;
-- the notebook text contains the new raise (grep test, as for `completed_state_not_saved`).
+- the notebooks print the folder line at the end (grep test);
+- a standalone import with a blank `run_id` → `LATEST_EXPORT.json`, even when an older folder has an unfinished import;
+- an unfinished import in the `LATEST_EXPORT` folder → continued (checkpoint used);
+- inventory/export ignore an older abandoned folder when the newest is complete;
+- the newest folder unfinished → continued, as today;
 
----
+## 2. B4 — workspace settings are read back
+**Problem.** `misc_importer._set_conf` reports "set" on the strength of the HTTP 200 alone. The customer's `enableExportNotebook` reads `Created=false`, but the target is still `true`, and every later run SKIPs it.
 
-## 5. B2 — legacy SQL queries keep their source owner
-**Today.** `owner_user_name` is read-only at create and stripped from the payload (`transforms.py:95`), so every
-migrated query is owned by the run-as SP (V5).
+**Change.**
+1. **After each PATCH,** `GET workspace-conf?keys=<key>` and compare: lower-cased, stripped, `null` = `""`.
+   - **Match:** note `<key> set to '<v>' (verified by read-back)`.
+   - **Mismatch:** raise `NotApplied`: "`<key>` was set to `<v>` and the API returned 200, but the target still reads `<observed>` — this workspace ignores it through the API. Set it in the admin console, then re-run."
+   - A FAILED row stores no fingerprint, so it stays red until the target really matches.
+2. **Heal 1.x false `Created` rows.**
+   - `existing_keys` already reads every target value; keep them in `self._target_conf`.
+   - `recheck_unchanged` returns True when the target value differs from the source. The row is then re-applied and read back.
+   - Matching keys stay SKIP with zero writes.
+   - This also reverts a hand change on the target (**D2**).
+   - Dry run: "would set `<key>` to `<v>` (target currently `<observed>`)".
 
-**5a. Export.**
-- `_sql_units` (`asset_export.py:733`): the `legacy_query` unit gets a top-level field
-  `source_owner = raw["owner_user_name"]`, which the LIST already returns (V5).
-- It goes in via `extra=` only: **not** in the payload and **not** in the fingerprint (decision note below).
-- The GET-by-id enrichment needs no change.
+**Tests:**
+- match → `created` with the note;
+- mismatch → `failed`/`not_applied`, no fingerprint stored;
+- a 1.x `created` row whose target differs → PATCH + read-back;
+- a 1.x row whose target matches → zero PATCH calls;
+- normalisation (`"False"` vs `"false"`, `null` vs `""`);
+- an unknown key → `PrerequisiteMissing`, as today;
+- dry run → no PATCH.
 
-**5b. Import** (`SqlImporter`).
-- **Desired owner.** `resolve_principal(source_owner, "user" if "@" in it else "service_principal")`.
-  - No owner on the source → nothing to do.
-  - An owner whose home is absent from the source roster (`_roster_status(owner) == "absent"`, a deleted user) → no
-    PATCH, and a note: "source owner `<x>` is not on target — left owned by the migration SP".
-  - The same applies to `/Users_Backup`-diverted queries.
-- **`_set_query_owner(unit, qid)`.** PATCH `{query:{owner_user_name: desired}, update_mask:"owner_user_name"}`, then
-  GET `api/2.0/sql/queries/<qid>` and compare.
-  - Match → note `owner set to <x> (verified)`.
-  - PATCH error or read-back mismatch → **warning** (`created_with_warning` / updated-with-warning) naming the owner
-    and the observed value: "query left owned by the migration SP". The query itself exists, so this is not a
-    failure.
-  - Reuse `_set_query_owner` from the branch, but use 16.2's patterns (no `verify_applied`).
-- **Where it runs:**
-  - after `_create_query`;
-  - in `update_one` for `legacy_query`, after the content PATCH, only when the owner differs;
-  - and for unchanged queries via `recheck_unchanged`:
-    - `existing_keys` keeps `self._target_owner = {target_id: owner_user_name}` from the LIST it already makes (zero
-      extra calls);
-    - `recheck_unchanged` returns True when the desired owner is resolvable and not absent, and differs from the
-      owner on the stored target id.
-- **The ADOPT path.** `legacy_query` joins `reconcile_on_adopt_types`, and `adopt_one(unit, target_id)` must:
-  1. keep 1.1.0's stale-update rule: a state row whose fingerprint moved → `update_one` (which also sets the owner) →
-     `changed=True`;
-  2. otherwise set the owner only if it differs → `changed=True` and note "owner set to <x>";
-  3. otherwise do nothing → `adopted`.
+## 3. B11 — a failed report write turns the task red
+**Problem.** `write_import_reports` and `ImportRunner.run` turn report-write errors into warnings, so a green run can leave no `import_status.xlsx`.
 
-  Test (1) explicitly: it is the rule the base ADOPT branch applied before the type joined `reconcile_on_adopt_types`.
-- Dry run intent: "would set owner to `<x>`".
+**Change.**
+1. `write_import_reports` still writes every artifact it can, but each failure is now logged at ERROR, with the traceback and the path.
+   - It returns `errors=[{artifact, path, error}]`.
+   - It then checks that each file exists and has size > 0; a missing or empty file is added to `errors`.
+2. `ImportRunner.run`: on report errors, `completed` becomes `completed_no_report` (new constant `RUN_STATUS_NO_REPORT`).
+   - `completed_state_not_saved` keeps priority.
+   - On an aborting run, the original exception is still re-raised.
+3. `04_Import` raises on `completed_no_report`, next to the existing `completed_state_not_saved` raise. The message is: "the target WAS changed and the state WAS saved; re-run the import with run_id=`<id>` to rewrite the reports."
 
-**Why no fingerprint change:**
-- Folding the owner into the fingerprint would UPDATE every already-migrated query (a content PATCH each) on the first
-  upgraded run.
-- The live compare touches only queries whose owner is actually wrong, and it also catches a later owner change on the
-  source.
+The inventory and export reports are out of scope. No upgrade concern.
 
-**Out of scope** (documented in the Runbook): dashboards and Genie spaces (no owner API, PLAN_13 B2), clusters
-(creator fixed), alerts V2. Jobs, pipelines and warehouses already get their owner through the ACL phase's `IS_OWNER`.
+**Tests:**
+- the xlsx render raises → `completed_no_report` with an ERROR line, and the json + md are still written;
+- a 0-byte file → `completed_no_report`;
+- a clean run → `completed`, with an unchanged summary;
+- abort + report failure → the original exception is re-raised;
+- state-not-saved + report failure → `completed_state_not_saved`;
+- the notebook contains the raise (grep test).
 
-**Upgrade path.**
-- 1.x state: queries are owned by the SP with an unchanged fingerprint → SKIP → recheck → owner PATCH + GET → status
-  `updated` with note `owner set to <x> (verified)`. One-time; the next run is SKIP again.
-- An airgap target reading an old 1.x bundle (no `source_owner`) → no-op, as today.
+## 4. B2 — SQL queries keep their source owner
+**Problem.** The owner is read-only at create, so every migrated query is owned by the migration SP.
+
+**Change.**
+1. **Export** (`_sql_units`): the `legacy_query` unit gets a top-level `source_owner` from the LIST's `owner_user_name`. It goes **outside** the payload and the fingerprint.
+2. **Import** (`SqlImporter._set_query_owner`): PATCH the owner, then GET the query and compare.
+   - **Match:** note `owner set to <x> (verified)`.
+   - **PATCH error or mismatch:** `created_with_warning`, "query left owned by the migration SP". The query exists, so this is not a failure.
+   - **Owner deleted on the source** (roster `absent`), or the query was moved to `/Users_Backup`: no PATCH, with a note.
+3. **When it runs:**
+   - after a create;
+   - after an update, if the owner differs;
+   - on unchanged queries through `recheck_unchanged`. This compares against the owner the target LIST already returns, so it costs no extra calls.
+4. **Adopt path.** `legacy_query` joins `reconcile_on_adopt_types`. `adopt_one`:
+   - if the fingerprint moved → `update_one`, which also sets the owner (1.1.1's rule, tested);
+   - else if the owner differs → owner only;
+   - else → `adopted`.
+
+**Why the fingerprint stays out of it:** putting the owner in the fingerprint would content-PATCH every migrated query once. Comparing against the live owner touches only queries whose owner is wrong.
+
+**Upgrade.**
+- On a 1.x target, every query is SP-owned. The first upgraded run sets each owner once (rows read `updated`) and then SKIPs.
+- An old bundle with no `source_owner` → no-op.
+
+**Out of scope** (Runbook): dashboards and Genie (no owner API), clusters, alerts. Jobs and warehouses already get their owner through ACLs.
 
 **Tests:**
 - create → PATCH + GET with the remapped owner;
-- read-back mismatch → warning; PATCH 4xx → warning;
-- absent owner → no PATCH, with a note;
-- no `source_owner` (1.1 bundle) → zero extra calls;
-- SKIP + owner differs → adopt → owner only, no content PATCH;
-- SKIP + owner matches → zero writes;
+- a mismatch or a 4xx → warning;
+- absent owner → no PATCH;
+- no `source_owner` → zero extra calls;
+- SKIP + owner differs → owner only, with no content PATCH;
+- owner matches → zero writes;
 - adopt with a moved fingerprint → update + owner;
-- the fingerprint of a legacy_query unit is identical to 1.1.0's for the same source (golden assert);
-- the export unit carries `source_owner` and the payload still has no owner.
+- the `legacy_query` fingerprint is identical to 1.1.1's (golden test).
 
----
+## 5. CUST-1 — pipelines: never change the owner; keep an SP run-as
+**Problem.**
+- The ACL importer sends the source's `IS_OWNER` in its PUT. On a UC pipeline, that is an owner change, which only a metastore admin may make: `403 Only metastore admins can change pipeline owner`.
+- The PUT is all-or-nothing, so **every** grant on the pipeline is lost.
+- Leaving `IS_OWNER` out is not possible either (V5).
 
-## 6. CUST-1 — pipeline ACLs survive a refused owner change
-**Today.**
-- `AclImporter._acl_body` (`acl_importer.py:229-260`) sends the source's `IS_OWNER` grant verbatim.
-- On a UC pipeline the run-as SP owns the new object, so `IS_OWNER=<source owner>` is an owner change. Only a
-  metastore admin may make it: `403 PERMISSION_DENIED Only metastore admins can change pipeline owner`.
-- `PUT permissions` is one declarative call, so **every** grant on that pipeline is lost.
-- Leaving `IS_OWNER` out is rejected too (V7).
+**Can the owner be changed at all?** Only by a metastore admin (UI, or `PUT permissions`). The migration SP isn't one at the customer, and a utility can't make itself one. **So the tool stops trying** (user decision, 2026-10-12). What *can* be kept is the identity the pipeline **runs as**, when that identity is an SP (V6).
 
-**Change (decision D1; recommended option (b)):** for `perm_type == "pipelines"`:
-1. Send the body as today (source owner included), which keeps `main`'s behaviour wherever the transfer is allowed:
-   a metastore-admin runner, or a non-UC pipeline.
-2. If the PUT fails with a 403 whose message contains `can change pipeline owner` (case-insensitive; keep the marker
-   in one constant):
-   - GET `permissions/pipelines/<id>` and take the current non-inherited `IS_OWNER` principal;
-   - rebuild the body with `IS_OWNER` = that principal plus every other grant;
-   - PUT again (V7: 200, owner unchanged, grants exact).
-3. The row becomes `created_with_warning`: "all N grants applied except the owner: source owner `<x>`; the pipeline is
-   still owned by `<current>` (a UC pipeline's owner is also its run-as identity). A metastore admin must transfer it:
-   UI → Permissions, or `PUT permissions` as a metastore admin."
-4. If the retry PUT also fails → FAILED with both errors, as today.
+**The rule** (user, 2026-10-13):
 
-**Option (a), if the user picks it instead:** always send the target's current owner for pipelines (one GET per
-pipeline, every run), and never attempt the transfer.
+| Source owner (= its run-as) | Target owner | Target runs as |
+|---|---|---|
+| a **user** | the migration identity | the migration identity. A user can't be set as run-as (V6). |
+| an **SP** | the migration identity | **the same SP** (remapped through `sp_mapping`), via spec `run_as` |
+| a **group** | — | — (a group can't own a pipeline, V6) |
 
-**ACL Parity.**
-- The applied entry carries `known_gap = [(source_owner, "IS_OWNER")]`.
-- `write_parity_report` drops that tuple from *expected* and the current owner's `IS_OWNER` from *actual*, then
-  computes the verdict on the rest.
-- It adds `"known_gap": "owner not transferred (needs metastore admin)"`, so the sheet reads `match` + the gap and not
-  `both`.
+In both cases the source owner gets `CAN_MANAGE` (**D1**).
 
-**Upgrade path.**
-- 1.x rows for these pipeline ACLs are FAILED, so the next normal run (or `failed_only`) re-attempts them and heals
-  them with the warning.
+**Change.**
+1. **ACLs** (`AclImporter`; `perm_type == "pipelines"` only, every other type unchanged):
+   1. `GET permissions/pipelines/<target id>` and read the current, non-inherited `IS_OWNER`. For a pipeline the tool created, that is the migration identity.
+   2. Build the body from the source grants, then:
+      - drop the source `IS_OWNER`;
+      - add `IS_OWNER` = the current owner;
+      - if the source owner is not the current owner, add the source owner as `CAN_MANAGE`, with no duplicate entry.
+   3. PUT once (V5: 200, exact). The row is `created`, with the note "owner kept as `<current>` (a pipeline owner change needs a metastore admin); source owner `<x>` given CAN_MANAGE".
+   4. If the GET fails or finds no owner → FAILED with that reason. The tool never guesses an owner.
+   5. **ACL Parity:** the source `IS_OWNER` → `CAN_MANAGE` is an accepted difference. The verdict is `match`, with `known_gap: owner kept on target (needs a metastore admin)`.
+2. **Run-as** (`DltImporter`):
+   1. **Export** (`_dlt_units`): the `dlt_pipeline` unit gets a top-level `source_run_as` = `r["_raw"]["run_as_user_name"]`, passed with `extra=`. `_raw` is the pipelines LIST entry, which carries it (V7). It is outside the payload, which is the `spec`, and outside the fingerprint.
+   2. **Create/update:** the source spec has no `run_as` and `source_run_as` is an SP application id (a UUID) → set `spec.run_as = {service_principal_name: <remapped id>}`.
+      - An explicit source `run_as` keeps today's `_remap_run_as`.
+      - A source `run_as` that is a user, and not the migration identity, is dropped, because the target would 400 (V6).
+   3. **The create/update is refused because of `run_as`** (e.g. a missing Service Principal User role; V6 "not verified"): retry once without `run_as`. The result is `created_with_warning`: "runs as the migration identity; source ran as SP `<x>` — grant the runner the Service Principal User role on `<x>`, then re-run." The pipeline exists either way.
+   4. **Already-migrated pipelines** (1.x targets run them as the migration SP):
+      - `existing_keys` keeps `self._target_run_as = {pipeline_id: run_as_user_name}` from the pipelines LIST it already makes (V7, zero extra calls).
+      - `recheck_unchanged` returns True when the desired SP run-as differs from the target's.
+      - `dlt_pipeline` joins `reconcile_on_adopt_types`. A plain ADOPT with an unchanged fingerprint only records `adopted` (`base_importer` ADOPT branch), so the reconcile hook is required. `adopt_one`:
+        - fingerprint moved → `update_one` (keeps 1.1.1's stale-update rule);
+        - else if the run-as differs → `update_one` (the full spec PUT, now with `run_as`) → `changed=True`;
+        - else → `adopted`.
+      - User-owned pipelines never recheck.
+
+**What the customer must know (Runbook, CHANGELOG):**
+- User-owned UC pipelines run as the migration identity until a metastore admin transfers them, so that identity needs access to their tables.
+- SP-owned pipelines keep their SP as the run-as identity.
+
+**Upgrade.**
+- 1.x pipeline-ACL rows are FAILED, so the next run (or `failed_only`) heals them.
+- SP-owned pipelines get their run-as back through the recheck: a one-time `updated`.
+- Pipelines whose owner was transferred earlier keep it: the current owner is then the source owner, so nothing is reverted.
 - No fingerprint change.
 
-**Tests** (offline only; V6 means the bed can't produce the 403):
-- 403 with the customer's verbatim message → GET → second PUT carries `IS_OWNER=<current>` plus all other grants →
-  `created_with_warning` with the note;
-- the parity verdict is `match` with `known_gap`;
-- a different 403 → no retry, FAILED as today;
-- a non-pipeline 403 → no retry;
-- a successful first PUT → one call, unchanged;
-- the retry fails → FAILED with both errors.
+**Tests:**
+- **ACLs:**
+  - a created pipeline → the PUT has `IS_OWNER=<runner>`, the source owner `CAN_MANAGE`, and the other grants verbatim;
+  - current owner = source owner → body = source ACL;
+  - the source owner already has `CAN_MANAGE` → no duplicate;
+  - the GET fails → FAILED, no PUT;
+  - other object types → byte-identical to 1.1.1;
+  - parity → `match` + `known_gap`;
+  - a 1.x FAILED row under `failed_only` → healed.
+- **Run-as:**
+  - SP-owned source → the create body has the remapped `run_as`;
+  - user-owned → no `run_as`;
+  - an explicit SP `run_as` → as today;
+  - an explicit other-user `run_as` → dropped, with a note;
+  - `run_as` refused → retry without it → `created_with_warning`;
+  - a 1.x target pipeline running as the runner with an SP source → recheck → update with `run_as`;
+  - user-owned → no recheck;
+  - the `dlt_pipeline` fingerprint is identical to 1.1.1's.
 
----
+## 6. CUST-2 — pipelines the API can't create become manual
+**Problem.** A `Synced table: <fqn>` pipeline is created by the platform and has no source code. `POST /pipelines` refuses it (`libraries must contain at least one element`), so it fails on every run.
 
-## 7. CUST-2 — pipelines the API can't create become a manual step
-**Today.**
-- A `Synced table: <catalog.schema.table> <suffix>` pipeline is created by the platform with a UC/Lakebase synced
-  table. Its spec has no source code.
-- `POST /api/2.0/pipelines` refuses it: `400 INVALID_PARAMETER_VALUE libraries must contain at least one element`.
-- Export marks it `auto` (`asset_export._dlt_units`, `:760-771`), so import POSTs it every run and it fails every run.
+**Change.** One rule, `helpers.pipeline_not_creatable(spec) -> note | ""`. A non-DAB pipeline with no non-empty `libraries` and no `ingestion_definition` is not creatable.
+- **Name starts with `Synced table:`** → note: "belongs to the synced table `<fqn>` (UC/Lakebase, out of scope) — recreate the synced table on the target and the platform recreates this pipeline."
+- **Has `gateway_definition`** (a Lakeflow Connect ingestion gateway, review 2026-10-14) → note naming its UC connection: the connection is UC (out of scope), create it on the target and recreate the gateway + ingestion pipeline in Lakeflow Connect. Ingestion pipelines (`ingestion_definition`) are still attempted as in 1.1.1; the Runbook documents both as manual.
+- **Otherwise** → note: "no source code (`libraries` is empty), so the pipelines API can't recreate it — recreate whatever owns it."
+- **Export** (`_dlt_units`): such pipelines get `mode="manual"`. The payload is kept as evidence.
+- **Import** (`DltImporter.load`): the same rule turns 1.x bundles' `create` into `manual`, with **no** API call.
+- These pipelines' ACL rows still say `object_absent`; the wording fix is in QA16.2-4, a later wave.
 
-**The rule** (`helpers.pipeline_not_creatable(spec) -> str`, one function used by export and import):
-- A non-DAB pipeline whose spec has no non-empty `libraries` and no `ingestion_definition` can't be created through
-  the pipelines API → return a note.
-- If the name starts with `Synced table:`: "this pipeline belongs to the synced table `<fqn>` (UC/Lakebase). Recreate
-  the synced table on the target and the platform recreates this pipeline. UC and Lakebase are out of scope for this
-  tool."
-- Otherwise: "this pipeline has no source code (`libraries` is empty), so the pipelines API cannot recreate it — it is
-  platform-managed. Recreate whatever owns it."
-- Return `""` for creatable pipelines.
-
-**Change.**
-- **Export:** `_dlt_units` emits it as `mode="manual"`, `migratable=False`, with the note. The payload is kept as
-  today, for evidence only.
-- **Import** (needed for the customer's existing 1.x bundles, which say `create`): `DltImporter.load()` sets
-  `import_action="manual"` + the note on any unit the rule matches. `_process_one` step 1 then records it `manual` with
-  **no API call**.
-- The ACL units of these pipelines will still read `object_absent` (QA16.2-4 is not in this wave). See decision D5.
-
-**Upgrade path.** 1.x state rows for these pipelines are FAILED; the next run records them `manual`. That puts them in
-the skipped/manual retry buckets, so they no longer show in `failed_only`.
+**Upgrade.** 1.x FAILED rows become `manual`, so they leave the `failed_only` bucket.
 
 **Tests:**
-- export: synced-table spec → manual with the table name in the note; empty libraries + no ingestion → generic note;
-  ingestion pipeline (no libraries, has `ingestion_definition`) → `auto`; normal pipeline → `auto`, fingerprint
-  unchanged;
-- import: a 1.x-shaped bundle unit with `import_action=create` + no libraries → `manual`, zero POSTs;
-- a normal pipeline → POSTed as today.
+- export: synced-table → manual with the table name; empty libraries → the generic note;
+- an ingestion pipeline → `auto`;
+- a normal pipeline → `auto`, with the same fingerprint;
+- import: a 1.x unit with `create` and no libraries → `manual`, zero POSTs.
 
----
+## 7. QA16.2-1 — show "folder missing" only when it is confirmed
+**Problem.**
+- On 6 Genie spaces, the customer saw "targets workspace folder /Users/<user>, which does not exist on target yet". Those folders existed.
+- The real server error was `Table 'cat.schema.tbl' does not exist`: Genie checks its UC tables at create time.
+- Two helpers turn any error that contains certain words into our own message, and the server text is lost:
+  - `BaseImporter.missing_parent_prerequisite` (`"does not exist"` / `"tree node"`), used by Genie, dashboards, queries and Alerts V2;
+  - `DashboardsImporter._not_published_prerequisite` (any 404 from a schedule create).
 
-## 7b. QA16.2-1 — our message only when the cause is confirmed, otherwise the server's error
-> Added 2026-10-12 (user). The customer hit this on 6 Genie spaces in 6 users' folders: the report said
-> `prerequisite_missing: targets workspace folder /Users/<user>, which does not exist on target yet`, but the folders
-> existed (their dashboards and files imported fine). `failed_only` fixed 1 of 6 and repeated the same message for
-> the other 5. 16.2 QA reproduced it: the server actually said `403 … Table 'cat.schema.retry_tbl' does not exist`
-> (a UC table Genie checks at create time).
+**Change.** Our message only after a live check returns a real 404; otherwise the server's error.
+- **Folder:** call `GET workspace/get-status?path=<the exact parent_path>` directly (not the cached `_home_present`), and tell a 404 apart with `is_not_found`.
+  - **404** → `PrerequisiteMissing` with **today's message, word for word**;
+  - **200 or any other error** → re-raise the original error, so `classify_error` shows the server's text.
+- **Not published:** call `_get_published(did)`, and only a confirmed 404 counts.
+  - **404** → today's message;
+  - **anything else** → the original error.
+- **Cost:** one GET, and only on a create that already failed with those words.
 
-**Today.** Two helpers replace the server's error with our own guess whenever certain words appear in it, and the
-server text is then lost from both `note` and `error_raw`:
-- `BaseImporter.missing_parent_prerequisite` (`base_importer.py:530-538`): any error containing `"does not exist"` or
-  `"tree node"` becomes "the folder does not exist". Used by Genie (`genie_importer.py:55`), Lakeview dashboards
-  (`dashboards_importer.py:108`), SQL queries (`sql_importer.py:158`) and Alerts V2 (`sql_importer.py:225`).
-- `DashboardsImporter._not_published_prerequisite` (`dashboards_importer.py:381-387`): any 404 from a schedule create
-  becomes "the dashboard is not published".
+No state, bundle or fingerprint change. 1.x rows that FAILED with the wrong message are retried by `failed_only` (it re-tries every FAILED row), and then show the real error or succeed.
 
-**Change (user 2026-10-12): keep our wording, but only when we have CONFIRMED the cause.**
-The rule: show our message only when a live check proves it; in every other case show the server's error unchanged.
+**Tests** (parametrised over Genie, dashboard, query and Alert V2):
+- "Table … does not exist" + folder check 200 → FAILED with the server text in `note`/`error_raw`;
+- folder check 404 → 1.1.1's message, compared to a golden string;
+- folder check 403/500 → the original error;
+- an unrelated error, or a successful create → no folder check;
+- a missing sub-folder under an existing home → 404 → our message;
+- schedule 404 + published 404 → our message; published 200/500 → the original error.
 
-- **Folder** (`missing_parent_prerequisite`, all four callers unchanged). When the create error contains
-  `"does not exist"` / `"tree node"`, check the folder right then: `GET workspace/get-status?path=<body parent_path>`
-  (the exact resolved parent, not just the home root; called directly, not through the cached `_home_present`).
-  - **404** → the folder really is missing → raise `PrerequisiteMissing` with **today's message, word for word**
-    (the customer's 1 genuine home case keeps exactly the text in the screenshot).
-  - **200** → the folder exists, so the error is about something else → `return`, and the caller re-raises the
-    original error → `classify_error` shows the server's text verbatim (+ its normal hint).
-  - **any other probe error** (403, 500, timeout) → not sure → the server's original error. Never guess.
-  - Use `is_not_found(exc)` (`helpers.py:79`) to tell a 404 from other errors; don't use `_get_status`, which
-    returns `{}` for every error and would turn a failed check into "folder missing". One DEBUG line with the result.
-- **Not published** (`_not_published_prerequisite`). On a 404 from the schedule create, check
-  `GET lakeview/dashboards/<id>/published` with the existing `_get_published(did)` (`dashboards_importer.py:251`):
-  - it 404s (draft) → raise with **today's message, word for word**;
-  - it returns a published doc, or the check fails → the server's original error.
-  - (`_get_published` returns `{}` for every error too, so the same rule applies: only a confirmed 404 counts.)
-- Cost: one GET, only on a create that already failed with those words. Successful creates make no extra call.
+## 8. QA16.2.1-1 — Alert V2 "updated" when only its schedule ran
+**Evidence.**
+- The 1.1.1 QA showed `wsmig_test_alert_v2 → updated` on two runs, with no edit.
+- The only payload difference between the bundles was `evaluation.last_evaluated_at`, which moved by a day each time (the alert runs daily at 09:00).
+- The alert that hadn't evaluated was correctly `skipped`.
 
-**Why this is safe.**
-- A confirmed missing folder still gets `prerequisite_missing` and the same text as 1.1.0; only the misdiagnosed cases
-  change, and they now show what the server said.
-- `failed_only` re-tries every FAILED row whatever its category (`state_store.py:129`), so the category of the
-  re-labelled rows never affects a retry.
-- No report, sheet or test depends on the removed (wrong) text for the misdiagnosed cases (checked `src/` and
-  `tests/`, 2026-10-12).
-
-**Rest of the importers, checked 2026-10-12, no change needed:** they already pass the server text through
-`classify_error`. The few keyword checks elsewhere only tolerate a known harmless error and never replace a message:
-`"already exists"` on SP create (followed by a lookup), and `"already"` on `clusters/start`. Workspace content and the
-jobs notebook-path check decide "home/path missing" from a `get-status` probe, not from error text.
-
-**Upgrade path.** No state, bundle or fingerprint change. 1.x rows that FAILED with the wrong message stay FAILED;
-the next `failed_only` re-attempts them and records either success or the server's real error.
-
-**Tests** (`tests/test_plan16_3.py`, parametrised over Genie / dashboard / query / alert V2):
-- create fails with `403 … Table 'c.s.t' does not exist`, folder check → 200 → FAILED with the server text in `note`
-  and `error_raw`; no "targets workspace folder" text;
-- create fails with "… does not exist", folder check → 404 → `prerequisite_missing` with **exactly** 1.1.0's message
-  (golden string assert);
-- folder check → 403/500 → the server's original error, not `prerequisite_missing`;
-- create fails with an unrelated error → no folder check (assert on the fake client);
-- successful create → no folder check;
-- the check uses the full parent path: a missing sub-folder under an existing home → 404 → today's message;
-- schedule 404 + published check 404 → today's "not PUBLISHED" message, word for word; published check 200 or 500 →
-  the server's original error;
-- a 1.1-shaped FAILED `genie_space` row under `failed_only` → re-attempted.
-
----
-
-## 7c. QA16.2.1-1 — an Alert V2 is "updated" on every run although nothing changed
-> Added 2026-10-12 (user). Found in the 1.1.1 hotfix QA (`PLAN_16_2_1` Run 3). Pre-existing: identical on 1.0/1.1.
-
-**What happened (live evidence, bundles on target `7405614409585920`).**
-- Run 3 reported `alert_v2 wsmig_test_alert_v2 → updated` ("source changed since the last import — updated in place"),
-  and the 1.1.0 run before it reported both test alerts V2 `updated`. Nobody edited either alert.
-- Field-by-field diff of the exported payload (`export/sql/alerts_v2.json`) between runs — the ONLY difference:
-
-  | Alert | Previous run → this run | Changed field |
-  |---|---|---|
-  | `wsmig_test_alert_v2` (cron `0 0 9 * * ?`, daily 09:00 UTC) | `20261012_073721` → `20261012_092155` | `evaluation.last_evaluated_at` `2026-10-11T09:00:33Z` → `2026-10-12T09:00:31Z` |
-  | same | `20261006_033735` → `20261012_073721` | `evaluation.last_evaluated_at` `2026-10-05T09:00:32Z` → `2026-10-11T09:00:33Z` |
-  | `wsmig_test_alert_v2_b` | `20261012_073721` → `20261012_092155` | none → fingerprint equal → correctly **skipped** |
-
-- So "updated" fired exactly when the source alert had **run on its schedule** between two migration runs. Nothing a
-  user can set changed.
-
-**Is it a bug? Yes (LOW–MEDIUM).** No data is lost or duplicated, and the PATCH re-sends the same settable content
-(the server ignores the read-only fields). But:
-- the report says `updated` for objects nobody touched. A customer with many scheduled alerts sees every one of them
-  "updated" on every run, which buries real changes and breaks "the report is the source of truth";
-- one needless PATCH per scheduled alert per run;
-- `evaluation.state` (`OK` / `TRIGGERED`) is in the payload too, so a pure state flip does the same.
-
-**Cause.** `STRIP_FIELDS["alert_v2"]` (`src/transform/transforms.py:103`) lists only top-level fields, and
-`strip_runtime` (`:136-147`) strips top-level keys only. The two read-only fields live **inside** `evaluation`
-(`evaluation.state`, `evaluation.last_evaluated_at`), so they stay in the payload and in the fingerprint. The
-collector's GET-by-id enrichment (PLAN 8 Bug 10) is what brings `evaluation` in, which is correct (create needs it).
-The legacy-alert strip list already drops its equivalents (`state`, `trigger_time`).
+**Cause.** `STRIP_FIELDS["alert_v2"]` and `strip_runtime` strip **top-level** keys only. `evaluation.state` and `evaluation.last_evaluated_at` sit inside `evaluation`, so they stay in the fingerprint. Every evaluation looks like an edit: a false `updated` and a needless PATCH per alert per run.
 
 **Change.**
-- Strip `evaluation.state` and `evaluation.last_evaluated_at` from the `alert_v2` payload at export, before
-  fingerprinting. Keep it small: a nested-path entry in `STRIP_FIELDS["alert_v2"]` (e.g. `"evaluation.state"`) handled
-  by `strip_runtime`, returning a copy (never mutate the record). Every other `evaluation` field (`source`,
-  `comparison_operator`, `threshold`, `notification`, `empty_result_state`, …) stays: they are create/update fields.
-- Also drop the two fields from the create/PATCH body (`_alert_v2_body`) for **1.x bundles** that still carry them.
-  This is defensive and changes nothing on the target (the server ignores them today).
-- **Audit the other families for the same nested-runtime-field pattern** while here: in this bed only Alerts V2 showed
-  false updates (Run 1/3 `updated` rows: the 2 alerts + home folders that genuinely healed + the seeded policy). Add the
-  regression test below for every asset type that has a GET-by-id enrichment (alerts V2, legacy queries, dashboards,
-  Genie, jobs, pipelines).
+- `strip_runtime` supports dotted paths. `STRIP_FIELDS["alert_v2"]` adds `evaluation.state` and `evaluation.last_evaluated_at`.
+  - It returns a copy and never mutates the record.
+  - All other `evaluation` fields stay: they are create/update fields.
+- `_alert_v2_body` also drops the two fields, for 1.x bundles that still carry them.
+- **Audit:** in the 1.1.1 runs no other type showed a false update. Add a guard test for every type with GET-by-id enrichment: alerts V2, queries, dashboards, Genie, jobs, pipelines.
 
-**Upgrade path (the one allowed fingerprint change, decision D7).**
-- The first 1.2.0 export gives every Alert V2 a new fingerprint (two fields fewer). The first upgraded run therefore
-  records each non-DAB Alert V2 `updated` **once** (a PATCH with the same content). From then on an alert is `updated`
-  only when the source really changed.
-- This is no worse than today: today the same alerts are `updated` on every run in which they evaluated.
-- Airgap with a 1.x **source** side: the bundle's fingerprints come from the old export, so the noise stays until the
-  source-side Git folder is upgraded too. Note it in the CHANGELOG.
+**Upgrade (the one allowed fingerprint change, D4).**
+- On the first 1.2.0 run, every non-DAB Alert V2 reads `updated` once (a same-content PATCH), then only on real edits.
+- In airgap mode, this needs the source-side Git folder upgraded too.
 
-**Tests** (`tests/test_plan16_3.py`):
-- two exports of the same alert that differ only in `evaluation.last_evaluated_at` and/or `evaluation.state` → equal
-  fingerprints; the run decides SKIP with zero PATCH calls;
-- a real edit (`threshold`, `comparison_operator`, `query_text`, `schedule`) → fingerprint moves → UPDATE;
-- the stripped payload still has `evaluation.source`, `comparison_operator`, `threshold`, `notification`, and create
-  still sends them (the PLAN 8 Bug 10 test still passes);
-- a 1.x-shaped unit whose payload carries both fields → the create / PATCH body omits them;
-- the strip never mutates the collector record;
-- for every enriched asset type: an export pair differing only in the type's known runtime fields → equal
-  fingerprints (the guard against this class of bug coming back).
-
-**Live QA check (§11).** Run C (and every later run): an Alert V2 that evaluated on the source between runs is
-`skipped`, not `updated` (compare `evaluation.last_evaluated_at` in the two bundles to prove it ran). Run B is the
-one-time `updated` per D7.
+**Tests:**
+- two exports that differ only in those two fields → equal fingerprints, SKIP, zero PATCH;
+- a real edit (threshold, operator, query, schedule) → UPDATE;
+- the stripped payload keeps `source`/`comparison_operator`/`threshold`/`notification` (the PLAN 8 Bug 10 test still passes);
+- a 1.x payload with the fields → the body omits them;
+- the record is not mutated;
+- the per-type guard test.
 
 ---
 
-## 8. Files touched
-- `notebooks/01_Inventory.py` (job_run_id widget + resolve call)
-- `jobs/direct_end_to_end_live.job.json`, `jobs/direct_end_to_end_dry_run.job.json`, `jobs/inventory.job.json`,
-  `jobs/airgap_source.job.json` (inventory task pin)
-- `src/exporters/bundle_state.py` (1b, 1c)
-- `src/importers/import_runner.py` (1c import resume, 1d, 4b)
-- `notebooks/04_Import.py` (4c)
-- `src/reports/import_report.py` (4a)
-- `src/importers/compute_importer.py` (§2)
-- `src/importers/misc_importer.py` (§3)
-- `src/exporters/asset_export.py` (§5a, §7)
-- `src/importers/sql_importer.py` (§5b)
-- `src/importers/acl_importer.py` (§6)
-- `src/utils/helpers.py` (`pipeline_not_creatable`)
-- `src/importers/dlt_importer.py` (§7)
-- `src/importers/base_importer.py` (§7b `missing_parent_prerequisite`), `src/importers/dashboards_importer.py` (§7b `_not_published_prerequisite`)
-- docs: `docs/RUNBOOK.md`, `docs/CONFIGURATION_GUIDE.md`, `docs/PERMISSIONS_GUIDE.md` (§10)
-- `CHANGELOG.md`, `VERSION` (§10)
-- `src/transform/transforms.py` (§7c nested strip) and `src/importers/sql_importer.py` (§7c body guard)
-- `tests/test_plan16_3.py` (new)
+## 9. Files and offline test bar
+**Files:**
+- `notebooks/01_Inventory.py`, `02_Export.py` and `04_Import.py` (the end-of-output folder line);
+- **no** `jobs/*.job.json` or installer change;
+- `src/exporters/bundle_state.py` and `src/exporters/asset_export.py`;
+- `src/transform/transforms.py`;
+- in `src/importers/`: `import_runner`, `misc_importer`, `sql_importer`, `acl_importer`, `dlt_importer`, `base_importer` and `dashboards_importer`;
+- `src/reports/import_report.py` and `src/utils/helpers.py`;
+- docs, `CHANGELOG.md`, `VERSION`;
+- the new `tests/test_plan16_3.py`.
 
-## 9. Offline test bar (dev session)
-- Every test listed in §1–§7c goes in `tests/test_plan16_3.py`. Use `tests/fakes.py` (fake client with recorded calls)
-  as `test_plan16_2.py` does.
-- **Full suite passes:** `python3 -m pytest` (497 today + the new ones).
-- **Mutation check:** for each item, revert the fix locally, confirm at least one new test fails, then restore it.
-  List the result per item in §9b.
-- **Backward compatibility** (ground rule 7), at least one test each:
-  - a 1.1-written state table (rows with `created`/`failed`/`skipped` + fingerprints) plus a 1.1-shaped bundle (no
-    `source_owner`, `create` on a synced pipeline, timestamp run folders, no `job_run_id` param) runs through the new
-    code with only the declared changes;
-  - a **fingerprint-stability test**: for every asset type in the fixture bundle, the 16.3 export fingerprint equals
-    1.1.0's.
-- No new silent `except` (ground rule 5). Every new `except` logs at DEBUG (expected) or WARNING/ERROR (degraded).
+**Test bar:**
+- **Tests:** every test above goes in `tests/test_plan16_3.py`, using the fakes from `tests/test_plan16_2.py`.
+- **Full suite:** `python3 -m pytest` passes (507 today, plus the new tests).
+- **Mutation check:** revert each item and confirm at least one new test fails. Record the results in §9b.
+- **Backward compatibility:**
+  - a 1.1.1-written state plus a 1.1.1-shaped bundle (no `source_owner`, a synced pipeline marked `create`, timestamp folders) produces only the declared changes;
+  - a **fingerprint-stability test**: every asset type except `alert_v2` keeps 1.1.1's fingerprint.
 
 ## 9b. Dev notes (the dev session fills this in)
-Judgment calls, deviations from this plan (with reason), the mutation-check results, and the final test count.
+Record judgment calls, deviations (with the reason), mutation-check results and the final test count.
 
-## 10. Docs, CHANGELOG, VERSION
-- `VERSION` = `1.2.0`. `CHANGELOG.md` `## [1.2.0] - <date>`:
-  - Upgrade notes:
-    - pull-only works; run-id folders need a re-run of `00_Install_Jobs`;
-    - the first upgraded run sets query owners (rows read `updated`);
-    - workspace settings are re-checked against the target;
-    - synced-table pipelines become manual;
-    - a failed report now turns the task red;
-    - Genie / dashboard / query / alert failures now show the server's real error instead of "folder does not exist"; re-run `failed_only` on rows that FAILED with that message.
-    - every Alert V2 reads `updated` once on the first 1.2.0 run (fingerprint fix, §7c); after that only real source edits show as `updated`. In airgap mode this needs the source-side Git folder upgraded too.
-  - Added / Fixed / Changed per item.
-- `RUNBOOK.md`:
-  - finding a run's folder (= the job run id);
-  - Repair run vs Run now;
-  - standalone `failed_only` with the job run id;
-  - `completed_no_report`: what to do;
-  - `not_applied` workspace settings;
-  - the pipeline owner needing a metastore admin;
-  - synced-table pipelines;
-  - which object types keep their owner;
-  - a Genie space that fails on a missing / unreadable UC table: create or grant the table (UC is out of scope), then `failed_only`.
-- `CONFIGURATION_GUIDE.md`: the `job_run_id` parameter (set by the job, leave blank).
-- `PERMISSIONS_GUIDE.md`: a UC pipeline owner transfer needs a metastore admin.
+**Dev session 2026-10-13** — branch `feature/16_3_customer_fixes` cut from local `main` @ `51e3a08` (VERSION 1.1.1;
+`git pull` could not reach the remote — SSH key not loaded — but local `main` already held the 1.1.1 merge). Baseline
+507 passed. **Final: 599 passed** (92 new in `tests/test_plan16_3.py`). Nothing committed.
 
----
+**Files outside §9 (deviation, intended behaviour changes only):**
+- `tests/test_import_framework.py` — `test_run_resolution_resumes_an_incomplete_import` asserted the deleted
+  unfinished-import scan (§1.2); rewritten as `..._uses_the_pointer_even_with_an_incomplete_import`.
+- `tests/test_importers_phase6_12.py` — (a) the conf test's fake never reflected a PATCH, so read-back (§2) said
+  `not_applied`; the fake now reflects writes. (b) two DLT tests used `libraries: []` payloads, which §6 now (correctly)
+  marks manual; the fixtures now carry a notebook library.
+- `genie_importer.py` (listed) needed no change — the §7 fix lives in `BaseImporter.missing_parent_prerequisite`.
 
-## 11. Live QA (Claude) — classic job cluster, LIVE + direct, stop after each run
-Rules: `plans/qa-testing-agent.md`.
-- Harness: copy `~/Desktop/wsmig_runs/plan16_2/setup/` → `plan16_3/setup/` and update the catalog, warehouse and
-  workspace id.
-- Reports go to `~/Desktop/wsmig_runs/plan16_3/`, with `FINDINGS.md` and one folder per run.
-- `system.access.audit` is no longer readable by the QA user. Write checks use live GETs, `DESCRIBE HISTORY` on the
-  state table, and the driver DEBUG log.
+**Judgment calls:**
+- §7 not-published: a direct `GET …/published` with `is_not_found`, NOT `_get_published` (it returns `{}` for every
+  error, so it can't tell 404 from 500). Only runs when the schedule create itself 404'd (as 1.1.1).
+- §7 folder: the probe is uncached on the EXACT `parent_path`; the pre-existing cached home-root probe in
+  `remap_parent_path` is unchanged.
+- §2: a read-back GET that itself errors propagates → the row is FAILED (`api_error`) — the report must not claim
+  success it could not verify. Dry-run wording via `dry_run_intent`.
+- §3: `reports["errors"]` is only added when non-empty, so a clean run's summary/reports dict is byte-identical. A
+  `write_text_local_then_copy` that renders nothing is also an error. The notebook prints `Run id`/`Folder` BEFORE the
+  red-task raises, so the folder is still the last thing printed on a green run and right above the raise on a red one.
+- §4: "moved to /Users_Backup" outside a create (recheck/adopt) is approximated with no extra call as "the parent
+  home's owner is absent from the source roster" (the backup divert's own precondition). The created query's owner is
+  taken from the create response, so a source query already owned by the runner costs zero owner calls.
+- §5 ACL: GET failure / no owner → `RuntimeError` with the reason (classified `api_error`, retried by `failed_only`).
+  Parity uses the IS_OWNER of the SAME re-read it already makes (no extra GET): expected source IS_OWNER → CAN_MANAGE,
+  the kept owner's IS_OWNER left out, `known_gap` also written to the sheet's existing `detail` column (so
+  `import_report.py` needed no parity change).
+- §5 run-as: an explicit source `run_as` USER other than the migration identity is dropped as a **warning** (amber)
+  rather than a plain note — the pipeline now runs as a different identity than on source. Migration identity = SCIM
+  `Me.userName`, read lazily once and only when a user `run_as` is present. "Refused because of run_as" = error text
+  containing `run_as` / `run as` / `service principal user` / `serviceprincipal.user`; only then is it retried once
+  without `run_as` (explicit SP run_as included). Account SPs are not in `sp_mapping` → kept as-is (same appId).
+- §6: the export marks the unit manual with its payload, but (like every manual unit) `export_runner` writes only the
+  index row for it, not the payload file — so "kept as evidence" = the unit in memory/ledger, not on disk. Not changed
+  (export_runner is outside §9).
+- §1: the 04 widget label changed from "blank = resume, else LATEST_EXPORT.json" to "blank = LATEST_EXPORT.json"
+  (label only; parameter name unchanged, no template/installer change). `_has_import_checkpoint` deleted (no callers).
 
-**Q0 — setup + fixtures** (Claude; fixture code in `tests/fixtures_medium.py` is test code, not utility code).
-- **Target.** A fresh target if the user recreates one; otherwise the current target with new state schemas (ask).
-  Then:
-  - runner `ensure` + `scope`;
-  - `target_uc_prep` (recreate `catalog_src_g9c6nd`);
-  - state schemas `wsmig_state_main` + `wsmig_state_16_3`;
-  - a staging volume;
-  - Git folder at `main` `c3421bb`.
-- New source phase **`query_owner`** (in `all`, before `acls`): set the owner of `wsmig_test_query` to `tanveer.singh@databricks.com`.
-  The other queries stay owned by the QA user, so the bed has two distinct owners, neither of them the runner.
-- New phases **`seed_16_3`** and **`target_conf_drift`**, both excluded from `all`:
-  - `seed_16_3` (source): `wsmig_test_policy_family` overrides `autotermination 30 → 45`; `wsmig_test_query` owner →
-    `aman.bansal@databricks.com` (another fixture user);
-  - `target_conf_drift` (target): `enableResultsDownloading` → `true` (source = `false`).
+**Mutation check** (each item reverted alone in a scratch copy; new tests that then fail):
+§8 alert strip 8 · §7 error wording 10 · §3 report write 2 · §2 settings 3 · §6 synced pipelines 5 · §1 folder choice 2 ·
+§1 notebook end lines 1 · §4 query owner 6 · §5 pipeline ACL 5 · §5 pipeline run-as 4.
 
-**Run A — 1.1.0 (`main` `c3421bb`) e2e, installed by the 1.1.0 installer → `wsmig_state_main`.** This is the
-customer baseline and the golden baseline on this bed. Expected 1.1.0 behaviour:
-- the bundle folder is a timestamp;
-- `wsmig_test_policy_family` is FAILED (400);
-- every target query is owned by the runner;
-- workspace settings are `Created` without verification;
-- pipelines' `IS_OWNER` is transferred (the runner is a metastore admin, V6).
+**Fingerprint stability:** `test_fingerprint_stability_every_type_but_alert_v2_matches_1_1_1` compares a 25-unit
+inventory (every asset type incl. publish/schedule, a synced pipeline, a query with an owner, a pipeline with an SP
+run-as) against golden hashes computed by running `main` @ `51e3a08`'s `build_all`: only the Alert V2 carrying
+`evaluation.state/last_evaluated_at` moves (D4); the alert without them is unchanged.
 
-Save `golden_snapshot.json`. **Stop.**
+## 10. Release (1.2.0)
+**`VERSION`** is `1.2.0`. **`CHANGELOG.md`** has Added / Fixed / Changed entries per item, plus these upgrade notes:
+- pull-only, no reinstall. Each notebook now ends with the run's folder path;
+- the first run sets query owners (`updated`) and re-checks workspace settings against the target;
+- every Alert V2 reads `updated` once;
+- synced-table pipelines become `manual`;
+- a missing report turns the task red;
+- failures that said "folder does not exist" now show the server's error, so re-run `failed_only`;
+- **pipelines keep the migration identity as owner.** User-owned pipelines also run as it; SP-owned ones keep running as their SP (one-time `updated` on 1.x targets). The source owner gets `CAN_MANAGE`. A metastore admin can transfer ownership afterwards.
 
-**Run B — the upgrade.** Seed `target_conf_drift` first; this simulates the customer's false "Created". Then pull the
-16.3 commit into the same Git folder and run the same 1.1.0-installed job, with no reinstall and the same state. Expect:
-- **B9 off by default:** a timestamp folder, `resolved via: fresh`;
-- **B3:** the family policy is `created`; a live GET shows `policy_family_id=personal-vm` + overrides;
-- **B2:**
-  - every migrated query owner = the source owner (tanveer for `wsmig_test_query`, the QA user for the rest), from
-    live GETs;
-  - rows `updated` with `owner set to … (verified)`;
-  - no content PATCH (DEBUG log);
-- **B4:**
-  - `enableResultsDownloading` is re-applied and reads back `false` (live GET);
-  - the other keys are SKIP with no write;
-- **CUST-1:** pipeline ACL rows are unchanged; the owner is still transferred (live GET permissions);
-- **CUST-2:** no change (no such pipeline in the bed);
-- **7b (QA16.2-1):** seed `retry_seed` on the source before this run (`RETRY_GENIE` is built on `retry_tbl`, which is missing on target). Its row is FAILED with the server's `Table … does not exist` text, and **not** "targets workspace folder". (The confirmed-missing-folder path is offline only: homes on the bed are already provisioned.) Then `retry_heal` + `failed_only` → created;
-- **no duplicates:** object counts per type are unchanged apart from the new policy;
-- `logcheck.py` clean.
+**`RUNBOOK.md`:**
+- finding a run's folder: open the job run → a task's output → the last `Folder :` line;
+- Repair run vs Run now;
+- standalone `failed_only`: `run_id` can stay blank;
+- `completed_no_report`;
+- `not_applied` settings;
+- pipeline owner / run-as and how a metastore admin transfers it;
+- synced-table pipelines;
+- which types keep their owner;
+- a Genie space failing on a missing UC table.
 
-**Stop.**
-
-**Run C — reinstall + run-id folder.** Run the 16.3 `00_Install_Jobs` (same names, same state schema), then the e2e
-job. Expect:
-- the job ids are unchanged;
-- the inventory task prints `resolved via: job-run-id`;
-- the folder name = the Jobs-UI run id;
-- export/import used the same folder;
-- `LATEST_*` pointers name it;
-- the run is near-idempotent: SKIP everywhere, no writes apart from rechecks that are expected to be 0.
-
-**Stop.**
-
-**Run D — Repair.**
-1. Start the e2e job again (a new *Run now*, which must give a **new** folder, D2).
-2. **Cancel** it while the import task is running.
-3. *Repair run* it.
-
-Expect:
-- the repaired import task gets the same `job_run_id`/task value → the same folder;
-- checkpoint lines `resumed from checkpoint`;
-- one final `import_status.xlsx` in that folder;
-- state `rows=N expected=N`;
-- no duplicates.
-
-**Stop.**
-
-**Run E — standalone `failed_only`** with `run_id` = Run D's job run id, copied from the Jobs UI, and
-`dry_run=false`. Expect:
-- `import_status_retry_<ts>.xlsx` in Run D's folder; the canonical report is untouched;
-- only failed units are acted on.
-
-**Stop.**
-
-**Run F — incremental.** Seed `seed_16_3` on the source, then run the e2e job. Expect:
-- a new folder;
-- the family policy `updated` through the family-shape edit (live GET overrides = 45);
-- `wsmig_test_query` owner = aman.bansal (verified);
-- the other queries SKIP with zero writes.
-
-**Stop.**
-
-**Run G — negative paths.**
-- **B11:** create the directory `<Run F folder>/reports/import_status_dry_run.xlsx/` (an obstacle; nothing on the
-  target is touched), then run the standalone import with `dry_run=true`. This is the one deliberate dry run: it
-  writes nothing to the target. Expect:
-  - the task is **red**, `run_status=completed_no_report`;
-  - the ERROR line names the file;
-  - the json + md still land.
-
-  Remove the obstacle (our own test artifact) and re-run: green.
-- **1d:** point the standalone import at a folder that has only an inventory: run the standalone `inventory` job → its
-  own run-id folder. Expect the actionable message naming `LATEST_EXPORT`'s run id.
-- **1c:** run the standalone export with a blank `run_id`. Expect it to resolve to the newest inventory by time (the
-  pointer), not by name, with timestamp folders from Runs A/B present.
-
-**Stop.**
-
-**Run Z (recommended final certification) — released `main` 1.2.0 on a fresh target and fresh schema → golden diff
-vs Run A.** Expected diffs only:
-- `cluster_policy` failed → created;
-- legacy_query notes `owner set …`;
-- workspace settings `(verified by read-back)`;
-- the bundle folder = the job run id.
-
-**Not live-testable here** (stated in FINDINGS):
-- CUST-1's 403 path (V6). A stand-in is the customer's next import, or a non-metastore-admin runner if the user wants
-  to set one up.
-- CUST-2: the bed has no synced table (D5).
-- A workspace-conf key the target silently drops (V8): it only shows up if the fresh target happens to drop one.
+**`PERMISSIONS_GUIDE.md`:**
+- the migration identity needs access to the tables of user-owned UC pipelines (it runs them);
+- to keep an SP run-as, it may need the Service Principal User role on that SP.
 
 ---
 
-## 12. Decisions for the user (defaults = recommended; dev builds the defaults unless the user says otherwise)
-- **D1 — CUST-1:**
-  - **(b) default:** try the source owner; on the "only metastore admins" 403, re-send with the target's current owner
-    and a warning;
-  - (a): always keep the target's current owner for pipelines.
+## 11. Live QA (Claude) — classic job cluster, LIVE + direct, 3 runs, stop after each
+Shrunk from 7 runs to 3 (user, 2026-10-15): each run now checks several items. Dropped: Run Z (the merged code is
+the code tested here; Run 1 already creates new pipelines and changes owners from scratch → after merge only check
+`main`'s VERSION) and the live §3 report-write negative (offline-covered).
 
-  (Plain "omit the owner" is not an option: the API rejects it, V7.)
-- **D2 — B9:** a new *Run now* after a failed run starts a **new** folder; continuing the same folder is done with
-  *Repair run*. **Default yes.**
-- **D3 — B4:** on every run, a workspace setting that differs from the source on the target is re-applied and read
-  back (heals the customer's false `Created`; also reverts a hand change on the target). **Default yes.**
-- **D4 — B9 activation:** run-id folders only after re-running `00_Install_Jobs`; pull-only upgrades keep timestamp
-  folders. **Default yes.** The alternative, reading the run id from the notebook context with no reinstall, works
-  (V1) but relies on an undocumented context API.
-- **D5 — CUST-2 coverage:**
-  - **default:** offline tests, plus the customer's next import as the live proof;
-  - optional: add a Lakebase instance + synced table to the source bed. That costs money, so it needs the user's OK.
-  - Optional add-on: fix the `object_absent` wording on these pipelines' ACLs (part of QA16.2-4, small).
+**Bed:**
+- target `7405614409585920`; state `catalog_3_5djjet.wsmig_state_16_2` (holds 1.1.1's state from PLAN_16_2_1
+  Run 3 = the customer's starting point, so no baseline run);
+- Git folder `wsmig_cust` + the jobs installed by 1.1.x (pull only, no reinstall);
+- target pipelines use catalog `catalog_src_g9c6nd` (schema `wsmig_test`); the runner has `ALL_PRIVILEGES` there;
+- evidence in `~/Desktop/wsmig_runs/plan16_3/run{1,2,3}/` + `FINDINGS.md`; checks use live GETs, the state table
+  and the driver log.
 
-- **D7 — 7c alert fingerprint:** accept the one-time `updated` of every Alert V2 on the first 1.2.0 run (the
-  only way to remove the per-run noise; today the same alerts are already `updated` whenever they evaluated).
-  **Default yes.**
+**Fixtures** (`tests/fixtures_medium.py`, all EXCLUDED from `all`; each shown to the user before it runs):
+
+| Phase | Side | When | What |
+|---|---|---|---|
+| `cust163_seed` | source | before Run 1 | `wsmig_test_query` owner → tanveer.singh; 3 new UC pipelines (never started): `wsmig_test_pipeline_cust1` (owner = QA user), `…_cust1_sp` (owner = `ai27_acc_spn_1`), `…_cust1_sp3` (owner = `ai27_acc_spn_3`), each CAN_RUN `ai27_account_grp_1` + CAN_VIEW a user; one extra grant on `wsmig_test_pipeline`; `wsmig_test_alert_v2` cron → every 15 min (original saved); Genie `wsmig_qa_163_genie` on `retry_tbl_163` (source-only table) |
+| `cust163_target_prep` | target | before Run 1 | `enableResultsDownloading` → `true` (source = `false`); **UC grant (user OK):** `USE CATALOG` + `USE SCHEMA` on `catalog_src_g9c6nd`/`wsmig_test` to `ai27_acc_spn_1` and `ai27_acc_spn_3` — a run-as SP needs them (live 403 otherwise) |
+| `cust163_run2` | both | before Run 2 | `wsmig_test_query` owner → aman.bansal; **grant (user OK):** the runner gets `servicePrincipal.user` on `ai27_acc_spn_3`; plant `wsmig/<src>/20200101_000000/` (copied manifest + an unfinished import checkpoint) |
+| `cust163_heal` | target | before Run 3 | create the empty `retry_tbl_163` on target |
+| `cust163_cleanup` | both | after Run 3 | restore the alert cron; remove the planted folder |
+
+| Run | What | Expect |
+|---|---|---|
+| **1 — upgrade** (pull 1.2.0, run the e2e job) | the customer's first run on 1.2.0 | **§1:** each task's output ends with `Run id` + `Folder`, and that folder holds this run's reports. **§4:** every query's owner = its source owner (live GET), rows `updated` "owner set … (verified)", no content PATCH. **§2:** `enableResultsDownloading` re-applied and reads `false`; other keys SKIP with no write. **§5:** `_cust1` → IS_OWNER = runner, QA user CAN_MANAGE, other grants exact, runs as the runner; `_cust1_sp` → IS_OWNER = runner, runs as `ai27_acc_spn_1`, SP CAN_MANAGE; `_cust1_sp3` → `created_with_warning` "grant the runner the Service Principal User role", runs as the runner; `wsmig_test_pipeline` → new grant applied, owner unchanged; parity `match` + known_gap. **§7:** the Genie row FAILED with the server's `Table … does not exist`, not "targets workspace folder". **§8:** both Alerts V2 `updated` once (D4). No duplicates; `logcheck.py` clean. |
+| **2 — change + repair** (`cust163_run2`, then e2e: cancel during import → Repair run) | an incremental change, idempotency, repair | Only `wsmig_test_query` (owner → aman.bansal, verified) and `_cust1_sp3` (now runs as `ai27_acc_spn_3`) are written; **everything else SKIPs with zero writes** from the new rechecks (queries, settings, pipeline run-as). The alert evaluated since Run 1 and is `skipped`. Inventory/export start a **fresh** folder, not the planted one. The repaired import uses the same folder, logs `resumed from checkpoint`, writes one final xlsx, `rows=N expected=N`, no duplicates. |
+| **3 — operator retry** (`cust163_heal`, then standalone import, `failed_only`, blank `run_id`) | the operator flow | `resolved via: LATEST_EXPORT.json` (Run 2's folder, not the planted one); `import_status_retry_<ts>.xlsx` there; only failed units acted on; `wsmig_qa_163_genie` `created` with its ACL. Then `cust163_cleanup`. |
+
+**Not live-testable here:** §6 synced-table pipelines (no synced table, **D3**); Lakeflow Connect gateways (need an
+external DB connection); §7's confirmed-missing-folder path (homes exist); a setting the target silently drops (only
+if this target drops one); §3 report-write failure (offline).
+
+---
+
+## 12. Decisions (the dev builds the defaults unless the user says otherwise)
+- **D1 — §5:** give the source owner `CAN_MANAGE` on the migrated pipeline. **Default: yes.** Without it, the original owner loses all access to their pipeline.
+- **D2 — §2:** a setting that differs on the target is re-applied on every run. This heals the false `Created`, and also reverts hand changes on the target. **Default: yes.**
+- **D3 — §6:** offline tests, plus the customer's next import as the live proof. **Default: yes.** The alternative, a Lakebase synced table on the source bed, costs money and needs the user's OK.
+- **D4 — §8:** accept one `updated` per Alert V2 on the first 1.2.0 run. **Default: yes.**
 
 ## 13. Review checklist (Claude, before live QA)
-- Diff touches only the files in §8.
-- Every 1.x fingerprint is unchanged (the test exists and passes).
+- The diff touches only the files in §9.
+- The fingerprint-stability test passes, with only `alert_v2` moving.
 - No new silent `except`.
-- `job_run_id` exists only on inventory tasks.
-- Resume rules match 1c.
-- `adopt_one` for `legacy_query` keeps the stale-update rule.
-- CUST-1 retry fires only on the exact marker.
-- The CUST-2 guard runs at both export and import.
-- The report-write failure can't mask an abort.
-- 7b: our message only after a check returns a real 404; a 200 or a failed check → the server's original error;
-  1.1.0's message text unchanged (golden test); no extra call on success.
-- 7c: only `evaluation.state` + `evaluation.last_evaluated_at` are stripped; every other fingerprint unchanged (the
-  stability test covers all asset types except Alert V2).
-- CHANGELOG upgrade notes match §10.
-- The suite and the mutation checks are reported in §9b.
+- §1 is the end-of-output print, import = `LATEST_EXPORT` and inventory/export newest-only, nothing else: no template, installer or naming change.
+- Resume looks at the newest folder only.
+- `legacy_query` adopt keeps the stale-update rule.
+- The pipeline ACL rule touches `perm_type == "pipelines"` only, never sends the source `IS_OWNER`, and never guesses an owner.
+- `run_as` is set only for an SP source owner, and a refused `run_as` degrades to a warning, never a failure.
+- The CUST-2 rule runs at both export and import.
+- A report failure can't mask an abort.
+- §7: our message only after a real 404, and 1.1.1's text is unchanged.
+- §8: only the two `evaluation.*` fields are stripped.
+- The CHANGELOG matches §10.
+- §9b is filled in.
 
 ## 14. Findings
-(live QA appends here)
+### Review (2026-10-14, Claude) — two small code changes, 601 tests pass
+- **Lakeflow Connect gateway** (`gateway_definition`, no `libraries` by design) would have become `manual` with the
+  misleading "no source code" note. User decision: keep it `manual` (it needs a UC connection, out of scope) and
+  document Lakeflow Connect as a manual step. `pipeline_not_creatable` now returns a note naming the connection;
+  test `test_lakeflow_connect_gateway_is_manual_with_a_uc_connection_note`. Docs: Runbook, Permissions Guide,
+  Architecture manual table, README, CHANGELOG.
+- **Run-as refusal matched on guessed words.** Live probe (runner = workspace admin with only
+  `servicePrincipal.manager` on the SP), create AND update → `403 PERMISSION_DENIED Cannot bind the service principal
+  provided in 'run_as' field (<sp>) … must have 'servicePrincipal.user' role`. Workspace admin is NOT exempt. A run-as
+  SP lacking `USE CATALOG` is a different 403. `_RUN_AS_REFUSED_MARKERS` now requires all of
+  `permission_denied` + `'run_as'` + `servicePrincipal.user`; the fake uses the live text; new test
+  `test_other_permission_denied_with_run_as_is_not_retried_and_fails`. (Mutation note: the old loose list also let the
+  USE CATALOG 403 through — the tightening guards unseen errors.) Evidence:
+  `plan16_3/api_probes/2026-10-14_runas_refusal.json`.
+
+### Run 1 — upgrade to 1.2.0 (2026-10-15) — PASS, 1 new finding (QA16.3-1)
+Git folder `wsmig_cust` → `feature/16_3_customer_fixes` @ `5d17952` (pull only). Seeds: `cust163_seed`,
+`cust163_target_prep`, `cust163_uc_grants` (user-approved), `cust163_alert`. `wsmig - direct end-to-end (LIVE)` → job
+run 976288619533031 SUCCESS (inventory 6.0 / export 0.7 / import 9.2 min), bundle `20261015_063308`, `run_status=completed`,
+state `rows=720 expected=720`. Roll-up: skipped 622 · updated 23 · created 4 · created_with_warning 5 · manual 9 ·
+skipped_no_object 59 · failed 6. Evidence `~/Desktop/wsmig_runs/plan16_3/run1/`.
+- **§1 PASS:** `Run id : 20261015_063308` + `Folder : …/20261015_063308/` are the last lines of inventory, export and import.
+- **§4 PASS:** all 19 queries `updated` "owner set to <source owner> (verified)"; live GET owners = source 19/19
+  (`wsmig_test_query` → tanveer.singh); exactly one PATCH per query (owner only, no content).
+- **§2 PASS:** `enableResultsDownloading` re-applied, row "set to 'false' (verified by read-back)", live = `false`;
+  the other 5 keys `skipped`, one workspace-conf PATCH in the whole run. (Status word is `created`, as the
+  declarative path always reports.)
+- **§5 PASS:** `_cust1` IS_OWNER = runner, runs as the runner, QA user CAN_MANAGE, grants exact; `_cust1_sp` IS_OWNER =
+  runner, runs as `ai27_acc_spn_1`, SP CAN_MANAGE; `_cust1_sp3` → 403 "Cannot bind the service principal provided in
+  'run_as'" → one retry without run_as → `created_with_warning` "grant the runner the Service Principal User role on
+  …", runs as the runner; `wsmig_test_pipeline` + CAN_VIEW applied, owner unchanged. ACL Parity `match` + "owner kept
+  on target" for all four. Pipelines 5 → 8, no duplicates.
+- **§7 PASS:** `wsmig_qa_163_genie` FAILED with the server's `403 … Table 'catalog_src_g9c6nd.wsmig_test.retry_tbl_163'
+  does not exist`, not the folder message.
+- **§8 PASS:** both Alerts V2 `updated` once (D4).
+- Failures = the 5 by-design ones from 1.1.1 + the seeded Genie. `logcheck`: every failed row has an ERROR line; 2
+  start-without-end + 1 double-end, all workspace-content rows garbled by thread interleaving (seen in 16.2 too).
+- **QA16.3-1 (new, report accuracy):** ACL Parity `extra_on_target=18` (every earlier run 0) — all 18 queries whose
+  owner was set from the runner to their creator. **Platform behaviour (verified on both sides):** a query owner
+  TRANSFER adds an explicit `CAN_MANAGE` for the new owner, while a creator-owner has none (source
+  `wsmig_test_query`, transferred to tanveer by the seed, also lists tanveer CAN_MANAGE → that one matches). No access
+  change (the owner manages anyway); it's a false "extra" that persists each run. Proposed fix: in
+  `write_parity_report`, for `queries`, treat the owner's own `CAN_MANAGE` as expected when the source lacks it, with
+  a `known_gap` note.
+- **QA16.3-1 fixed (2026-10-15, user: no new report text — code comment only):** `AclImporter._query_parity` drops
+  `(owner, CAN_MANAGE)` from the target side when the source doesn't list it; owner from the SQL importer's LIST
+  (shared context `legacy_query_target_owners`), else one LIST in the ACL phase. Tests
+  `test_query_owner_can_manage_added_by_an_owner_change_is_not_an_extra` +
+  `test_query_extra_can_manage_for_a_non_owner_is_still_reported` (both fail with the fix removed). 603 pass.
+
+### Run 2 — prep (2026-10-15)
+- `cust163_run2`: `wsmig_test_query` owner → aman.bansal (source GET confirms). Runner granted
+  `servicePrincipal.user` on `ai27_acc_spn_3` (via the workspace rule-set proxy; `source_acct` login had expired).
+- Planted (our test artifacts, remove after Run 3): `wsmig/7405604611768470/20200101_000000/misc/` = Run 1's
+  manifest + an import checkpoint (1.1.1's import would resume it); `…/20200101_000001/misc/checkpoint.json` only
+  (1.1.1's inventory/export would resume it).
+
+### Run 2 — re-run + cancel + Repair run (2026-10-15) — PASS, 1 pre-existing finding (QA16.3-2)
+Git folder @ `4a50765` (the QA16.3-1 fix). Job run 384144645463303: inventory + export SUCCESS, import cancelled 2 min
+in (checkpoint had `import:identity` + `import:compute` only, no import_results/xlsx), Repair run (import only) SUCCESS.
+Bundle `20261015_090931`. Roll-up: skipped 647 · updated 2 · adopted 2 · created_with_warning 3 · manual 9 ·
+skipped_no_object 59 · failed 6 (the same 6 as Run 1). Evidence `~/Desktop/wsmig_runs/plan16_3/run2/`.
+- **§1 folder PASS:** inventory/export opened a fresh folder (not the planted `20200101_000001`); the repaired import
+  used the same folder (`resolved via: widget`), replayed identity + compute "resumed from checkpoint — no API call
+  this run" (49 rows), wrote ONE `import_status.xlsx`; state `rows=728 expected=728`; 728 units, no duplicate keys.
+  Both planted folders untouched. `LATEST_EXPORT.json` → `20261015_090931`.
+- **§4 PASS:** only `wsmig_test_query` written — one PATCH, "owner set to aman.bansal (verified)", live GET agrees; its
+  ACL re-applied once (source ACL changed with the owner). The other 18 queries skipped.
+- **§5 PASS:** `_cust1_sp3` one PUT, now runs as `ai27_acc_spn_3` (da12f5ae), IS_OWNER still the runner; no refusal,
+  no retry. Other pipelines skipped.
+- **QA16.3-1 fix PASS live:** ACL Parity 262/262 `match` (Run 1: 18 queries `extra_on_target`); Detail empty.
+- **Writes in the repaired import** (all accounted for): the query PATCH + its permissions PUT, the sp3 pipeline PUT,
+  and — identical in Run 1, not 16.3 — 2 `permissionassignments` PUTs (admins/users, idempotent), 2 dashboard
+  subscription POSTs (16.2 behaviour), the seeded Genie's 403, and 2 alert POSTs that 409 (below). The cancelled first
+  attempt made zero writes.
+- **QA16.3-2 (pre-existing on main, NOT fixed — needs a decision):** both Alerts V2 rows are `adopted` "create raced
+  the existence check" instead of `skipped`. `SqlImporter.existing_keys` reads the alerts LIST under key `results`,
+  but `GET /api/2.0/alerts` returns `{"alerts": [...]}` (the collector already uses `"alerts"`) → the target index is
+  always empty → every run POSTs a create, gets 409 ALREADY_EXISTS, and adopts. No duplicate, but one rejected write
+  per alert per run and the wrong status word. Likely related to PLAN_11 BUG-1. Fix = one key + a test.
+- **QA16.3-2 fixed (2026-10-15, user-approved):** `sql_importer.existing_keys` reads `"alerts"`. Test
+  `test_alert_v2_already_on_target_is_found_by_the_live_list_shape_and_skipped` pages the live shape through the
+  REAL `ApiClient.get_paginated` (fails before the fix: create instead of skip). 604 pass. Run 3 is `failed_only`
+  (alerts out of scope), so the live check is the next full import: both alerts `skipped`, no `POST api/2.0/alerts`.
+
+### Run 3 — standalone `failed_only`, blank run_id (2026-10-15) — PASS
+Git folder @ `603487b` (QA16.3-2 fix). `cust163_heal` created `catalog_src_g9c6nd.wsmig_test.retry_tbl_163` on target.
+`wsmig - import` run 196138743120929 (`dry_run=false`, `retry_mode=failed_only`, `run_id` blank) SUCCESS.
+Evidence `~/Desktop/wsmig_runs/plan16_3/run3/`.
+- **§1 PASS:** `Run id : 20261015_090931 (resolved via: LATEST_EXPORT.json)` = Run 2's folder; retry artifacts
+  `import_status_retry_20261015_095142.xlsx` / `import_results_retry_…json` / `manual_actions_import_retry_…md` written
+  there, Run 2's `import_status.xlsx` kept. State `rows=728 expected=728`.
+- **§7 PASS:** `wsmig_qa_163_genie` `created` (one POST, one space on target) + its ACL `created` (ai27_account_grp_1
+  CAN_RUN).
+- Roll-up created 2 · failed 5 (the by-design 5; the policied cluster's one re-tried POST 400s as before). Writes: exactly
+  those 3. Everything else "not in this retry's work list".
+- **Extra full import for QA16.3-2 (run 333035090423575, `retry_mode=off`) — did NOT exercise the fix:** blank run_id →
+  the same Run 2 folder, whose checkpoint already holds every phase, so all 728 rows replayed "resumed from checkpoint
+  — no API call this run" (zero writes; by design). It re-wrote that folder's `import_status.xlsx`/`import_results.json`
+  with the same statuses. A live check of QA16.3-2 needs a FRESH export folder (an end-to-end run).
+
+### QA16.3-2 live check + cleanup (2026-10-15) — PASS, live QA COMPLETE
+`cust163_cleanup` restored the source `wsmig_test_alert_v2` cron to `0 0 9 * * ?` (a real edit), then
+`wsmig - direct end-to-end (LIVE)` run 744042131314584 SUCCESS, bundle `20261015_111800`. Evidence
+`~/Desktop/wsmig_runs/plan16_3/run4_alerts/`.
+- `wsmig_test_alert_v2`: `exists=yes fingerprint=changed → UPDATE`, one PATCH, `updated`; target cron now `0 0 9 * * ?`.
+- `wsmig_test_alert_v2_b`: `exists=yes fingerprint=same → SKIP`. Zero `POST api/2.0/alerts` (Run 2 had 2 × 409).
+- Other writes = the known pre-16.3 set only (policied cluster 400, 2 permissionassignments, 2 subscriptions).
+- Cleanup done: alert cron restored; planted `20200101_000000`/`20200101_000001` deleted (contents checked first).
+- Log tip: when all tasks share one job cluster the `#seq` restarts per stage — dedup the doubled driver stderr by
+  whole line, not by `#seq`.
+
+### Upgrade test main (1.1.1) → 1.2.0 on a FRESH target (2026-10-16, in progress)
+User rule: every release is live-tested as an upgrade from the previous version (old releases = their merged
+branches: 1.1.0 `feature/dashboard_publish_and_acl`, 1.1.1 `main`). Evidence `~/Desktop/wsmig_runs/plan16_3/upgrade_test/`.
+- **Target:** `adb-7405607357241881.1` (westus2, metastore fa077131; source is westus). Runner = workspace admin (via
+  the workspace permission-assignment API; `source_acct` login expired), scope `wsmig_runner`. Staging
+  `/Volumes/catalog_4_2yesmc/wsmig_staging/staging`, state `catalog_4_2yesmc.wsmig_state_main` (`catalog_4_2yesmc` =
+  the workspace's own catalog; `catalog_src_g9c6nd`/`catalog_ws_bozvdk` here have lost their storage). Git folder
+  `wsmig_main` @ main 51e3a08; jobs installed by main's `00_Install_Jobs`, then the classic-cluster reset.
+- **Baseline 1.1.1 e2e** run 223176052964558 SUCCESS, bundle `20261016_131652`: created 263 · adopted 19 · warn 10 ·
+  skipped 71 · manual 9 · no-object 209 · failed 150 = 141 user homes not provisioned yet + 5 by design + 1 job
+  ordering (`run_job_task` → a later job) + 3 `polfam` jobs (source fixture drift: tag `family_job` vs the policy's
+  `family_job_v2`). Both metastores' admin = `account users`, so 1.1.1 moved every pipeline's IS_OWNER to the source
+  owner with no 403 — the customer's CUST-1 403 can't be reproduced here.
+- **Source prep (user-approved):** the 3 `polfam` jobs' tag → `family_job_v2` (before-settings saved). Lakebase
+  instance `wsmig-qa-lb` (CU_1) + database catalog `wsmig_lb_cat` + synced table
+  `wsmig_lb_cat.public.zones_synced` (SNAPSHOT, pk `zip`) → platform pipeline
+  `Synced table: wsmig_lb_cat.public.zones_synced Vl02hH` (no `libraries`) = the CUST-2 shape. **Delete after the
+  1.2.0 run** (paid).
+- **Fix found by the live name:** the platform appends a random suffix to the synced-table pipeline name; the
+  §6 note quoted it as part of the table. `pipeline_not_creatable` now takes the first token. Test
+  `test_synced_table_note_drops_the_platforms_random_name_suffix` (fails on the old helper). 605 pass.
+- **Next:** homes provisioned (user checks) → 1.1.1 e2e until only by-design failures (expect the synced pipeline to
+  FAIL `libraries must contain at least one element`) → source edits: `wsmig_test_query` text, SP run-as on
+  `wsmig_test_pipeline`, one NEW SP-owned pipeline, 2 workspace confs → Git folder to 1.2.0 → e2e.
+
+### Upgrade test 1.1.0 → 1.2.0 on FRESH source + target (2026-10-19, in progress — supersedes the 2026-10-16 bed)
+User: baseline = **1.1.0** (`feature/dashboard_publish_and_acl` @ 37996ea) because some BUs never took 1.1.1.
+Source ws 7405609680512510 (westus), target ws 7405609204731078 (westus2), runner `ai27_wsmig_runner` recreated
+(appId 8233dc03…). Evidence `~/Desktop/wsmig_runs/plan16_3/upgrade_110/`.
+- **Run 1 (1.1.0 e2e)** job run 6786418126348, bundle `20261019_084244`: failed 132 = 120 user homes + 2 family
+  policies (B3) + 3 polfam jobs + synced pipeline (`target schema field is required`) + run-as SP job (env) +
+  run_job_task ordering + 2 libraries (cluster stopped) + serving key (by design) + **Starter Warehouse ACL (new)**.
+  All 7 created queries owned by the runner (B2 reproduced). All 8 confs `Created` and read back = source.
+- **Two new findings, fixed on this branch (user-approved, 612 tests; 4 of the 7 new tests fail on the prior code):**
+  - **QA16.3-U1 workspace-conf reads lag writes.** Live on the source: after a PATCH the GET flip-flopped between
+    old and new for ~1–2 min (one key ~5 min). §2's single read-back could report a false `failed`. Fix: a key
+    not visible at once is held; after the phase's last conf row ONE shared loop re-reads all held keys every
+    15 s for up to 3 min (worst case 3 min total, not per key), then each row is recorded verified or failed.
+  - **QA16.3-U2 ownerless warehouse ACL.** New workspaces' Serverless Starter Warehouse is created by a platform
+    SP and has NO IS_OWNER; a full-replace PUT is refused (`400 … with no existing owner must provide a new owner`;
+    earlier beds' starter warehouses had an owner). Fix: when neither the source ACL nor the target warehouse names
+    an owner, PATCH (add) the grants — no owner invented. PATCH verified live on the ownerless warehouse.
+- **Source edits planted for 1.2.0:** `cust163_seed` (query owner → tanveer, pipelines user / spn_1 / spn_3,
+  Genie on a source-only table), `wsmig_test_query` text, `wsmig_test_pipeline` run-as → spn_1, confs
+  `enableWebTerminal` true + `maxTokenLifetimeDays` 20; target `cust163_uc_grants` + conf drift
+  `enableResultsDownloading=true`. Runner granted servicePrincipal.user on spn_1.
+- **Run 2 (1.1.0 failed_only, same bundle)** job run 558695262116710 — see below.
+  Result: SUCCESS in 4.6 min — 232 created + 12 updated (all 120 home items, the run-as SP job, the
+  run_job_task job, 122 ACLs). Still failed = 10, all expected on 1.1.0: 2 family policies + 3 polfam jobs (B3),
+  synced pipeline (CUST-2), Starter Warehouse ACL (U2), 2 libraries, serving key. All 19 target queries are
+  owned by the runner → this is the customer-shaped 1.1.0 state for the 1.2.0 run.
+- **Run 3 (1.2.0 e2e @ 420a650)** job run 22168871247355 SUCCESS (inv 6.7 / exp 0.9 / imp 11.1 min), bundle
+  `20261019_113156`: created 19 · updated 21 · warn 7 · skipped 582 · manual 10 · no-object 60 · **failed 4**
+  (2 libraries — cluster stopped, serving key, Genie on a source-only table = server's 403 verbatim, §7). **PASS.**
+  - B3 (1.1.1 fix via 1.2.0): both family policies + 3 polfam jobs + their ACLs created.
+  - B2: 17 queries `updated` "owner set to … (verified)"; target owners now = source (16 abhishek, wsmig_test_query
+    tanveer). The 2 queries of deleted users (preserved under /Users_Backup) keep the runner, by design.
+  - CUST-1: new user-owned pipeline → owner + run-as runner, source owner CAN_MANAGE; SP-owned → owner runner,
+    run-as spn_1; spn_3 (no role) → runs as runner + the "grant Service Principal User" warning;
+    `wsmig_test_pipeline` (source run-as edited to spn_1) → run-as spn_1, existing owner kept. Pipelines whose
+    owner 1.1.0 already moved: skipped, untouched.
+  - CUST-2: synced pipeline `manual` with the synced-table note, no POST.
+  - B4 + U1: `enableWebTerminal` verified after 120 s, `maxTokenLifetimeDays` after 45 s (U1's shared re-read
+    proven live — the 1.2.0 single read would have FAILED both), target drift `enableResultsDownloading` re-applied
+    + verified, 5 matching keys skipped with no write.
+  - U2: Starter Warehouse ACL `created` via PATCH ("no owner on source or target").
+  - Alerts V2 skipped, not updated once: these alerts never evaluated on the new source (no `evaluation.state`),
+    so the fingerprint did not move — D4 only applies to alerts that have evaluated. Correct.
+  - ACL Parity 251/251 `match`.
+  - Pre-existing cosmetic (main): an UPDATE that carries a warning is labelled "Created — with a warning" (no
+    updated-with-warning status) — `wsmig_test_pipeline` reads that way because UC pipelines always carry the UC
+    note. Backlog.
+  - Source noise: an empty SP home `/Users/fcbf1bea…` (SP not in SCIM) appeared on the source between the runs —
+    recreated under the backup root with the usual warning. Not a tool issue.
+- **Run 4 (1.2.0 e2e, idempotency @ 420a650, 2026-10-21)** job run 359314249532348 SUCCESS (inv 8.5 / exp 0.9 /
+  imp 9.8 min), bundle `20261021_060241`: **created 0 · updated 0** · skipped 626 · manual 10 · no-object 60 ·
+  warn 3 · failed 4 (same 4 expected). Target snapshot before/after identical (object counts, query owners,
+  pipeline run-as, confs) → no duplicates, no owner/conf/run-as flapping. Warnings: `_cust1_sp3` re-attempts its
+  refused run-as every run with the same "grant the Service Principal User role" note (by design — it heals once
+  the role is granted, as on 2026-10-15); the 2 dashboard schedules whose notification destinations are missing
+  on target repeat their warning (pre-existing since 1.1.0). ACL Parity 251/251 `match`.
+- **Verdict (Claude): 1.2.0 certified prod-ready for direct mode.** Caveats (offline-tested only): the CUST-1 403
+  heal of a 1.x-failed pipeline ACL row (both metastores' admin = account users), a conf key the target truly
+  ignores (red after 3 min), the confirmed-missing-folder wording, the dashboard not-published probe, a failed
+  report write, Lakeflow Connect gateways, and airgap mode (mode-agnostic code; needs the source Git folder upgraded
+  too).

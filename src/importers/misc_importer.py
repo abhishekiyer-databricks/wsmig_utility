@@ -13,7 +13,11 @@ burning DBUs is not a default.
 **Workspace conf is written key-by-key, from a documented key set only.** `PATCH workspace-conf`
 accepts arbitrary keys, and blanket-writing whatever the source returned could flip a security
 setting (token access, IP-list enforcement) on the target. So each key is applied individually — one
-rejected key doesn't take the others down with it — and the note names what changed.
+rejected key doesn't take the others down with it — and the note names what changed. Every write is
+READ BACK (PLAN 16.3 §2): a 200 alone proves nothing, because which keys a workspace silently
+ignores differs per workspace — a key the target did not take is `failed`/`not_applied`, never
+`Created`. A key whose target value differs from source is re-applied on every run (D2), which heals
+a 1.x row that recorded `Created` on the strength of the 200 alone.
 
 **IP access lists are NOT here**: they are account-level for this customer, so a workspace-scoped tool
 cannot see or migrate them (master §6a) — a customer/account-admin task, out of scope by decision.
@@ -21,10 +25,21 @@ cannot see or migrate them (master §6a) — a customer/account-admin task, out 
 from __future__ import annotations
 
 import json
+import time
 
-from src.importers.base_importer import BaseImporter, PrerequisiteMissing, SkippedNoObject
-from src.state.state_store import CAT_DEPENDENCY_UNRESOLVED
+from src.importers.base_importer import (BaseImporter, NotApplied, PrerequisiteMissing,
+                                         SkippedNoObject, classify_error)
+from src.state.state_store import ACTION_FAILED, CAT_DEPENDENCY_UNRESOLVED
 from src.utils.helpers import safe_str
+
+# Workspace-conf reads are eventually consistent (live 2026-10-19: right after a PATCH the GET
+# flip-flopped between the old and new value for ~1–2 min). A key that does not read back at once is
+# HELD, and every held key is re-read together after the phase's last conf row — one shared wait, so
+# the worst case is CONF_VERIFY_SECONDS in total however many keys are held.
+CONF_VERIFY_SECONDS = 180
+CONF_POLL_SECONDS = 15
+_now = time.monotonic
+_sleep = time.sleep
 
 # Library statuses that mean "already registered on the cluster" — so an existing-check SKIP is
 # safe (Bug 16). A FAILED / UNINSTALL_ON_RESTART library is NOT present, so it still re-installs.
@@ -62,10 +77,49 @@ class MiscImporter(BaseImporter):
         # once. We only ever stop clusters in this set, so a cluster the customer already had running
         # is never stopped out from under them.
         self._force_started_clusters: set = set()
+        # Target workspace-conf values read by `existing_keys` (PLAN 16.3 §2): an unchanged key whose
+        # target value differs from source is re-applied (`recheck_unchanged`).
+        self._target_conf: dict = {}
+        # Conf keys written but not yet visible on the first read: key → expected value, and the
+        # held `_record` call for each (replayed once the shared re-read settles it).
+        self._conf_unverified: dict = {}
+        self._conf_held: dict = {}
+        self._last_conf_key = None
 
     def load(self) -> list[dict]:
         """Init scripts → libraries (need clusters) → conf."""
-        return self.units_for("global_init_script", "cluster_library", "workspace_conf")
+        units = self.units_for("global_init_script", "cluster_library", "workspace_conf")
+        confs = [u for u in units if safe_str(u.get("asset_type")) == "workspace_conf"]
+        self._last_conf_key = self.natural_key(confs[-1]) if confs else None
+        return units
+
+    def _process_one(self, unit: dict, existing: dict) -> None:
+        try:
+            super()._process_one(unit, existing)
+        finally:
+            if (safe_str(unit.get("asset_type")) == "workspace_conf"
+                    and self.natural_key(unit) == self._last_conf_key):
+                self._settle_unverified_conf()
+
+    def _record(self, unit: dict, status: str, **kw) -> None:
+        """A conf row whose write is not yet visible is held, not recorded (see `_set_conf`)."""
+        key = self.natural_key(unit)
+        if (safe_str(unit.get("asset_type")) == "workspace_conf" and key in self._conf_unverified
+                and key not in self._conf_held):
+            self._conf_held[key] = (unit, status, kw)
+            return
+        super()._record(unit, status, **kw)
+
+    def run(self):
+        """Run the phase, then STOP every cluster WE force-started — once each, after all its
+        libraries installed (Bug 1). Stopping here rather than per library is what removes the
+        start/stop race that let only the first library on a shared cluster install."""
+        result = super().run()
+        if self._conf_held:          # safety net: the last conf row never reached the settle step
+            self._settle_unverified_conf()
+            self.flush_checkpoint()
+        self._stop_force_started_clusters()
+        return result
 
     def existing_keys(self) -> dict:
         out: dict = {}
@@ -82,6 +136,7 @@ class MiscImporter(BaseImporter):
                                    params={"keys": ",".join(sorted(KNOWN_CONF_KEYS))}) or {}
             for key, value in (conf.items() if isinstance(conf, dict) else []):
                 out[key] = safe_str(value)
+                self._target_conf[key] = value
         except Exception as exc:  # noqa: BLE001 — a conf read failure must not stop the phase
             self.log.warning("workspace-conf read failed", error=str(exc)[:200])
 
@@ -124,6 +179,25 @@ class MiscImporter(BaseImporter):
             if safe_str(st.get("status")).upper() in _LIBRARY_PRESENT_STATES:
                 labels.add(_library_label(st.get("library")))
         return labels
+
+    def recheck_unchanged(self, unit: dict, row) -> bool:
+        """An unchanged conf key is re-applied when the TARGET value differs from source (§2, D2) —
+        a 1.x false `Created`, or a hand change on target. Matching keys stay SKIP, zero writes."""
+        if safe_str(unit.get("asset_type")) != "workspace_conf":
+            return False
+        payload = unit.get("payload") or {}
+        key = safe_str(payload.get("key")) or self.natural_key(unit)
+        return (key in self._target_conf
+                and _conf_norm(self._target_conf[key]) != _conf_norm(payload.get("value")))
+
+    def dry_run_intent(self, unit: dict, action) -> str:
+        if safe_str(unit.get("asset_type")) != "workspace_conf":
+            return ""
+        payload = unit.get("payload") or {}
+        key = safe_str(payload.get("key")) or self.natural_key(unit)
+        current = self._target_conf.get(key)
+        return (f"would set `{key}` to {safe_str(payload.get('value'))!r} (target currently "
+                f"{safe_str(current)!r})")
 
     def create_one(self, unit: dict) -> dict:
         asset_type = safe_str(unit.get("asset_type"))
@@ -172,14 +246,6 @@ class MiscImporter(BaseImporter):
         if payload.get("position") is not None:
             body["position"] = payload["position"]
         return body
-
-    def run(self):
-        """Run the phase, then STOP every cluster WE force-started — once each, after all its
-        libraries installed (Bug 1). Stopping here rather than per library is what removes the
-        start/stop race that let only the first library on a shared cluster install."""
-        result = super().run()
-        self._stop_force_started_clusters()
-        return result
 
     def _stop_force_started_clusters(self) -> None:
         for cluster_id in sorted(self._force_started_clusters):
@@ -307,7 +373,71 @@ class MiscImporter(BaseImporter):
                 f"Set it by hand if it is wanted: value on source was {value!r}.")
         # One key per call: a single rejected key must not take the others down with it.
         self.client.patch("api/2.0/workspace-conf", {key: safe_str(value)})
-        return {"target_id": key, "note": f"{key} set to {safe_str(value)!r}"}
+        # Read back (§2). Reads lag writes, so a mismatch here is not yet a failure: the key is held
+        # and settled by the shared re-read after the last conf row (`_settle_unverified_conf`).
+        # A FAILED row stores no fingerprint, so it stays red until the target really matches.
+        got = self.client.get("api/2.0/workspace-conf", params={"keys": key}) or {}
+        observed = got.get(key) if isinstance(got, dict) else None
+        if _conf_norm(observed) != _conf_norm(value):
+            self._conf_unverified[key] = value
+            return {"target_id": key, "note": f"{key} set to {safe_str(value)!r}"}
+        self._target_conf[key] = observed
+        return {"target_id": key,
+                "note": f"{key} set to {safe_str(value)!r} (verified by read-back)"}
+
+    def _settle_unverified_conf(self) -> None:
+        """Re-read every held conf key together until it matches or CONF_VERIFY_SECONDS pass, then
+        record each: verified, or failed (`not_applied`) with the value the target still reads."""
+        if not self._conf_unverified:
+            return
+        pending = dict(self._conf_unverified)
+        observed: dict = {}
+        self.log.info(f"workspace conf: {len(pending)} key(s) not visible right after the PATCH "
+                      f"({', '.join(sorted(pending))}) — re-reading every {CONF_POLL_SECONDS} s for "
+                      f"up to {CONF_VERIFY_SECONDS // 60} min")
+        deadline = _now() + CONF_VERIFY_SECONDS
+        waited = 0
+        while pending and _now() < deadline:
+            _sleep(CONF_POLL_SECONDS)
+            waited += CONF_POLL_SECONDS
+            try:
+                got = self.client.get("api/2.0/workspace-conf",
+                                      params={"keys": ",".join(sorted(pending))}) or {}
+            except Exception as exc:  # noqa: BLE001 — a failed re-read is retried until the deadline
+                self.log.warning("workspace-conf re-read failed", error=str(exc)[:200])
+                continue
+            for key in list(pending):
+                observed[key] = got.get(key) if isinstance(got, dict) else None
+                if _conf_norm(observed[key]) == _conf_norm(pending[key]):
+                    self._target_conf[key] = observed[key]
+                    self._release_conf(key, verified_after=waited)
+                    pending.pop(key)
+        for key, value in pending.items():
+            self._release_conf(key, failure=NotApplied(
+                f"`{key}` was set to {safe_str(value)!r} and the API returned 200, but the target "
+                f"still reads {safe_str(observed.get(key))!r} after {CONF_VERIFY_SECONDS // 60} min — "
+                f"this workspace ignores it through the API. Set it in the admin console, then "
+                f"re-run."))
+
+    def _release_conf(self, key: str, verified_after: int = 0, failure=None) -> None:
+        self._conf_unverified.pop(key, None)
+        held = self._conf_held.pop(key, None)
+        if held is None:
+            return
+        unit, status, kw = held
+        if failure is not None:
+            category, message = classify_error(failure)
+            super()._record(unit, ACTION_FAILED, target_id=kw.get("target_id", ""), note=message,
+                            error_raw=str(failure), category=category)
+            return
+        value = (unit.get("payload") or {}).get("value")
+        super()._record(unit, status, **{**kw, "note": f"{key} set to {safe_str(value)!r} "
+                                                       f"(verified by read-back after {verified_after} s)"})
+
+
+def _conf_norm(value) -> str:
+    """Workspace-conf values compare as strings: the GET returns `"true"`/`"30"` or `null` (V3)."""
+    return "" if value is None else safe_str(value).strip().lower()
 
 
 def _library_label(library) -> str:

@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from src.transform.transforms import fingerprint, strip_runtime
 from src.utils.helpers import (PLATFORM_INTERNAL_NOTE, folder_natural_key,
-                               is_platform_internal, safe_str)
+                               is_platform_internal, pipeline_not_creatable, safe_str)
 
 # migration_mode → default export_status (the fetcher/runner may override for content/skip).
 # `covered` = the object is the on-disk twin of an asset already exported via its NATIVE API
@@ -731,7 +731,11 @@ def _sql_units(records: list[dict]) -> list[dict]:
             else:
                 out.append(_make_unit("sql_warehouse", nk, sid, raw, mode="auto"))
         elif st == "legacy_query":
-            out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto"))
+            # PLAN 16.3 §4: the owner is read-only at create, so it travels OUTSIDE the payload and
+            # the fingerprint (`owner_user_name` is stripped) and is set by the importer after.
+            owner = safe_str(raw.get("owner_user_name"))
+            out.append(_make_unit("legacy_query", nk, sid, raw, mode="auto",
+                                  extra={"source_owner": owner} if owner else None))
         elif st == "legacy_alert":
             # Legacy alerts are MANUAL, like legacy dashboards (IMP-5). The v1 create API wants the
             # old flat `options{column,op,value}` shape, but the read API only returns the newer
@@ -767,7 +771,17 @@ def _dlt_units(records: list[dict]) -> list[dict]:
                                   note="handled by DAB redeploy (spec.deployment.kind=BUNDLE)"))
         else:
             spec = r.get("spec") if isinstance(r.get("spec"), dict) else {}
-            out.append(_make_unit("dlt_pipeline", name, pid, spec, mode="auto"))
+            # PLAN 16.3 §6: a pipeline with no source code (a synced table's) can't be recreated
+            # through the API → manual. The payload is kept as evidence; the fingerprint is unchanged.
+            not_creatable = pipeline_not_creatable(spec)
+            # PLAN 16.3 §5: who the pipeline RUNS AS on source (the LIST entry carries it; an SP
+            # shows as its applicationId) — outside the payload and the fingerprint.
+            raw = r.get("_raw") if isinstance(r.get("_raw"), dict) else {}
+            run_as = safe_str(raw.get("run_as_user_name"))
+            out.append(_make_unit("dlt_pipeline", name, pid, spec,
+                                  mode="manual" if not_creatable else "auto",
+                                  migratable=not not_creatable, note=not_creatable,
+                                  extra={"source_run_as": run_as} if run_as else None))
     return out
 
 

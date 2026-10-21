@@ -408,11 +408,14 @@ def test_run_resolution_prefers_an_explicit_run_id():
         assert resolve_import_run_id(cfg, "explicit_run") == ("explicit_run", "widget")
 
 
-def test_run_resolution_resumes_an_incomplete_import():
+def test_run_resolution_uses_the_pointer_even_with_an_incomplete_import():
+    """PLAN 16.3 §1: a blank run_id always means LATEST_EXPORT.json (no unfinished-import scan)."""
     with tempfile.TemporaryDirectory() as tmp:
         cfg, _ = _bundle(tmp, "20260101_000000", import_cp=True)
+        from src.exporters.bundle_state import write_latest_export_pointer
+        write_latest_export_pointer(cfg, "20260202_000000", {"tool_version": "0.1.0"}, {})
         run_id, how = resolve_import_run_id(cfg, "")
-        assert (run_id, how) == ("20260101_000000", "resume-incomplete-import")
+        assert (run_id, how) == ("20260202_000000", "LATEST_EXPORT.json")
 
 
 def test_run_resolution_ignores_a_finished_import_and_uses_the_pointer():

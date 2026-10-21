@@ -344,6 +344,8 @@ Findings are graded so you know what actually matters:
 | **Git repos** | Recreating a repo on the target requires a Git **PAT / credential**, so it is kept out of the utility's scope | Inventoried + exported as **metadata only** (url/provider/branch/path); recreate runbook; zero file bytes |
 | **Model serving (UC-backed)** | Points at a UC-registered model (out of scope) | Flagged **manual/conditional**; only external-model endpoints auto-migrate |
 | **Apps / Lakebase / Vector Search** | No v1 recreate path | **Inventory-only**, flagged manual |
+| **Synced-table pipelines** | Platform-created, no source code; belong to a UC/Lakebase synced table | **manual** — recreate the synced table on target; the platform recreates the pipeline |
+| **Lakeflow Connect pipelines** | Gateway + ingestion pipelines depend on a UC **connection** (out of scope); a database-connector ingestion pipeline also points at the source gateway id | Gateway: **manual** with a note naming the connection. Ingestion: attempted, fails without the connection → create the connection on target, recreate both in Lakeflow Connect |
 
 ### ❌ Out of scope entirely
 

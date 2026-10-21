@@ -30,7 +30,7 @@ dbutils.widgets.dropdown("connectivity_mode", "direct", ["airgap", "direct"],
                          "Connectivity mode")
 dbutils.widgets.text("source_workspace_id", "", "Source workspace id (identifies the bundle)")
 dbutils.widgets.text("staging_location", "", "Staging location (UC Volume /Volumes/...)")
-dbutils.widgets.text("run_id", "", "Run id (blank = resume, else LATEST_EXPORT.json)")
+dbutils.widgets.text("run_id", "", "Run id (blank = LATEST_EXPORT.json)")
 
 # Dry run FIRST. Flip to false only once the rehearsal reads clean.
 dbutils.widgets.dropdown("dry_run", "true", ["true", "false"],
@@ -137,8 +137,8 @@ from src.auth.token_manager import build_clients
 from src.config.config_manager import ROLE_TARGET, STAGE_IMPORT, Config
 from src.exporters import bundle_paths as BP
 from src.exporters.artifact_writer import ArtifactWriter, read_json_or_empty
-from src.importers.import_runner import (RUN_STATUS_STATE_NOT_SAVED, ImportRunner,
-                                         resolve_import_run_id)
+from src.importers.import_runner import (RUN_STATUS_NO_REPORT, RUN_STATUS_STATE_NOT_SAVED,
+                                         ImportRunner, resolve_import_run_id)
 from src.state.sql_backend import build_sql_backend
 from src.state.state_store import StateStore
 from src.utils import logger as _logger
@@ -150,8 +150,9 @@ _say(f"repo root on sys.path: {_REPO_ROOT}")
 # COMMAND ----------
 
 # MAGIC %md ## Config + which bundle to import
-# MAGIC Precedence: explicit `run_id` → resume an incomplete import → `LATEST_EXPORT.json` → fail
-# MAGIC loudly. A run_id is never invented: that would import an empty bundle and report a
+# MAGIC Precedence: explicit `run_id` → `LATEST_EXPORT.json` → fail loudly. An import that crashed in
+# MAGIC the latest export's folder is still continued (its checkpoint + the state table skip the work
+# MAGIC already done). A run_id is never invented: that would import an empty bundle and report a
 # MAGIC spuriously clean run.
 
 # COMMAND ----------
@@ -377,12 +378,18 @@ _say(_logger.FULL_LOG_HINT)
 
 # COMMAND ----------
 
-# MAGIC %md ## Fail the job if the migration state was not saved
+# MAGIC %md ## Fail the job if the migration state or a report was not saved
 # MAGIC Every phase ran, but the final MERGE into the state table failed: the target WAS changed and
 # MAGIC the source→target id map was not persisted. The job must go red; the next run's recovery
-# MAGIC replay re-merges the rows from the checkpoint once the state table is fixed.
+# MAGIC replay re-merges the rows from the checkpoint once the state table is fixed. Likewise when an
+# MAGIC import report did not land (`completed_no_report`): re-run with the same run_id to rewrite it.
 
 # COMMAND ----------
+
+# PLAN 16.3 §1: the run's folder again at the very END of the output (above any red-task raise), so
+# the operator does not have to scroll back to the header for it.
+_say(f"Run id : {cfg.run_id}")
+_say(f"Folder : {cfg.output_path.rstrip('/')}/   (reports/ = the xlsx, misc/ = the JSON + logs)")
 
 if result.get("run_status") == RUN_STATUS_STATE_NOT_SAVED:
     raise RuntimeError(
@@ -390,3 +397,10 @@ if result.get("run_status") == RUN_STATUS_STATE_NOT_SAVED:
         f"{RUN_STATUS_STATE_NOT_SAVED}). The target was changed; the source→target id map is in the "
         "checkpoint only. Fix the state table (permissions / cluster), then re-run — the recovery "
         "replay re-merges the rows. See the driver log (stderr) for the flush error.")
+if result.get("run_status") == RUN_STATUS_NO_REPORT:
+    _missing = ", ".join(e.get("path", "?") for e in (result.get("reports") or {}).get("errors", []))
+    raise RuntimeError(
+        f"Import finished but a report was NOT written (run_status={RUN_STATUS_NO_REPORT}"
+        + (f"; missing: {_missing}" if _missing else "") + "). The target WAS changed and the "
+        f"state WAS saved; re-run the import with run_id={cfg.run_id} to rewrite the reports. See "
+        "the ERROR line above for the cause.")

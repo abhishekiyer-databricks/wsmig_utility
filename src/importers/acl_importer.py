@@ -208,6 +208,9 @@ class AclImporter(BaseImporter):
         if perm_type == "secret-scope":
             return self._apply_secret_acls(object_key, grants)
 
+        if perm_type == "pipelines":
+            return self._apply_pipeline_acl(object_key, target_id, grants)
+
         body = self._acl_body(grants)
         if not body["access_control_list"]:
             return {"target_id": target_id,
@@ -215,11 +218,35 @@ class AclImporter(BaseImporter):
                              "`admins` grant, so there is no explicit ACL to apply — target access "
                              "already matches by construction")}
 
-        self.client.put(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+        if perm_type == "sql/warehouses" and self._ownerless_warehouse(body, target_id):
+            # A full-replace PUT on a warehouse with no owner is refused ("PUT requests for
+            # warehouse … with no existing owner must provide a new owner", live 2026-10-19 — the
+            # platform-created Serverless Starter Warehouse). Neither side has an owner, so the
+            # grants are ADDED instead: no owner is invented and nothing is taken away.
+            self.client.patch(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+            note = (f"{len(body['access_control_list'])} explicit grant(s) added — the warehouse "
+                    f"has no owner on source or target, so the grants were added rather than "
+                    f"replacing its ACL")
+        else:
+            self.client.put(f"api/2.0/permissions/{perm_type}/{target_id}", body)
+            note = f"{len(body['access_control_list'])} explicit grant(s) applied"
         self._applied.append({"perm_type": perm_type, "target_id": target_id,
                               "object_natural_key": object_key, "grants": grants})
-        return {"target_id": target_id,
-                "note": f"{len(body['access_control_list'])} explicit grant(s) applied"}
+        return {"target_id": target_id, "note": note}
+
+    def _ownerless_warehouse(self, body: dict, target_id: str) -> bool:
+        """Whether neither the PUT body nor the target warehouse names an IS_OWNER. Only read when
+        the body has no owner; an unreadable target ACL keeps the 1.1.x PUT (its error surfaces)."""
+        if any(e.get("permission_level") == "IS_OWNER" for e in body["access_control_list"]):
+            return False
+        try:
+            doc = self.client.get(f"api/2.0/permissions/sql/warehouses/{target_id}") or {}
+        except Exception as exc:  # noqa: BLE001 — fall back to the PUT
+            self.log.warning("warehouse ACL read failed", target_id=target_id, error=str(exc)[:200])
+            return False
+        return not any(p.get("permission_level") == "IS_OWNER" and not p.get("inherited")
+                       for a in doc.get("access_control_list") or []
+                       for p in a.get("all_permissions") or [])
 
     def update_one(self, unit: dict, target_id: str) -> dict:
         """`PUT permissions` is already declarative — an update IS the same call."""
@@ -258,6 +285,76 @@ class AclImporter(BaseImporter):
             for level in sorted(levels):
                 acl.append({field: principal, "permission_level": level})
         return {"access_control_list": acl}
+
+    # ── pipelines: never change the owner (PLAN 16.3 §5, CUST-1) ─────────
+    def _current_pipeline_owner(self, target_id: str) -> tuple:
+        """`(principal, principal_type)` of the target pipeline's non-inherited IS_OWNER. Raises
+        when it cannot be read or there is none — the tool never guesses an owner."""
+        try:
+            doc = self.client.get(f"api/2.0/permissions/pipelines/{target_id}") or {}
+        except Exception as exc:  # noqa: BLE001 — becomes this unit's FAILED reason
+            raise RuntimeError(
+                f"could not read the pipeline's current owner (GET permissions/pipelines/"
+                f"{target_id}), so its ACL was NOT applied — a pipeline PUT must name the current "
+                f"owner and the tool never guesses one: {str(exc)[:300]}") from exc
+        for entry in doc.get("access_control_list") or []:
+            if not isinstance(entry, dict):
+                continue
+            if any(isinstance(p, dict) and not p.get("inherited")
+                   and safe_str(p.get("permission_level")) == "IS_OWNER"
+                   for p in entry.get("all_permissions") or []):
+                for field, ptype in (("user_name", "user"),
+                                     ("service_principal_name", "service_principal"),
+                                     ("group_name", "group")):
+                    if safe_str(entry.get(field)):
+                        return safe_str(entry[field]), ptype
+        raise RuntimeError(
+            f"the target pipeline {target_id} reports no IS_OWNER, so its ACL was NOT applied — a "
+            f"pipeline PUT must name the current owner and the tool never guesses one")
+
+    def _source_pipeline_owner(self, grants: list) -> tuple:
+        """`(target principal, principal_type)` of the SOURCE's explicit IS_OWNER, remapped."""
+        for grant in grants or []:
+            if (isinstance(grant, dict) and not grant.get("inherited")
+                    and safe_str(grant.get("permission_level")) == "IS_OWNER"):
+                ptype = safe_str(grant.get("principal_type"))
+                return self._remap_principal(safe_str(grant.get("principal")), ptype), ptype
+        return "", ""
+
+    def _pipeline_acl_body(self, grants: list, owner: tuple) -> tuple:
+        """The PUT body for a pipeline: the source grants with the source IS_OWNER dropped, IS_OWNER =
+        the CURRENT target owner, and the source owner (when different) given CAN_MANAGE (D1).
+        Returns `(body, source_owner)` — source_owner is "" when no substitution was needed."""
+        src_owner, src_ptype = self._source_pipeline_owner(grants)
+        body = self._acl_body(grants)
+        field = {"user": "user_name", "group": "group_name",
+                 "service_principal": "service_principal_name"}
+        acl = [e for e in body["access_control_list"] if e.get("permission_level") != "IS_OWNER"]
+        cur, cur_ptype = owner
+        acl.insert(0, {field[cur_ptype]: cur, "permission_level": "IS_OWNER"})
+        moved = bool(src_owner) and src_owner != cur
+        if moved:
+            src_field = field.get(src_ptype) or self._guess_principal_field(src_owner)
+            if not any(e.get(src_field) == src_owner and e.get("permission_level") == "CAN_MANAGE"
+                       for e in acl):
+                acl.append({src_field: src_owner, "permission_level": "CAN_MANAGE"})
+        return {"access_control_list": acl}, (src_owner if moved else "")
+
+    def _apply_pipeline_acl(self, object_key: str, target_id: str, grants: list) -> dict:
+        """A pipeline's `PUT permissions` must name exactly ONE owner (V5), and on a UC pipeline any
+        IS_OWNER other than the current one is an owner CHANGE that only a metastore admin may make —
+        a 403 that cost the object EVERY grant (CUST-1). So the current owner is kept and the source
+        owner gets CAN_MANAGE; the rest of the source ACL travels verbatim, in ONE PUT."""
+        owner = self._current_pipeline_owner(target_id)
+        body, src_owner = self._pipeline_acl_body(grants, owner)
+        self.client.put(f"api/2.0/permissions/pipelines/{target_id}", body)
+        self._applied.append({"perm_type": "pipelines", "target_id": target_id,
+                              "object_natural_key": object_key, "grants": grants})
+        note = f"{len(body['access_control_list'])} explicit grant(s) applied"
+        if src_owner:
+            note += (f"; owner kept as `{owner[0]}` (a pipeline owner change needs a metastore "
+                     f"admin); source owner `{src_owner}` given CAN_MANAGE")
+        return {"target_id": target_id, "note": note}
 
     def _apply_secret_acls(self, scope: str, grants: list) -> dict:
         """Apply a secret scope's ACLs via `secrets/acls/put` — one call PER PRINCIPAL.
@@ -631,6 +728,11 @@ class AclImporter(BaseImporter):
                                 "detail": f"could not re-read the ACL: {str(exc)[:160]}"})
                 continue
             actual = self._normalise_from_api(doc.get("access_control_list") or [])
+            known_gap = ""
+            if perm_type == "pipelines":
+                expected, actual, known_gap = self._pipeline_parity(expected, actual)
+            elif perm_type == "queries":
+                actual = self._query_parity(expected, actual, target_id)
 
             expected_set, actual_set = set(expected), set(actual)
             missing = sorted(expected_set - actual_set)
@@ -645,13 +747,16 @@ class AclImporter(BaseImporter):
             else:
                 verdict = "extra_on_target"
             counts[verdict] = counts.get(verdict, 0) + 1
-            objects.append({
+            obj = {
                 "perm_object_type": perm_type, "target_id": target_id,
                 "object": applied["object_natural_key"], "verdict": verdict,
                 "missing_on_target": [list(m) for m in missing],
                 "extra_on_target": [list(e) for e in extra],
                 "present": [list(p) for p in present],
-            })
+            }
+            if known_gap:
+                obj["known_gap"] = obj["detail"] = known_gap
+            objects.append(obj)
 
         report = {
             "run_id": self.config.run_id,
@@ -671,6 +776,49 @@ class AclImporter(BaseImporter):
         self.context["acl_parity"] = report
         self.log.info("acl parity report", **counts)
         return report
+
+    @staticmethod
+    def _pipeline_parity(expected: list, actual: list) -> tuple:
+        """Parity for a pipeline whose owner was KEPT (§5): the source IS_OWNER reads as CAN_MANAGE
+        and the target's own IS_OWNER is left out — the accepted difference (verdict `match` +
+        `known_gap`). A pipeline whose target owner already IS the source owner compares exactly.
+        Returns `(expected, actual, known_gap)`."""
+        src_owner = next((p for p, lvl in expected if lvl == "IS_OWNER"), "")
+        kept = next((p for p, lvl in actual if lvl == "IS_OWNER"), "")
+        if not src_owner or not kept or kept == src_owner:
+            return expected, actual, ""
+        expected = sorted({(p, "CAN_MANAGE" if lvl == "IS_OWNER" else lvl) for p, lvl in expected})
+        actual = [a for a in actual if a[1] != "IS_OWNER"]
+        return expected, actual, "owner kept on target (needs a metastore admin)"
+
+    def _query_parity(self, expected: list, actual: list, target_id: str) -> list:
+        """Drop the query OWNER's own explicit `CAN_MANAGE` from the target side when the source
+        doesn't list it (QA16.3-1). Changing a query's owner makes the platform ADD an explicit
+        `CAN_MANAGE` for the new owner, while a creator-owner has none (verified live on both
+        workspaces 2026-10-15). The owner manages the query either way, so this is no difference
+        in access — without this every creator-owned query reads `extra_on_target` on every run.
+        Any other extra grant is still reported."""
+        owner = self._query_target_owner(target_id)
+        line = (owner, "CAN_MANAGE")
+        if owner and line in actual and line not in expected:
+            return [a for a in actual if a != line]
+        return actual
+
+    def _query_target_owner(self, target_id: str) -> str:
+        """The target query's owner, from the SQL importer's LIST this run (shared context), or one
+        LIST here when the SQL phase didn't run this session. "" when unknown."""
+        owners = self.context.get("legacy_query_target_owners")
+        if owners is None:
+            try:
+                queries = self.client.get_paginated("api/2.0/sql/queries", "results",
+                                                    params={"page_size": 100})
+                owners = {safe_str(q.get("id")): safe_str(q.get("owner_user_name"))
+                          for q in queries if q.get("id")}
+            except Exception as exc:  # noqa: BLE001 — parity then compares the raw lists, as 1.1
+                self.log.debug(f"ACL parity: could not list query owners ({str(exc)[:160]})")
+                owners = {}
+            self.context["legacy_query_target_owners"] = owners
+        return safe_str(owners.get(target_id))
 
     # ── normalisation (both sides, identically) ───────────────────────────
     def _normalise_grants(self, grants: list, remap: bool) -> list:
