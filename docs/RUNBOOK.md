@@ -276,6 +276,23 @@ Fix the cause, then re-run only the outstanding units.
 > through the API, or take longer than 3 minutes to show it, **a workspace admin should check the
 > migrated settings in the admin console after the migration.**
 >
+> **The settings the tool covers** (only these nine are read on the source and set on the target):
+>
+> | API key | What it controls |
+> |---|---|
+> | `enableTokensConfig` | Personal access tokens on / off |
+> | `maxTokenLifetimeDays` | Maximum lifetime of new personal access tokens |
+> | `enableIpAccessLists` | The IP access list feature on / off (the lists themselves are account-level and not migrated) |
+> | `enableExportNotebook` | Notebook export |
+> | `enableResultsDownloading` | Downloading notebook results |
+> | `enableWebTerminal` | Web terminal |
+> | `enableDbfsFileBrowser` | DBFS file browser |
+> | `enableUploadDataUis` | The upload-data UI |
+> | `storeInteractiveNotebookResultsInCustomerAccount` | Storing notebook results in the customer's account storage |
+>
+> **Every other admin-console setting is not migrated** (for example `enableNotebookTableClipboard`). An
+> admin compares those by hand and sets them on the target.
+>
 > **A setting that is `failed` / `not_applied`** ("… the API returned 200, but the target still reads
 > … after 3 min"): the target did not take that key through the API. Set it by hand in the **admin
 > console**, then re-run — the row turns green once the target really holds the source value.

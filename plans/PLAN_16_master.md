@@ -73,12 +73,13 @@ UC lives in the region metastore and SURVIVES a target rebuild → one **state s
 | **16.4** Dashboards + catalog rename | B7 remainder (publish + schedules + subscriptions shipped in 16.2): notification-destination migration, atomic row. B13 `catalog_mapping_json` for dashboards, Genie, DLT. | B7 `DashboardsCollector._published_state`/`_schedules`, `DashboardsImporter._reconcile_publish_and_schedules`/`_get_published`/`_reconcile_schedules`/subscriptions, `asset_export._lakeview_units` facets (fix: only 404 = draft; update an edited schedule). B13 `helpers.parse_catalog_mapping`, DLT `catalog` remap (note, not warning). **Redo** `remap_catalog_refs` — rewrite only inside dataset `queryLines` / Genie table identifiers. |
 | **16.5** Performance (B6 + PLAN_15) | `parallel_threads` (default 1 = `main`): parallel inventory ACL enrichment; parallel workspace existence probe (same live probe); import parallel within dependency sub-levels with the main thread recording; id maps built once per sub-level; identity/misc serial; jobs topo-ordered by `run_job_task`. | `BaseCollector.map_parallel`, `WorkspaceCollector.enrich` (report fetch failures). Installer/job `parallel_threads` param plumbing. **Redo** the import-side `_run_parallel`. |
 | **16.6** Incremental by metadata | Notebooks/files: change detection by source `modified_at` (no content hash), stored in state `source_modified_at`, compared at export to skip downloads (direct mode, LIVE state table); missing `modified_at` = changed; one-time transition for `main`-written rows; live existence probe kept; default off until signed off. | `workspace_collector` `modified_at` capture; `asset_export._workspace_units` `fingerprint_extra`; `ExportRunner._unchanged_in_state` concept (fix: live table, success + target-id check). |
-| **16.7** Cutover: resume schedules (user 2026-10-05, take up later) | Import runs pause every migrated schedule (`pause_job_schedules=true`, default — jobs and, from 16.2, dashboard schedules), and nothing un-pauses them: re-running with `pause_job_schedules=false` does NOT help (unchanged fingerprint → SKIP). Add a cutover option on the import job (e.g. `resume_schedules=true`, or a packaged `wsmig - cutover` job) that touches ONLY schedules: every job schedule/continuous/trigger and every dashboard schedule the tool paused is set back to the SOURCE's pause status from the bundle (UNPAUSED only where the source was UNPAUSED); nothing else is imported; result rows + report sheet; dry-run supported. Works on `main`-written state (jobs). | — (new) |
 
 ## Backlog after 16.3 (moved out of 16.3 by the user 2026-10-09; not scheduled)
 - **16.4** dashboards + catalog rename (row above) — needs live API checks first (destination secrets) + a user decision on re-pushing already-migrated objects for a catalog rename.
-- **B8** best-effort re-sweep of home-content `prerequisite_missing` units before the ACL phase (+ the optional optimistic home write gate).
-- **B1** source run-as SP for the airgap source job · **B12** widget labels · **W0-6** workspace-conf coverage, REPORT ONLY · **W0-7** no-op creates labelled `skipped`.
+- **W0-6** workspace-conf coverage — DOCUMENTATION ONLY (user 2026-10-21): list the keys the tool covers in the RUNBOOK best-effort note; no code. **DONE 2026-10-21.**
+- **W0-7** no-op creates labelled `skipped`.
+- "Updated with a warning" is labelled `Created (warning)` (found in the 16.3 upgrade test; same on `main`).
+- **Removed by the user 2026-10-21 (not needed):** B8 home-content re-sweep, B1 airgap source run-as SP, B12 widget labels, and 16.7 cutover / resume schedules.
 - **QA16.2-2…4** (below). (QA16.2-1 moved INTO 16.3 as §7b by the user 2026-10-12, after the customer's 6 Genie failures.)
 - The wider **B4** audit: read-back for the other mutating calls (global init scripts, permission assignments, SCIM entitlements/members, ACL PUT, update calls).
 
@@ -204,6 +205,5 @@ classic compute, golden diff, per-wave stop). Fixtures: reuse `tests/fixtures_fv
 
 ## Open decisions (asked in the relevant sub-plan)
 - 16.3: D1–D6 in `PLAN_16_3_customer_fixes.md` §12 (CUST-1 source owner CAN_MANAGE, new-run folder, conf re-check, reinstall for run-id folders, CUST-2 coverage, one-time alert update).
-- Backlog (B8): adopt the optimistic home write if the ownership check passes?
 - 16.6: upgrade transition (recommended) vs one full re-upload; `incremental_export` default after sign-off.
 - CUST-1 / CUST-2: scheduled in 16.3 (user 2026-10-09); CUST-1 = keep target owner (PLAN_16_3 §5, rewritten 2026-10-12).
