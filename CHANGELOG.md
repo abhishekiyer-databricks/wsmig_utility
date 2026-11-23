@@ -10,6 +10,57 @@ bundle's `manifest.json`, `export_index.json`, and the migration state table.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-23
+
+Hotfix (PLAN 16.3.1). Import side only: no state-schema, fingerprint, natural-key, bundle or job-template change, so
+existing 1.2.0 bundles import as they are (no re-inventory, no re-export, no source-side upgrade in `airgap` mode).
+
+### Upgrade notes (from 1.2.0)
+- **Pull into the existing Git folder — no reinstall.**
+- **Homes:** run the import job once with `retry_mode=failed_only`, `dry_run=false` and the **same `run_id`**. The
+  user / SP homes 1.2.0 left `prerequisite_missing` are created, and their notebooks, files, folders, queries,
+  dashboards and Genie spaces land with their permissions, in that one run. Home rows then read `created`.
+- **Identities:** nothing is removed. Identity rows 1.2.0 recorded as `created` / `adopted` are skipped while the
+  source is unchanged (no surprise writes). Identities 1.2.0 assigned directly although the source only had them via
+  a group stay assigned; when such a row is next updated or adopted it carries the note *directly assigned on
+  target, nested only on source … left unchanged*. To clean them up, see RUNBOOK → Nested identities; 1.2.1
+  re-runs keep the cleanup (1.2.0 re-assigned them).
+
+### Fixed
+- **User homes are created by the tool** (ES-2364565). Since 2026-11-12 a home appears only on the owner's
+  sign-in or a workspace admin's `mkdirs`, so content under owners who never sign in on the target stayed
+  `prerequisite_missing` forever. The import now creates each missing home (`mkdirs` as the workspace-admin run-as),
+  at most once per owner per pass, and reads it back. A refusal is a `prerequisite_missing` row quoting the server:
+  `DIRECTORY_PROTECTED` → "the owner is not assigned to the target workspace"; anything else → "confirm the run-as
+  identity is a workspace admin". Owners deleted in source still go to `/Users_Backup` (decided before any
+  `mkdirs`). Dry runs and the existence check never create anything.
+- **Service principal homes** (latent bug): every account SP is in `sp_mapping` as `appId → appId`, which the tool
+  read as "recreated SP, home auto-provisioned", so it never checked or created an account SP's home and reported
+  it as provisioned. Only an SP mapped to a *different* applicationId is treated as recreated now; its new home
+  `/Users/<newAppId>` is checked and created the same way.
+- **Nested identities stay nested.** An account group, SP or user that the source had only as a member of an
+  assigned group (`workspace_permissions == []`) was assigned directly on the target (`[]` became `USER`, and a
+  workspace-SCIM POST of a user/SP is itself a direct assignment) — and re-assigned on every re-run. 1.2.1 never
+  assigns or POSTs it: it waits (up to 5 min, one SCIM list per kind every 10 s) until the identity is visible
+  through its parent, then applies its entitlements. No parent on the target → `prerequisite_missing` naming the
+  parents and their outcome, never a direct assignment. Unknown (`None`, pre-Plan-6 bundles) keeps the `USER`
+  fallback; workspace-local and system groups are unchanged.
+- **Identities already on the target get their entitlements** (adopt path). 1.2.0 only recorded `adopted` — the
+  likely cause of "group A's Workspace access was not copied". An identity direct on the source but visible on the
+  target only through a group is now also assigned directly.
+
+### Added
+- **Verified entitlements in the report.** Every entitlement / role write is GET → PATCH only the missing values →
+  GET. The Users, Service Principals and Groups sheets gain **Entitlements copied**, **Already present**,
+  **Entitlements failed** and **Assignment** (`direct` / `via group (…)` / `direct on target (pre-existing); nested
+  on source`). An entitlement that is refused or does not read back fails the row (`not_applied`, server message
+  kept), so `retry_mode=failed_only` retries it — 1.2.0 logged a warning that never reached the report. No extra
+  call for identities with no direct entitlements.
+
+### Docs
+- RUNBOOK: homes created by the tool + the two home failure rows; new **Nested identities** section (direct vs via
+  group, the DB3 note, safe manual cleanup); job `run_as` SPs need the Service Principal User role.
+
 ## [1.2.0] - 2026-10-13
 
 Customer fixes, wave 2 (PLAN 16.3). No state-schema change; the only fingerprint change is Alert V2 (below).

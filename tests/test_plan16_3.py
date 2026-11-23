@@ -574,9 +574,11 @@ def test_fingerprint_stability_every_type_but_alert_v2_matches_1_1_1():
 # ═══════════════════════════════ §7 confirm-then-label ═══════════════════════════════
 
 _TABLE_ERR = "INVALID_PARAMETER_VALUE: Table 'cat.schema.tbl' does not exist"
+# PLAN 16.3.1: the home itself is present here (only the sub-folder is missing), so the message no
+# longer claims "a user home is created on first login" — homes are created by mkdirs now.
 _FOLDER_MSG = ("`{nk}` targets workspace folder `{parent}`, which does not exist on target yet — "
-               "provision/assign its owner (a user home is created on first login) or import the "
-               "folder's content family first, then re-run with retry_mode=failed_only.")
+               "import the folder's content family (workspace) first, then re-run with "
+               "retry_mode=failed_only.")
 
 
 TEAM = f"{HOME}/team"     # a sub-folder, so the probe of the EXACT parent is told apart from the

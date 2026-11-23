@@ -106,6 +106,19 @@ _ASSET_TYPE_TO_CARD = {
 }
 
 
+# The identity tabs that carry the PLAN 16.3.1 entitlement + assignment columns.
+_IDENTITY_CARDS = ("users", "service_principals", "groups")
+
+
+def _entitlements_copied_cell(row: dict) -> str:
+    """"Entitlements copied": the verified values; in a dry run, what a live run would copy."""
+    copied = safe_str(row.get("entitlements_copied"))
+    if copied:
+        return copied
+    would = safe_str(row.get("entitlements_would_copy"))
+    return f"(dry run) would copy: {would}" if would and row.get("dry_run") else ""
+
+
 def _card_for_asset_type(asset_type: str) -> str:
     return _ASSET_TYPE_TO_CARD.get(safe_str(asset_type), safe_str(asset_type) or "other")
 
@@ -475,6 +488,15 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             ("Target Id", "target_id", 24), ("Source Id", "source_id", 22),
             ("Failure Category", "failure_category", 20), ("Note / reason", "note", 70),
             ("Actual server error", "error_raw", 80)]
+    # PLAN 16.3.1 DB5 + Part B: the identity tabs also show, per identity, which entitlements were
+    # copied (verified by a GET) / already present / failed, and how it is in the workspace.
+    # Inserted right after "Note / reason"; every other tab keeps exactly the columns above.
+    _note_at = [c[1] for c in cols].index("note") + 1
+    identity_cols = (cols[:_note_at] + [
+        ("Entitlements copied", "_entitlements_copied", 34),
+        ("Already present", "entitlements_present", 30),
+        ("Entitlements failed", "entitlements_failed", 44),
+        ("Assignment", "assignment", 34)] + cols[_note_at:])
 
     by_card: dict[str, list] = {}
     for x in rows:
@@ -513,7 +535,8 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
         sheet_name = _re.sub(r"[\\/?*\[\]:]", "-", label)[:31]
         sheet = wb.create_sheet(sheet_name)
         sheet.sheet_view.showGridLines = False
-        for col, (h, _k, w) in enumerate(cols, 1):
+        sheet_cols = identity_cols if card in _IDENTITY_CARDS else cols
+        for col, (h, _k, w) in enumerate(sheet_cols, 1):
             cc = sheet.cell(row=1, column=col, value=h)
             cc.font = font(bold=True, color="FFFFFF", size=10)
             cc.fill = fill("1E3A5F")
@@ -522,8 +545,10 @@ def _render_xlsx(local_path: str, config, summary: dict, rows: list[dict],
             sheet.column_dimensions[get_column_letter(col)].width = w
         for i, x in enumerate(by_card[card], start=2):
             _label, colour = _status_label(x)
-            for col, (_h, key, _w) in enumerate(cols, 1):
-                cc = sheet.cell(row=i, column=col, value=safe_str(x.get(key)))
+            for col, (_h, key, _w) in enumerate(sheet_cols, 1):
+                value = (_entitlements_copied_cell(x) if key == "_entitlements_copied"
+                         else safe_str(x.get(key)))
+                cc = sheet.cell(row=i, column=col, value=value)
                 cc.border = box
                 cc.font = font(size=9)
                 cc.alignment = left_wrap

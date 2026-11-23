@@ -39,11 +39,17 @@ def _same_path(actual: str, wanted: str) -> bool:
 class RecordingClient:
     """Records every call; answers GETs from a table; mints ids on POST."""
 
-    def __init__(self, get_table=None, paginated=None, fail_paths=None, status_paths=None):
+    def __init__(self, get_table=None, paginated=None, fail_paths=None, status_paths=None,
+                 mkdirs_creates=False, mkdirs_errors=None):
         self.get_table = get_table or {}
         self.paginated = paginated or {}
         self.fail_paths = set(fail_paths or ())
         self.status_paths = set(status_paths or ())   # workspace paths that "exist"
+        # PLAN 16.3.1: model the real mkdirs — opt-in so every older test keeps its exact calls.
+        #   mkdirs_creates → a successful mkdirs makes the path exist (the read-back sees it)
+        #   mkdirs_errors  → {path: server error} the platform raises for that mkdirs (P3/P6)
+        self.mkdirs_creates = mkdirs_creates
+        self.mkdirs_errors = dict(mkdirs_errors or {})
         self.calls: list[tuple] = []
         self._n = 0
 
@@ -78,6 +84,12 @@ class RecordingClient:
         self.calls.append(("POST", path, body))
         if path in self.fail_paths:
             raise RuntimeError("INVALID_PARAMETER_VALUE: rejected")
+        if path == "api/2.0/workspace/mkdirs":
+            target = (body or {}).get("path")
+            if target in self.mkdirs_errors:
+                raise RuntimeError(self.mkdirs_errors[target])
+            if self.mkdirs_creates:
+                self.status_paths.add(target)
         # Track force-started clusters so a later clusters/get returns RUNNING (see get()).
         if path == "api/2.0/clusters/start":
             self._started_clusters = getattr(self, "_started_clusters", set())
@@ -312,19 +324,38 @@ def test_instance_pool_update_sends_the_full_config_with_the_id():
 
 # ═══════════════════════════════ WORKSPACE ══════════════════════════════════
 
-def test_a_user_home_directory_is_reported_as_a_prerequisite_not_mkdird():
-    """`/Users/<email>` appears only when the USER is provisioned — that's why identity is phase 1."""
+_DIR_PROTECTED = ("400 Client Error: DIRECTORY_PROTECTED: Folder Users is protected")
+
+
+def test_an_absent_user_home_directory_is_created_with_mkdirs():
+    """PLAN 16.3.1 Part A (updated from `…_is_reported_as_a_prerequisite_not_mkdird`): since
+    2026-11-12 a home appears only on sign-in or an admin mkdirs, so the run-as admin creates it
+    (P1) — once, read back — and the row is `created` with the provisioned note."""
     assert is_user_home("/Users/a@b.com")
     assert not is_user_home("/Users/a@b.com/sub")
-    client = RecordingClient()
+    client = RecordingClient(mkdirs_creates=True)
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", "/Users/missing@corp.com", {"path": "/Users/missing@corp.com"})], client)
     res = imp.run()
-    assert client.posts_to("workspace/mkdirs") == [], "a home directory must never be mkdir'd"
+    assert [b["path"] for b in client.bodies_to("workspace/mkdirs")] == ["/Users/missing@corp.com"]
+    assert res.created == 1 and res.failed == 0
+    row = st.row("directory", "/Users/missing@corp.com")
+    assert row["last_action"] == "created"
+    assert "home created by the migration" in res.units[0]["note"]
+
+
+def test_a_user_home_the_platform_refuses_is_a_prerequisite_naming_the_reason():
+    """PLAN 16.3.1 (the DIRECTORY_PROTECTED half of the old test): an owner not assigned on target
+    is refused by the platform (P3) → prerequisite_missing carrying the server's own text."""
+    client = RecordingClient(mkdirs_errors={"/Users/missing@corp.com": _DIR_PROTECTED})
+    imp, st = _make(WorkspaceImporter, [
+        _unit("directory", "/Users/missing@corp.com", {"path": "/Users/missing@corp.com"})], client)
+    res = imp.run()
     assert res.failed == 1
     row = st.row("directory", "/Users/missing@corp.com")
     assert row["failure_category"] == "prerequisite_missing"
-    assert "provisioned" in row["last_error"]
+    assert "not assigned to the target workspace" in row["last_error"]
+    assert "DIRECTORY_PROTECTED" in row["last_error"]
 
 
 _OLD_APP = "9e15fb97-bd21-4abc-9def-0123456789ab"
@@ -334,10 +365,11 @@ _NEW_APP = "11112222-3333-4444-5555-666677778888"
 def test_sp_home_content_is_remapped_to_the_new_application_id():
     """IMP-6: a recreated SP gets a NEW applicationId, so its home `/Users/<oldAppId>/...` must be
     rewritten to `/Users/<newAppId>/...` — otherwise content lands in a directory that can never
-    exist (the two failed dirs). The home ROOT is a skip (auto-provisioned at SP create); content
-    beneath it is created/uploaded at the remapped path."""
+    exist (the two failed dirs). PLAN 16.3.1 (P10): the NEW home is NOT auto-provisioned at SP
+    create, so it is checked and created with mkdirs; content beneath it lands at the remapped
+    path."""
     idmap = {"sp_mapping": {_OLD_APP: _NEW_APP}}
-    client = RecordingClient()
+    client = RecordingClient(mkdirs_creates=True)
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"}),
         _unit("directory", f"/Users/{_OLD_APP}/proj", {"path": f"/Users/{_OLD_APP}/proj"}),
@@ -347,9 +379,10 @@ def test_sp_home_content_is_remapped_to_the_new_application_id():
     ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map=idmap)
     res = imp.run()
     assert res.failed == 0, "nothing should fail once the SP home is remapped"
-    # home root: skipped (auto-provisioned), not mkdir'd
+    # home root: the NEW-appId home is created (once); the OLD one is never mkdir'd
     mkdirs = [b["path"] for b in client.bodies_to("workspace/mkdirs")]
     assert f"/Users/{_OLD_APP}" not in mkdirs, "the OLD-appId home root must never be mkdir'd"
+    assert mkdirs.count(f"/Users/{_NEW_APP}") == 1, "the NEW home is created exactly once"
     assert f"/Users/{_NEW_APP}/proj" in mkdirs, "content dir must be created under the NEW appId"
     # notebook uploaded to the remapped path
     nb = client.bodies_to("workspace/import")[0]
@@ -359,25 +392,28 @@ def test_sp_home_content_is_remapped_to_the_new_application_id():
 
 
 def test_an_unmigrated_sp_home_is_a_clear_prerequisite_not_a_bare_failure():
-    """IMP-6: an SP home whose applicationId is NOT in the identity map (the SP was never migrated)
-    can't be created — say so plainly, distinct from a user-home prerequisite."""
-    client = RecordingClient()
+    """IMP-6 + PLAN 16.3.1: an SP that is NOT on the target (never migrated / not assigned) has its
+    home mkdirs REFUSED by the platform (P3) — say so plainly, naming the SP, with the server text."""
+    client = RecordingClient(mkdirs_errors={f"/Users/{_OLD_APP}": _DIR_PROTECTED})
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client,
         identity_map={"sp_mapping": {}})
     res = imp.run()
-    assert client.posts_to("workspace/mkdirs") == []
+    assert len(client.posts_to("workspace/mkdirs")) == 1, "one attempt, refused"
     assert res.failed == 1
     row = st.row("directory", f"/Users/{_OLD_APP}")
     assert row["failure_category"] == "prerequisite_missing"
-    assert "SERVICE PRINCIPAL home" in row["last_error"]
+    assert f"home of service principal `{_OLD_APP}`" in row["last_error"]
+    assert "not assigned to the target workspace" in row["last_error"]
 
 
 def test_content_under_an_absent_user_home_is_a_clean_prerequisite_not_a_raw_error():
     """PLAN 8 Bug 8/14: a subdir/notebook under a user home whose owner is ABSENT on target must be
     ONE clean prerequisite_missing per unit — not the raw DIRECTORY_PROTECTED / parent-missing
     api_error per descendant that swamped the RIL failure list (≈264 of 297 failures)."""
-    client = RecordingClient()   # get-status raises RESOURCE_DOES_NOT_EXIST → home reads as absent
+    # PLAN 16.3.1: the home is attempted ONCE (refused: owner not assigned, P3); nothing beneath it
+    # is ever mkdir'd, and every descendant is one clean prerequisite naming the reason.
+    client = RecordingClient(mkdirs_errors={"/Users/ghost@x.com": _DIR_PROTECTED})
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", "/Users/ghost@x.com/proj", {"path": "/Users/ghost@x.com/proj"}),
         _unit("notebook", "/Users/ghost@x.com/proj/nb",
@@ -385,10 +421,11 @@ def test_content_under_an_absent_user_home_is_a_clean_prerequisite_not_a_raw_err
     ], client, staging_files={"c/nb.py": b"print(1)"}, identity_map={"sp_mapping": {}})
     res = imp.run()
     assert res.failed == 2
-    assert client.posts_to("workspace/mkdirs") == [], "must NOT attempt mkdirs under an absent home"
+    assert [b["path"] for b in client.bodies_to("workspace/mkdirs")] == ["/Users/ghost@x.com"], \
+        "only the home root is attempted (once); never mkdirs under an absent home"
     for row in res.units:
         assert row["failure_category"] == "prerequisite_missing"
-        assert "owner is not present on target" in row["note"]
+        assert "not assigned to the target workspace" in row["note"]
 
 
 def _write_classification(aw, sp_app_ids):
@@ -403,14 +440,16 @@ def test_orphan_sp_home_message_distinguishes_not_migrated_from_deleted():
     operator's next step differs, so the two must read differently."""
     # (a) appId present in the source roster but NOT in sp_mapping → "present in source but not
     #     migrated this run".
-    client = RecordingClient()
+    #     PLAN 16.3.1: such an SP is not assigned on target, so the platform refuses its home
+    #     mkdirs (P3) — the row says so ("assign it"), never "deleted in source".
+    client = RecordingClient(mkdirs_errors={f"/Users/{_OLD_APP}": _DIR_PROTECTED})
     imp, st = _make(WorkspaceImporter, [
         _unit("directory", f"/Users/{_OLD_APP}", {"path": f"/Users/{_OLD_APP}"})], client,
         identity_map={"sp_mapping": {}})
     _write_classification(imp.staging, [_OLD_APP])
     imp.run()
     row = st.row("directory", f"/Users/{_OLD_APP}")
-    assert "present in the source roster" in row["last_error"]
+    assert "not assigned to the target workspace" in row["last_error"]
     assert "deleted in source" not in row["last_error"]
 
     # (b) appId ABSENT from the roster, with backup DISABLED → "deleted in source" prerequisite.
@@ -479,8 +518,9 @@ def test_orphaned_sp_home_content_diverted_to_backup():
 def test_home_owner_in_roster_but_import_failed_stays_prerequisite():
     """PLAN 9 §2: an owner PRESENT in the roster whose home is merely absent on target this run
     (identity import failed/pending) must NOT be diverted — it recovers into the REAL home on
-    retry_mode=failed_only. Diverting it would scatter a live user's files."""
-    client = RecordingClient()
+    retry_mode=failed_only. Diverting it would scatter a live user's files.
+    PLAN 16.3.1: its REAL home is attempted (refused here: not assigned) — never the backup root."""
+    client = RecordingClient(mkdirs_errors={"/Users/live@x.com": _DIR_PROTECTED})
     imp, st = _make(WorkspaceImporter, [
         _unit("notebook", "/Users/live@x.com/nb",
               {"path": "/Users/live@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
@@ -488,16 +528,18 @@ def test_home_owner_in_roster_but_import_failed_stays_prerequisite():
     _write_roster(imp.staging, users=["live@x.com"])   # owner IS in the roster
     res = imp.run()
     assert res.failed == 1 and res.warned == 0
-    assert client.posts_to("workspace/mkdirs") == [], "must not divert an in-roster owner"
+    assert [b["path"] for b in client.bodies_to("workspace/mkdirs")] == ["/Users/live@x.com"], \
+        "must not divert an in-roster owner (only its real home is attempted)"
     row = st.row("notebook", "/Users/live@x.com/nb")
     assert row["failure_category"] == "prerequisite_missing"
-    assert "owner is not present on target" in row["last_error"]
+    assert "not assigned to the target workspace" in row["last_error"]
 
 
 def test_recreated_sp_home_still_remaps_to_new_appid_not_backup():
     """sp_mapping wins over backup: a recreated SP's home follows its NEW appId (IMP-6), never the
-    backup root, even if the OLD appId is absent from the roster."""
-    client = RecordingClient()
+    backup root, even if the OLD appId is absent from the roster. (PLAN 16.3.1: its new home is
+    created with mkdirs — P10.)"""
+    client = RecordingClient(mkdirs_creates=True)
     imp, _st = _make(WorkspaceImporter, [
         _unit("notebook", f"/Users/{_OLD_APP}/proj/nb",
               {"path": f"/Users/{_OLD_APP}/proj/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
@@ -542,8 +584,9 @@ def test_workspace_home_backup_false_preserves_current_prerequisite_behaviour():
 
 def test_unknown_roster_does_not_silently_divert():
     """No/garbled classification file → roster 'unknown' → prerequisite, NEVER a silent backup: we
-    must not scatter a possibly-live user's files on a missing roster."""
-    client = RecordingClient()
+    must not scatter a possibly-live user's files on a missing roster. (PLAN 16.3.1: the REAL home
+    is attempted — refused here — never a backup folder.)"""
+    client = RecordingClient(mkdirs_errors={"/Users/ghost@x.com": _DIR_PROTECTED})
     imp, st = _make(WorkspaceImporter, [
         _unit("notebook", "/Users/ghost@x.com/nb",
               {"path": "/Users/ghost@x.com/nb", "language": "PYTHON"}, content_ref="c/nb.py"),
@@ -551,7 +594,7 @@ def test_unknown_roster_does_not_silently_divert():
     # deliberately DO NOT write identity_classification.json
     res = imp.run()
     assert res.failed == 1 and res.warned == 0
-    assert client.posts_to("workspace/mkdirs") == []
+    assert [b["path"] for b in client.bodies_to("workspace/mkdirs")] == ["/Users/ghost@x.com"]
     assert st.row("notebook", "/Users/ghost@x.com/nb")["failure_category"] == "prerequisite_missing"
 
 

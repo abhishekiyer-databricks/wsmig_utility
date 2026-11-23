@@ -40,16 +40,29 @@ identities we deliberately do NOT create.
 
 Members and ACL principals are matched **by name** (userName / applicationId / displayName), never
 by source id — source ids are meaningless on the target.
+
+**Nested identities stay nested (PLAN 16.3.1 Part B).** An identity that is only a MEMBER of an
+assigned group on the source (`workspace_permissions == []`, never directly assigned) is never
+assigned here: no `permissionassignments` PUT for a group, and no workspace-SCIM POST for a user/SP
+(the POST itself creates a DIRECT assignment, PB1). Account-group membership is account-global, so
+the identity becomes visible on target through its parent; PASS 3 waits for that, then applies its
+entitlements. Existing extra direct assignments are reported, NEVER removed (DB3).
+
+**Entitlements are verified (DB5).** Every entitlement/role write is GET → PATCH only the missing
+values → GET; each identity row says what was copied / already present / failed, and a failure
+fails the row (`not_applied`) so `retry_mode=failed_only` re-applies it.
 """
 from __future__ import annotations
 
 import json
 import time
 
-from src.importers.base_importer import (BaseImporter, PrerequisiteMissing, SkippedNoObject,
-                                         CAT_NOT_SUPPORTED)
+from src.importers.base_importer import (BaseImporter, DeferredToNestedPass,
+                                         EntitlementsNotApplied, PrerequisiteMissing,
+                                         SkippedNoObject, CAT_NOT_SUPPORTED, classify_error)
 from src.state.state_store import (ACTION_ADOPTED, ACTION_CREATED, ACTION_CREATED_WITH_WARNING,
-                                   ACTION_FAILED)
+                                   ACTION_FAILED, CAT_NOT_APPLIED, CAT_PREREQUISITE_MISSING,
+                                   UpsertAction)
 from src.utils.helpers import safe_str
 from src.utils.logger import fmt_elapsed, get_logger
 
@@ -73,6 +86,28 @@ _ASSIGNMENTS = "api/2.0/preview/permissionassignments"
 # migrating workspace N would escalate that identity across every other workspace in the account.
 # Only workspace-scoped entitlements migrate.
 _ACCOUNT_LEVEL_ROLES = {"account_admin"}
+
+# PASS 3 (nested identities) wait budget. Visibility through a parent takes 3-6 s (PB6), the same as
+# a direct assignment, so 300 s is a wide margin; each poll is ONE SCIM list per needed kind.
+NESTED_POLL_SEC = 10
+NESTED_WAIT_SEC = 300
+# DB5 read-back: after a PATCH, re-read up to this many times, this far apart, until every sent
+# value shows (SCIM is read-your-writes in practice; the retries only absorb a slow replica).
+ENTITLEMENT_READ_TRIES = 3
+ENTITLEMENT_READ_SEC = 3
+
+# The built-in groups are never "nested only" — their membership is migrated declaratively.
+_SYSTEM_GROUP_NAMES = ("users", "admins")
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so offline tests can make the waits instant."""
+    time.sleep(seconds)
+
+
+def _ent_label(attribute: str, value: str) -> str:
+    """How an entitlement/role value is named in the report (`role:` prefix for roles)."""
+    return f"role:{value}" if attribute == "roles" else value
 
 # Group kinds, as stamped into the bundle by src/identity/classifier.py.
 KIND_ACCOUNT = "account"
@@ -112,6 +147,11 @@ class IdentityImporter(BaseImporter):
     # ADOPT must still perform the member PATCH — otherwise a source workspace admin silently
     # would not be an admin on target.
     declarative_asset_types = ("group_membership",)
+    # PLAN 16.3.1 §3B.4: an identity that already exists on target when the phase starts is
+    # RECONCILED, not just recorded — its entitlements are applied (the customer's "group A's
+    # Workspace access was not copied" case) and its direct assignment checked (never for a nested
+    # one). `adopt_one` does it.
+    reconcile_on_adopt_types = ("user", "service_principal", "group")
 
     def __init__(self, *a, **kw) -> None:
         super().__init__(*a, **kw)
@@ -131,6 +171,13 @@ class IdentityImporter(BaseImporter):
         # PASS 2 work list: (group_name, target_group_id, members, unit, result_row). Membership is
         # deliberately NOT patched during a group's own create — see `run()`.
         self._member_pass: list[tuple] = []
+        # PASS 3 work list (PLAN 16.3.1): nested-only identities NOT visible at phase start. They
+        # are never assigned/POSTed; they become visible through their parent group.
+        self._nested_pass: list[dict] = []
+        # (asset_type, natural_key) → source parent group names, derived from the bundle (no call).
+        self._parents_by_key: dict = {}
+        # principal ids whose workspace assignment was already ensured this run (one PUT at most).
+        self._ensured: set = set()
 
     # ── load: the phase's fixed internal order ────────────────────────────
     def load(self) -> list[dict]:
@@ -141,7 +188,116 @@ class IdentityImporter(BaseImporter):
         """
         units = self.units_for("user", "service_principal", "group", "group_membership")
         units += self._oauth_secret_manual_units(units)
+        self._parents_by_key = self._source_parents(units)
         return units
+
+    # ── nested identities (PLAN 16.3.1 Part B) ────────────────────────────
+    @staticmethod
+    def _recorded_permissions(unit: dict):
+        """The exported `workspace_permissions` — payload first, then unit (same lookup as
+        `_permissions_for_unit`): a list (direct = ["USER"|"ADMIN"], nested only = []) or None
+        (could not check / pre-Plan-6 bundle)."""
+        payload = unit.get("payload") or {}
+        permissions = payload.get("workspace_permissions")
+        if permissions is None:
+            permissions = unit.get("workspace_permissions")
+        return permissions
+
+    def _is_nested_only(self, unit: dict) -> bool:
+        """True ONLY for an account identity the source recorded as NOT directly assigned —
+        `workspace_permissions` is exactly `[]` — i.e. it was in the workspace only as a member of
+        an assigned group (PB3). Never for `None` (unknown → today's USER fallback), a
+        workspace-local group (records ['USER'], and the kind check is a second guard), a system
+        group, or a `group_membership` unit."""
+        asset_type = safe_str(unit.get("asset_type"))
+        if asset_type not in ("user", "service_principal", "group"):
+            return False
+        if asset_type == "group" and _kind_of(unit) != KIND_ACCOUNT:
+            return False
+        if self.natural_key(unit).lower() in _SYSTEM_GROUP_NAMES:
+            return False
+        permissions = self._recorded_permissions(unit)
+        return isinstance(permissions, list) and len(permissions) == 0
+
+    def _source_parents(self, units: list) -> dict:
+        """`{(asset_type, natural_key): [parent group names]}` from the bundle's group members.
+
+        A member is matched by its source SCIM id (`value` == the child's `source_id`, exact), with
+        the display name as the fallback for a member entry without an id. System and generated
+        groups (`users`, `admins`, `users-clone-…`) are not parents — they confer no visibility.
+        (Users' own `groups` attribute is stripped from the export payload, so the group side is
+        the one source that covers users, SPs and groups alike.)"""
+        by_id: dict = {}
+        by_display: dict = {}
+        for u in units:
+            at = safe_str(u.get("asset_type"))
+            if at not in ("user", "service_principal", "group"):
+                continue
+            key = (at, self.natural_key(u))
+            if safe_str(u.get("source_id")):
+                by_id[safe_str(u.get("source_id"))] = key
+            payload = u.get("payload") or {}
+            for name in {self.natural_key(u), safe_str(payload.get("displayName"))}:
+                if name:
+                    by_display.setdefault(name, key)
+        parents: dict = {}
+        for g in units:
+            if safe_str(g.get("asset_type")) != "group":
+                continue
+            if _kind_of(g) in (KIND_SYSTEM, KIND_SYSTEM_GENERATED):
+                continue
+            parent = self.natural_key(g)
+            for m in (g.get("payload") or {}).get("members") or []:
+                if not isinstance(m, dict):
+                    continue
+                child = by_id.get(safe_str(m.get("value"))) if safe_str(m.get("value")) else None
+                if child is None and not safe_str(m.get("value")):
+                    child = by_display.get(safe_str(m.get("display")))
+                if child and child != ("group", parent):
+                    bucket = parents.setdefault(child, [])
+                    if parent not in bucket:
+                        bucket.append(parent)
+        return parents
+
+    def _parents_of(self, unit: dict) -> list:
+        return list(self._parents_by_key.get(
+            (safe_str(unit.get("asset_type")), self.natural_key(unit)), []))
+
+    def _parents_text(self, unit: dict) -> str:
+        parents = self._parents_of(unit)
+        return ", ".join(f"`{p}`" for p in parents) if parents else "a group not in this bundle"
+
+    def _directly_assigned_on_target(self, target_id: str) -> bool:
+        """Whether the target ALREADY lists this principal in permissionassignments (read once at
+        phase start; a nested identity is never PUT, so this is always pre-existing)."""
+        return bool(target_id) and self._target_assignments is not None and \
+            safe_str(target_id) in self._target_assignments
+
+    def _db3_note(self, unit: dict) -> str:
+        return (f"directly assigned on target, nested only on source (via "
+                f"{self._parents_text(unit)}); left unchanged — remove its workspace assignment "
+                f"manually if the source layout must be mirrored (RUNBOOK §Nested identities)")
+
+    def _assignment_label(self, unit: dict, target_id: str) -> str:
+        """The report's "Assignment" column for an identity row."""
+        asset_type = safe_str(unit.get("asset_type"))
+        if asset_type not in ("user", "service_principal", "group"):
+            return ""
+        if asset_type == "group" and _kind_of(unit) not in (KIND_ACCOUNT, KIND_WORKSPACE_LOCAL):
+            return ""
+        if self._is_nested_only(unit):
+            if self._directly_assigned_on_target(target_id):
+                return "direct on target (pre-existing); nested on source"
+            return f"via group ({', '.join(self._parents_of(unit)) or 'not in bundle'})"
+        return "direct"
+
+    def dry_run_intent(self, unit: dict, action) -> str:
+        """A nested-only identity is never assigned: the rehearsal says it will be reached through
+        its group (no polling in a dry run)."""
+        if self._is_nested_only(unit) and action is UpsertAction.CREATE:
+            return (f"would ADOPT (nested on source via {self._parents_text(unit)}; no direct "
+                    f"assignment)")
+        return ""
 
     def _oauth_secret_manual_units(self, units: list) -> list:
         """PLAN 8 Bug 3 + PLAN 11 Finding-7: an SP whose SOURCE had OAuth client secret(s) is a
@@ -275,6 +431,12 @@ class IdentityImporter(BaseImporter):
     # ── create / update ───────────────────────────────────────────────────
     def create_one(self, unit: dict) -> dict:
         asset_type = safe_str(unit.get("asset_type"))
+        if self._is_nested_only(unit):
+            # PLAN 16.3.1 §3B.3: NO permissionassignments PUT (group) and NO workspace-SCIM POST
+            # (user/SP — the POST itself makes a direct assignment, PB1). PASS 3 resolves it once it
+            # is visible through its parent and writes its row.
+            self._nested_pass.append(unit)
+            raise DeferredToNestedPass(self.natural_key(unit))
         if asset_type == "user":
             return self._create_user(unit)
         if asset_type == "service_principal":
@@ -293,26 +455,42 @@ class IdentityImporter(BaseImporter):
         """
         asset_type = safe_str(unit.get("asset_type"))
         payload = unit.get("payload") or {}
+        nested = self._is_nested_only(unit)
         if asset_type in ("user", "service_principal"):
             resource = "Users" if asset_type == "user" else "ServicePrincipals"
-            self._apply_entitlements(resource, target_id, payload)
+            ent = self._apply_entitlements(resource, target_id, payload)
             # PLAN 8 Bug 5: name the ACTUAL change (entitlement/role added, or removed-in-source and
             # NOT removed on target) instead of the old fixed "entitlements/roles re-applied" string,
             # which hid both a secret change (now a manual unit, Bug 3) and an entitlement removal.
-            return {"target_id": target_id, "note": self._diff_note(asset_type, unit, payload),
+            note = self._diff_note(asset_type, unit, payload)
+            if nested and self._directly_assigned_on_target(target_id):
+                note = f"{note}; {self._db3_note(unit)}"
+            note = self._with_entitlements(note, ent)
+            self._raise_if_entitlements_failed(unit, target_id, ent)
+            return {"target_id": target_id, "note": note, "entitlements": ent,
                     "source_detail": self._snapshot_json(asset_type, payload)}
         if asset_type == "group":
-            self._apply_entitlements("Groups", target_id, payload)
+            ent = self._apply_entitlements("Groups", target_id, payload)
             if _kind_of(unit) == KIND_ACCOUNT:
                 # Never re-sync an account group's members: account-global (§multi-workspace) and
-                # Entra would revert it. Permissions ARE re-checked, since ADMIN/USER can change.
+                # Entra would revert it. Permissions ARE re-checked, since ADMIN/USER can change —
+                # EXCEPT for a nested-only group, which is never (re)assigned (PLAN 16.3.1: 1.2.0
+                # re-PUT it on every re-run, undoing any manual cleanup).
                 # PLAN 11 Finding-2: the member delta IS named for detection/reporting
                 # (members_applied=False), and the snapshot now INCLUDES members so a later run can
                 # diff a membership-only change (the fingerprint already moves on one).
-                self._ensure_assignment(target_id, unit, self.natural_key(unit))
                 note = self._diff_note("group", unit, payload, members_applied=False)
-                return {"target_id": target_id,
-                        "note": f"{note}; workspace entitlements/permissions re-applied",
+                if nested:
+                    note = f"{note}; workspace entitlements re-applied (nested on source via " \
+                           f"{self._parents_text(unit)}; not assigned)"
+                    if self._directly_assigned_on_target(target_id):
+                        note = f"{note}; {self._db3_note(unit)}"
+                else:
+                    self._ensure_assignment(target_id, unit, self.natural_key(unit))
+                    note = f"{note}; workspace entitlements/permissions re-applied"
+                note = self._with_entitlements(note, ent)
+                self._raise_if_entitlements_failed(unit, target_id, ent)
+                return {"target_id": target_id, "note": note, "entitlements": ent,
                         "source_detail": self._snapshot_json("group", payload)}
             member_note = self._sync_members(target_id, payload.get("members") or [])
             # The additive PATCH (member_note) says what was ADDED/unresolved; the diff names what
@@ -320,12 +498,51 @@ class IdentityImporter(BaseImporter):
             # target for review), per the "report, don't act" stance for source-side removals.
             diff = self._diff_note("group", unit, payload)
             note = f"{diff}; {member_note}" if diff else member_note
-            return {"target_id": target_id, "note": note,
+            self._raise_if_entitlements_failed(unit, target_id, ent)
+            return {"target_id": target_id, "note": self._with_entitlements(note, ent),
+                    "entitlements": ent,
                     "warning": member_note if "could not resolve" in member_note else "",
                     "source_detail": self._snapshot_json("group", payload)}
         if asset_type == "group_membership":
             return self._add_builtin_members(unit)
         return {"target_id": target_id}
+
+    def adopt_one(self, unit: dict, target_id: str) -> dict:
+        """RECONCILE an identity that was already on target when the phase started (PLAN 16.3.1
+        §3B.4). 1.2.0 only recorded `adopted` here — no entitlements — which is how an account group
+        the customer pre-assigned kept no Workspace access.
+
+          • nested only on source → apply entitlements, NO assignment call; DB3 note if the target
+            already has a (1.2.0-made) direct assignment for it — left unchanged.
+          • direct on source (["USER"|"ADMIN"]) or unknown (None) → apply entitlements and ENSURE the
+            direct assignment (fixes "direct on source, only via a group on target").
+          • system / undetermined-kind groups → unchanged (adopted; built-in membership is the
+            declarative `group_membership` unit).
+        `changed` (→ `updated`) only when an entitlement was copied (§3B.4)."""
+        asset_type = safe_str(unit.get("asset_type"))
+        payload = unit.get("payload") or {}
+        key = self.natural_key(unit)
+        adopted_note = "already existed on target — adopted into the migration state (not duplicated)"
+        if asset_type == "group" and _kind_of(unit) not in (KIND_ACCOUNT, KIND_WORKSPACE_LOCAL):
+            return {"changed": False, "target_id": target_id, "note": adopted_note}
+        resource = {"user": "Users", "service_principal": "ServicePrincipals",
+                    "group": "Groups"}[asset_type]
+        ent = self._apply_entitlements(resource, target_id, payload)
+        changed = bool(ent.get("copied"))
+        if self._is_nested_only(unit):
+            note = (f"{adopted_note}; nested on source via {self._parents_text(unit)} — reached "
+                    f"through its group on the target, not directly assigned (as on source)")
+            if self._directly_assigned_on_target(target_id):
+                note = f"{adopted_note}; {self._db3_note(unit)}"
+        else:
+            note = adopted_note
+            if self._ensure_assignment(target_id, unit, key):
+                # Not `changed`: a pre-1.2.1 adopt applied the same assignment and read `adopted`.
+                note = f"{note}; direct workspace assignment applied (as on source)"
+        note = self._with_entitlements(note, ent)
+        self._raise_if_entitlements_failed(unit, target_id, ent)
+        return {"changed": changed, "target_id": target_id, "note": note, "entitlements": ent,
+                "source_detail": self._snapshot_json(asset_type, payload)}
 
     # ── users ─────────────────────────────────────────────────────────────
     def _create_user(self, unit: dict) -> dict:
@@ -354,12 +571,15 @@ class IdentityImporter(BaseImporter):
         # (e.g. "Sanket Kelkar") could not be added to their groups, leaving them under-populated.
         self._index_display(created, payload, target_id, fallback=key)
         self._record_identity_row("user", key, target_id, key, unit, ACTION_CREATED)
-        self._apply_entitlements("Users", target_id, payload)
+        ent = self._apply_entitlements("Users", target_id, payload)
         # Workspace ADMIN vs USER lives only in permissionassignments (F8) — a source workspace
         # admin would otherwise land on target as a plain USER.
         self._ensure_assignment(target_id, unit, key)
+        self._raise_if_entitlements_failed(unit, target_id, ent)
         return {"target_id": target_id,
-                "note": f"adopted/created the account user `{key}` (userName preserved)",
+                "note": self._with_entitlements(
+                    f"adopted/created the account user `{key}` (userName preserved)", ent),
+                "entitlements": ent,
                 "source_detail": self._snapshot_json("user", payload)}
 
     # ── service principals ────────────────────────────────────────────────
@@ -399,10 +619,13 @@ class IdentityImporter(BaseImporter):
             self._index_display({}, payload, existing_id, fallback=source_app_id)
             self._record_identity_row("service_principal", source_app_id, existing_id,
                                       source_app_id, unit, ACTION_ADOPTED)
-            self._apply_entitlements("ServicePrincipals", existing_id, payload)
+            ent = self._apply_entitlements("ServicePrincipals", existing_id, payload)
+            self._raise_if_entitlements_failed(unit, existing_id, ent)
             return {"target_id": existing_id,
-                    "note": f"adopted the existing account service principal {source_app_id} "
-                            f"(applicationId preserved)",
+                    "note": self._with_entitlements(
+                        f"adopted the existing account service principal {source_app_id} "
+                        f"(applicationId preserved)", ent),
+                    "entitlements": ent,
                     "source_detail": self._snapshot_json("service_principal", payload)}
 
         target_id = safe_str(created.get("id"))
@@ -417,8 +640,9 @@ class IdentityImporter(BaseImporter):
 
         self._record_identity_row("service_principal", source_app_id, target_id, new_app_id,
                                   unit, ACTION_CREATED)
-        self._apply_entitlements("ServicePrincipals", target_id, payload)
+        ent = self._apply_entitlements("ServicePrincipals", target_id, payload)
         self._ensure_assignment(target_id, unit, source_app_id)
+        self._raise_if_entitlements_failed(unit, target_id, ent)
 
         warning = ""
         if new_app_id and source_app_id and new_app_id != source_app_id:
@@ -437,7 +661,8 @@ class IdentityImporter(BaseImporter):
             # unit (Bug 3), emitted every run. Here we only cross-reference it in the SP's note.
             note = (f"{note}. NOTE: this SP had OAuth client secret(s) on source — see the separate "
                     f"manual action for `{source_app_id}` (a secret value can never be migrated).")
-        return {"target_id": target_id, "note": note, "warning": warning,
+        return {"target_id": target_id, "note": self._with_entitlements(note, ent),
+                "warning": warning, "entitlements": ent,
                 "source_detail": self._snapshot_json("service_principal", payload)}
 
     def _lookup_sp_id(self, app_id: str) -> str:
@@ -502,13 +727,17 @@ class IdentityImporter(BaseImporter):
         target_id = safe_str(created.get("id"))
         self._target_groups[name] = target_id
         self._record_identity_row("group", name, target_id, name, unit, ACTION_CREATED)
-        self._apply_entitlements("Groups", target_id, payload)
+        ent = self._apply_entitlements("Groups", target_id, payload)
 
         # Membership is DEFERRED to pass 2, not patched here. Patching now would resolve members
         # against the groups created SO FAR, so a parent listed before its child would silently
         # lose the child — which is the exact failure two-pass exists to prevent.
         self._defer_members(name, target_id, payload.get("members") or [], unit)
-        return {"target_id": target_id, "note": "group created empty; members applied in pass 2",
+        self._raise_if_entitlements_failed(unit, target_id, ent)
+        return {"target_id": target_id,
+                "note": self._with_entitlements("group created empty; members applied in pass 2",
+                                                ent),
+                "entitlements": ent,
                 "source_detail": self._snapshot_json("group", payload)}
 
     def _defer_members(self, name: str, target_id: str, members: list, unit: dict) -> None:
@@ -541,11 +770,14 @@ class IdentityImporter(BaseImporter):
                     f"WORKSPACE-LOCAL group with the same name. That shadow permanently blocks "
                     f"assigning the account group. Delete the workspace-local group `{name}` on the "
                     f"target, then re-run with retry_mode=failed_only.")
-            self._apply_entitlements("Groups", target_id, payload)
+            ent = self._apply_entitlements("Groups", target_id, payload)
             self._ensure_assignment(target_id, unit, name)
+            self._raise_if_entitlements_failed(unit, target_id, ent)
             return {"target_id": target_id,
-                    "note": "account group already assigned; entitlements re-applied "
-                            "(members are account-owned and were not modified)",
+                    "note": self._with_entitlements(
+                        "account group already assigned; entitlements re-applied "
+                        "(members are account-owned and were not modified)", ent),
+                    "entitlements": ent,
                     # Finding-2: snapshot INCLUDES members (for detection only) so a later run can
                     # diff a membership-only change and name the delta.
                     "source_detail": self._snapshot_json("group", payload)}
@@ -577,11 +809,17 @@ class IdentityImporter(BaseImporter):
                     "An account admin must create it in the target account first.") +
                 " Then re-run with retry_mode=failed_only.") from exc
         self._target_groups[name] = account_id
+        self._ensured.add(safe_str(account_id))
+        if self._target_assignments is not None:
+            self._target_assignments[safe_str(account_id)] = self._permissions_for_unit(unit)
         self._record_identity_row("group", name, account_id, name, unit, ACTION_ADOPTED)
-        self._apply_entitlements("Groups", account_id, payload)
+        ent = self._apply_entitlements("Groups", account_id, payload)
+        self._raise_if_entitlements_failed(unit, account_id, ent)
         return {"target_id": account_id,
-                "note": f"assigned the existing account group (id {account_id} preserved); members "
-                        f"are account-owned and were not modified",
+                "note": self._with_entitlements(
+                    f"assigned the existing account group (id {account_id} preserved); members "
+                    f"are account-owned and were not modified", ent),
+                "entitlements": ent,
                 # Finding-2: snapshot INCLUDES members (detection only) for a later membership diff.
                 "source_detail": self._snapshot_json("group", payload)}
 
@@ -626,27 +864,36 @@ class IdentityImporter(BaseImporter):
         `None` means inventory COULD NOT read permissionassignments (not "no permissions"), so it
         must not be treated as an empty grant — USER is the minimum that makes a principal usable,
         and over-granting ADMIN on a guess would be worse.
+
+        PLAN 16.3.1 §3B.8: a nested-only identity (recorded `[]`) must never reach here — every
+        caller skips it. Failing loud makes a future regression a red test, not a silent re-assign.
         """
-        payload = unit.get("payload") or {}
-        permissions = payload.get("workspace_permissions")
-        if permissions is None:
-            permissions = unit.get("workspace_permissions")
+        if self._is_nested_only(unit):
+            raise RuntimeError("nested-only identity reached the assignment path")
+        permissions = self._recorded_permissions(unit)
         if not permissions:
             return ["USER"]
         return [p for p in permissions if safe_str(p)] or ["USER"]
 
-    def _ensure_assignment(self, principal_id: str, unit: dict, name: str) -> None:
-        """PUT the workspace permission if it differs from what the target already has.
+    def _ensure_assignment(self, principal_id: str, unit: dict, name: str) -> bool:
+        """PUT the workspace permission if it differs from what the target already has. Returns
+        whether a PUT was sent and accepted.
 
         This is the only carrier of workspace ADMIN vs USER (Plan 6 F8) — SCIM entitlements do not
         express it, so without this an admin on source silently lands as a plain USER on target.
+        At most once per principal per run (the adopt reconcile and the post-adopt hook both call
+        it). NEVER called for a nested-only identity (PLAN 16.3.1) — `_permissions_for_unit` raises.
         """
         wanted = self._permissions_for_unit(unit)
+        pid = safe_str(principal_id)
+        if pid in self._ensured:
+            return False
+        self._ensured.add(pid)
         if self._target_assignments is not None:
-            current = self._target_assignments.get(safe_str(principal_id))
+            current = self._target_assignments.get(pid)
             if current is not None and sorted(current) == sorted(wanted):
                 self.log.debug(f"workspace permission {name}: already {sorted(wanted)}")
-                return
+                return False
         self.log.debug(f"assigning workspace permission {name} → {wanted}",
                        principal_id=principal_id)
         try:
@@ -657,6 +904,10 @@ class IdentityImporter(BaseImporter):
                              error=str(exc)[:200])
             self.result.warnings.append(
                 f"group/{name}: could not set workspace permissions {wanted}: {str(exc)[:160]}")
+            return False
+        if self._target_assignments is not None:
+            self._target_assignments[pid] = list(wanted)
+        return True
 
     def run(self):
         """Pass 1 (create/adopt every identity) → PASS 2 (apply group membership).
@@ -668,6 +919,8 @@ class IdentityImporter(BaseImporter):
         """
         result = super().run()
         self._apply_deferred_members()
+        # PASS 3 (PLAN 16.3.1 §3B.6): nested-only identities, reached through their parent group.
+        self._apply_nested_pass()
         self.flush_checkpoint()
         return result
 
@@ -831,21 +1084,32 @@ class IdentityImporter(BaseImporter):
                 "source_detail": self._snapshot_json("group", payload)}
 
     # ── entitlements + roles (SEPARATE PATCH passes after create) ──────────
-    def _apply_entitlements(self, resource: str, target_id: str, payload: dict) -> None:
-        """Apply `entitlements` then `roles` as their own PATCHes (master §10a).
+    def _apply_entitlements(self, resource: str, target_id: str, payload: dict) -> dict:
+        """Apply `entitlements` then `roles` — VERIFIED (PLAN 16.3.1 DB5) — and return
+        `{"copied", "present", "failed", "errors"}` (role values prefixed `role:`).
 
-        Separate from create because several workspaces reject them inline, and separate from each
-        other so one being unsupported doesn't lose the other. Best-effort per PATCH: an entitlement
-        that cannot be set must not fail the identity, which by now already exists on target.
+          1. GET the identity's current entitlements/roles (`before`);
+          2. PATCH (op add, one per attribute) ONLY the values `before` lacks;
+          3. GET again (up to ENTITLEMENT_READ_TRIES) until every sent value shows.
+        copied = sent and read back; present = already there; failed = a PATCH error (with the
+        server's message) or "sent, but not present after a fresh GET". Nothing to apply (most
+        users) → no call at all, exactly as 1.2.0.
+
+        Separate PATCHes because several workspaces reject them inline at create, and per
+        attribute so one being unsupported doesn't lose the other. This never raises: the caller
+        decides (`_raise_if_entitlements_failed` fails the row as `not_applied`, which replaced
+        1.2.0's warning that never reached the report).
 
         Known, unfixable limitation (inherited from `databrickslabs/migrate`): a role granted BOTH
         directly and via a group is indistinguishable through the API, so only the group grant
         migrates. It surfaces in the ACL parity report rather than being quietly written off.
         """
+        result: dict = {"copied": [], "present": [], "failed": [], "errors": []}
+        wanted: dict = {}
         for attribute in ("entitlements", "roles"):
             values = payload.get(attribute) or []
             entries = [v if isinstance(v, dict) else {"value": v} for v in values]
-            entries = [e for e in entries if e.get("value")]
+            entries = [e for e in entries if safe_str(e.get("value"))]
             if attribute == "roles":
                 # Account-level roles are account-GLOBAL. Replaying `account_admin` while migrating
                 # workspace N would escalate that identity across every workspace in the account —
@@ -858,19 +1122,239 @@ class IdentityImporter(BaseImporter):
                     self.log.info("skipped account-level role (account-global, not migrated)",
                                   resource=resource, target_id=target_id,
                                   role=safe_str(entry.get("value")))
-            if not entries or not target_id:
+            seen: set = set()
+            unique = []
+            for e in entries:
+                v = safe_str(e.get("value"))
+                if v not in seen:
+                    seen.add(v)
+                    unique.append(e)
+            if unique:
+                wanted[attribute] = unique
+        if not wanted or not target_id:
+            return result
+
+        path = f"{_SCIM}/{resource}/{target_id}"
+        try:
+            before = self._read_identity_attributes(path)
+        except Exception as exc:  # noqa: BLE001 — unknown `before`: send everything (add is idempotent)
+            self.log.warning("could not read identity entitlements before applying them",
+                             resource=resource, target_id=target_id, error=str(exc)[:200])
+            before = {}
+
+        sent: dict = {}
+        for attribute, entries in wanted.items():
+            have = before.get(attribute, set())
+            missing = []
+            for e in entries:
+                v = safe_str(e.get("value"))
+                if v in have:
+                    result["present"].append(_ent_label(attribute, v))
+                else:
+                    missing.append(e)
+            if not missing:
                 continue
             try:
-                self.client.patch(f"{_SCIM}/{resource}/{target_id}", {
+                self.client.patch(path, {
                     "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-                    "Operations": [{"op": "add", "path": attribute, "value": entries}],
+                    "Operations": [{"op": "add", "path": attribute, "value": missing}],
                 })
-            except Exception as exc:  # noqa: BLE001 — never fail an existing identity over this
+            except Exception as exc:  # noqa: BLE001 — reported per value; the identity exists
+                _cat, message = classify_error(exc)
                 self.log.warning("could not apply identity attribute", attribute=attribute,
                                  resource=resource, target_id=target_id, error=str(exc)[:200])
-                self.result.warnings.append(
-                    f"{resource}/{target_id}: could not set {attribute} "
-                    f"{[e.get('value') for e in entries]}: {str(exc)[:160]}")
+                result["errors"].append(str(exc))
+                for e in missing:
+                    result["failed"].append(
+                        f"{_ent_label(attribute, safe_str(e.get('value')))} ({message})")
+                continue
+            sent[attribute] = [safe_str(e.get("value")) for e in missing]
+
+        if sent:
+            after: dict = {}
+            read_error = ""
+            for attempt in range(ENTITLEMENT_READ_TRIES):
+                try:
+                    after = self._read_identity_attributes(path)
+                    read_error = ""
+                except Exception as exc:  # noqa: BLE001 — an unreadable result is not a success
+                    after, read_error = {}, str(exc)
+                if all(v in after.get(a, set()) for a, vals in sent.items() for v in vals):
+                    break
+                if attempt < ENTITLEMENT_READ_TRIES - 1:
+                    _sleep(ENTITLEMENT_READ_SEC)
+            for attribute, vals in sent.items():
+                for v in vals:
+                    if v in after.get(attribute, set()):
+                        result["copied"].append(_ent_label(attribute, v))
+                    else:
+                        why = (f"sent, but could not be read back: {read_error[:200]}"
+                               if read_error else "sent, but not present after a fresh GET")
+                        result["failed"].append(f"{_ent_label(attribute, v)} ({why})")
+                        result["errors"].append(read_error or
+                                                f"{_ent_label(attribute, v)}: PATCH returned 2xx "
+                                                f"but a fresh GET does not show it")
+        return result
+
+    def _read_identity_attributes(self, path: str) -> dict:
+        """`{"entitlements": {values}, "roles": {values}}` as the target has them NOW."""
+        data = self.client.get(path, params={"attributes": "entitlements,roles"}) or {}
+        out: dict = {}
+        for attribute in ("entitlements", "roles"):
+            out[attribute] = {self._value_of(v) for v in (data.get(attribute) or [])
+                              if self._value_of(v)}
+        return out
+
+    @staticmethod
+    def _with_entitlements(note: str, ent: dict) -> str:
+        """`note` + "; entitlements: copied …; already present …; failed …" (only non-empty parts)."""
+        parts = []
+        for field, label in (("copied", "copied"), ("present", "already present"),
+                             ("failed", "failed")):
+            if ent and ent.get(field):
+                parts.append(f"{label} {', '.join(ent[field])}")
+        if not parts:
+            return note
+        summary = "entitlements: " + "; ".join(parts)
+        return f"{note}; {summary}" if note else summary
+
+    def _raise_if_entitlements_failed(self, unit: dict, target_id: str, ent: dict) -> None:
+        """DB5: an entitlement/role that was refused, or that a fresh GET does not show, fails the
+        row (`not_applied`) — the identity exists, so the row still carries its target id, and
+        `retry_mode=failed_only` re-applies + re-verifies it."""
+        if not ent or not ent.get("failed"):
+            return
+        message = (f"{safe_str(unit.get('asset_type'))} `{self.natural_key(unit)}` exists on "
+                   f"target, but entitlements could not be applied: {', '.join(ent['failed'])}. "
+                   f"Re-run with retry_mode=failed_only.")
+        raise EntitlementsNotApplied(message, target_id=safe_str(target_id), entitlements=ent,
+                                     error_raw=safe_str((ent.get("errors") or [message])[0]))
+
+    # ── PASS 3: nested-only identities (PLAN 16.3.1 §3B.6) ────────────────
+    _NESTED_RESOURCE = {"group": "Groups", "service_principal": "ServicePrincipals",
+                        "user": "Users"}
+    _NESTED_KEY_FIELD = {"group": "displayName", "service_principal": "applicationId",
+                         "user": "userName"}
+
+    def _apply_nested_pass(self) -> None:
+        """Resolve every deferred nested-only identity through its parent, then apply its
+        entitlements. Never assigns anything.
+
+        Polls ONE SCIM list per needed kind every NESTED_POLL_SEC, up to NESTED_WAIT_SEC (PB6
+        measured 3-6 s), and stops as soon as all are visible. An identity still invisible after
+        the budget is `prerequisite_missing` naming its parents and their outcome in this run
+        (DB1) — never a fallback to a direct assignment."""
+        pending = list(self._nested_pass)
+        self._nested_pass = []
+        if not pending:
+            self.log.info("nested-identity pass 3: none")
+            return
+        t0 = time.time()
+        total = len(pending)
+        self.log.info(f"Phase: nested-identity pass 3 — {total:,} identities nested on source")
+        if self.dry_run:            # defensive: a dry run never reaches create_one
+            return
+        resolved_n = 0
+        deadline = time.time() + NESTED_WAIT_SEC
+        while pending:
+            kinds = {safe_str(u.get("asset_type")) for u in pending}
+            visible: dict = {}
+            for kind in sorted(kinds):
+                field = self._NESTED_KEY_FIELD[kind]
+                index: dict = {}
+                try:
+                    for obj in self.client.get_scim(self._NESTED_RESOURCE[kind]):
+                        k = safe_str(obj.get(field))
+                        if k:
+                            index[k] = obj
+                except Exception as exc:  # noqa: BLE001 — one failed poll; the next may succeed
+                    self.log.warning("nested-identity pass 3: could not list target SCIM",
+                                     resource=self._NESTED_RESOURCE[kind], error=str(exc)[:200])
+                visible[kind] = index
+            still = []
+            for unit in pending:
+                obj = visible.get(safe_str(unit.get("asset_type")), {}).get(self.natural_key(unit))
+                if obj and safe_str(obj.get("id")):
+                    self._resolve_nested(unit, obj)
+                    resolved_n += 1
+                else:
+                    still.append(unit)
+            pending = still
+            self.log.info(f"nested-identity pass 3: {resolved_n}/{total} visible")
+            if not pending or time.time() >= deadline:
+                break
+            _sleep(NESTED_POLL_SEC)
+        for unit in pending:
+            self._record_nested_unresolved(unit)
+        # Re-publish for the cross-phase consumers (job run_as, secret-scope MANAGE, ACL principals)
+        # so they see the identities pass 3 found (PB4/PB5: those grants succeed for them).
+        self.context.setdefault("target_identities", {}).update({
+            "users": self._target_users, "service_principals": self._target_sps,
+            "groups": self._target_groups})
+        self.log.info(f"Phase complete: nested-identity pass 3 — {total:,} identities, visible "
+                      f"{resolved_n}, prerequisite_missing {len(pending)} "
+                      f"({fmt_elapsed(time.time() - t0)})")
+
+    def _resolve_nested(self, unit: dict, obj: dict) -> None:
+        """Index a nested identity now visible on target, apply its entitlements, record its row."""
+        asset_type = safe_str(unit.get("asset_type"))
+        key = self.natural_key(unit)
+        payload = unit.get("payload") or {}
+        target_id = safe_str(obj.get("id"))
+        if asset_type == "group":
+            self._target_groups[key] = target_id
+            self._target_group_kinds[key] = safe_str(
+                (obj.get("meta") or {}).get("resourceType")).lower()
+        elif asset_type == "service_principal":
+            self._target_sps[key] = target_id
+            self._index_display(obj, payload, target_id, fallback=key)
+        else:
+            self._target_users[key] = target_id
+            self._index_display(obj, payload, target_id, fallback=key)
+        ent = self._apply_entitlements(self._NESTED_RESOURCE[asset_type], target_id, payload)
+        note = (f"nested on source via {self._parents_text(unit)}; reached through its group on "
+                f"the target, not directly assigned (as on source)")
+        note = self._with_entitlements(note, ent)
+        source_detail = self._snapshot_json(asset_type, payload)
+        try:
+            self._raise_if_entitlements_failed(unit, target_id, ent)
+        except EntitlementsNotApplied as exc:
+            self._record(unit, ACTION_FAILED, target_id=target_id, note=str(exc),
+                         error_raw=exc.error_raw, category=CAT_NOT_APPLIED, entitlements=ent)
+        else:
+            self._record(unit, ACTION_ADOPTED, target_id=target_id, note=note,
+                         source_detail=source_detail, entitlements=ent)
+            self._record_identity_row(asset_type, key, target_id, key, unit, ACTION_ADOPTED)
+        self._stamp_assignment(unit, target_id)
+
+    def _record_nested_unresolved(self, unit: dict) -> None:
+        """DB1: no parent reached the target, so the identity is not visible — a retryable
+        prerequisite naming each parent and what happened to it in this run."""
+        key = self.natural_key(unit)
+        outcomes = {safe_str(r.get("natural_key")): safe_str(r.get("import_status"))
+                    for r in self.result.units if safe_str(r.get("asset_type")) == "group"}
+        in_bundle = {self.natural_key(u) for u in self.units_by_type.get("group", []) or []}
+        parents = self._parents_of(unit)
+        described = [f"`{p}`: {outcomes.get(p) or ('not processed' if p in in_bundle else 'not in bundle')}"
+                     for p in parents]
+        note = (f"nested on source via {self._parents_text(unit)}; none of them is on the target, so "
+                f"`{key}` is not visible here. Import or assign a parent, then re-run with "
+                f"retry_mode=failed_only."
+                + (f" Parents this run: {'; '.join(described)}." if described else ""))
+        self._record(unit, ACTION_FAILED, note=note, error_raw=note,
+                     category=CAT_PREREQUISITE_MISSING)
+        self._stamp_assignment(unit, "")
+
+    def _stamp_assignment(self, unit: dict, target_id: str) -> None:
+        """Add the report's "Assignment" value to the unit's latest row."""
+        if not self.result.units:
+            return
+        row = self.result.units[-1]
+        if (safe_str(row.get("natural_key")) == self.natural_key(unit)
+                and safe_str(row.get("asset_type")) == safe_str(unit.get("asset_type"))):
+            label = self._assignment_label(unit, target_id)
+            if label:
+                row["assignment"] = label
 
     # ── source snapshot + cross-run diff (PLAN 8 Bug 5) ───────────────────
     @staticmethod
@@ -997,6 +1481,7 @@ class IdentityImporter(BaseImporter):
         if (safe_str(unit.get("asset_type")) == "group"
                 and _kind_of(unit) == KIND_ACCOUNT
                 and self._target_group_kinds.get(self.natural_key(unit)) == "workspacegroup"):
+            # (also for a nested-only account group: the shadow blocks its visibility the same way)
             name = self.natural_key(unit)
             message = (
                 f"`{name}` is an ACCOUNT group on the source, but the target already has a "
@@ -1012,10 +1497,18 @@ class IdentityImporter(BaseImporter):
         before = len(self.result.units)
         super()._process_one(unit, existing)
         if len(self.result.units) == before:
-            return
+            return        # deferred to PASS 3 (nested-only) — that pass records the row
         row = self.result.units[-1]
         if safe_str(row.get("natural_key")) != self.natural_key(unit):
             return
+        self._stamp_assignment(unit, safe_str(row.get("target_id")))
+        if row.get("dry_run") and safe_str(unit.get("asset_type")) in (
+                "user", "service_principal", "group"):
+            payload = unit.get("payload") or {}
+            would = [self._value_of(e) for e in (payload.get("entitlements") or [])]
+            would += [_ent_label("roles", self._value_of(r)) for r in (payload.get("roles") or [])
+                      if self._value_of(r).lower() not in _ACCOUNT_LEVEL_ROLES]
+            row["entitlements_would_copy"] = ", ".join(v for v in would if v)
         status = safe_str(row.get("import_status"))
         # The create path already wrote its row (with the NEW appId, which this generic path cannot
         # know), and a failure has no target id worth recording.
@@ -1035,6 +1528,8 @@ class IdentityImporter(BaseImporter):
         # a user already present on target (adopted, never created) kept whatever ADMIN/USER it
         # happened to have, so a source ADMIN silently stayed a plain USER — the exact failure the
         # permissionassignments pass exists to prevent. The create paths call this themselves; this
-        # covers every path that does NOT create.
-        if safe_str(unit.get("asset_type")) in ("user", "service_principal", "group"):
+        # covers every path that does NOT create. NEVER for a nested-only identity (PLAN 16.3.1 —
+        # 1.2.0 PUT USER here on every re-run, directly assigning what the source only nested).
+        if (safe_str(unit.get("asset_type")) in ("user", "service_principal", "group")
+                and not self._is_nested_only(unit)):
             self._ensure_assignment(target_id, unit, self.natural_key(unit))
