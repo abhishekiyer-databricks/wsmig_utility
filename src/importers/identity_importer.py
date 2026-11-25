@@ -174,6 +174,11 @@ class IdentityImporter(BaseImporter):
         # PASS 3 work list (PLAN 16.3.1): nested-only identities NOT visible at phase start. They
         # are never assigned/POSTed; they become visible through their parent group.
         self._nested_pass: list[dict] = []
+        # Group members that are nested-only identities still waiting for PASS 3 when their group's
+        # membership was applied: (asset_type, group_key, group_id, members, added, total,
+        # unresolved, member_note). They are added after PASS 3 instead of being reported as
+        # "could not resolve" — they are not missing, just not visible yet.
+        self._held_members: list[tuple] = []
         # (asset_type, natural_key) → source parent group names, derived from the bundle (no call).
         self._parents_by_key: dict = {}
         # principal ids whose workspace assignment was already ensured this run (one PUT at most).
@@ -492,7 +497,8 @@ class IdentityImporter(BaseImporter):
                 self._raise_if_entitlements_failed(unit, target_id, ent)
                 return {"target_id": target_id, "note": note, "entitlements": ent,
                         "source_detail": self._snapshot_json("group", payload)}
-            member_note = self._sync_members(target_id, payload.get("members") or [])
+            member_note = self._sync_members(target_id, payload.get("members") or [],
+                                             group_key=self.natural_key(unit))
             # The additive PATCH (member_note) says what was ADDED/unresolved; the diff names what
             # was removed IN SOURCE — which is REPORTED, not applied (the removed member stays on
             # target for review), per the "report, don't act" stance for source-side removals.
@@ -921,6 +927,7 @@ class IdentityImporter(BaseImporter):
         self._apply_deferred_members()
         # PASS 3 (PLAN 16.3.1 §3B.6): nested-only identities, reached through their parent group.
         self._apply_nested_pass()
+        self._apply_held_members()
         self.flush_checkpoint()
         return result
 
@@ -936,7 +943,7 @@ class IdentityImporter(BaseImporter):
         for i, (name, target_id, members, unit) in enumerate(self._member_pass, 1):
             self.log.debug(f"applying members to group {name} ({len(members or [])} members)")
             try:
-                note = self._sync_members(target_id, members)
+                note = self._sync_members(target_id, members, group_key=name)
             except Exception as exc:  # noqa: BLE001 — fail-soft per group (D21)
                 from src.importers.base_importer import classify_error
                 category, message = classify_error(exc)
@@ -966,7 +973,7 @@ class IdentityImporter(BaseImporter):
                       f"({fmt_elapsed(time.time() - t0)})")
 
     def _amend_row(self, natural_key: str, status: str, note: str, *, category: str = "",
-                   error_raw: str = "") -> None:
+                   error_raw: str = "", asset_type: str = "group") -> None:
         """Update an already-recorded row's status/note after pass 2.
 
         Pass 1 recorded the group as `created` before its membership was known; the outcome the
@@ -974,7 +981,7 @@ class IdentityImporter(BaseImporter):
         than a second row being appended for the same unit.
         """
         for row in self.result.units:
-            if safe_str(row.get("natural_key")) != natural_key or row.get("asset_type") != "group":
+            if safe_str(row.get("natural_key")) != natural_key or row.get("asset_type") != asset_type:
                 continue
             old_status = safe_str(row.get("import_status"))
             new_status = status or old_status
@@ -991,9 +998,9 @@ class IdentityImporter(BaseImporter):
             if category:
                 row["failure_category"] = category
             if new_status == "created_with_warning":
-                self.result.warnings.append(f"group/{natural_key}: {note}")
+                self.result.warnings.append(f"{asset_type}/{natural_key}: {note}")
             if self.state is not None:
-                self.state.record("group", natural_key, action=new_status,
+                self.state.record(asset_type, natural_key, action=new_status,
                                   fingerprint=safe_str(row.get("fingerprint")),
                                   source_object_id=safe_str(row.get("source_id")),
                                   target_object_id=safe_str(row.get("target_id")),
@@ -1007,41 +1014,126 @@ class IdentityImporter(BaseImporter):
                 self._pending_cp.append(natural_key)
             return
 
-    def _sync_members(self, group_id: str, members: list) -> str:
-        """PATCH the group's members, resolving each BY NAME on the target.
+    def _sync_members(self, group_id: str, members: list, *, group_key: str = "",
+                      asset_type: str = "group") -> str:
+        """PATCH the group's members, resolving each on the target.
 
-        Source member ids are meaningless here, so every member is looked up by its
-        userName/applicationId/displayName. A member that doesn't exist on target is skipped and
-        NAMED — usually an identity that wasn't created (an unassigned account identity). Sending a
-        dangling id would fail the whole PATCH and lose the resolvable members too, so partial
-        success with an explicit list beats all-or-nothing.
+        A member is matched by its SOURCE id first: an ACCOUNT identity (user, account SP, account
+        group) keeps the same id in every workspace of the account, so `value` IS its target id once
+        it is on the target. Only when the id is not there (a recreated workspace-local identity)
+        does it fall back to the name — and display names are NOT stable across workspaces for the
+        same account user (seen live 2026-11-25: 13 of `users`' 175 members), so name-first matching
+        reported members as missing that were already on the target.
+
+        A member that is a nested-only identity still waiting for PASS 3 is HELD and added after
+        PASS 3 (`_apply_held_members`), not reported as unresolved. A member that resolves neither
+        way is skipped and NAMED — sending a dangling id would fail the whole PATCH and lose the
+        resolvable members too, so partial success with an explicit list beats all-or-nothing.
         """
-        resolved, unresolved = [], []
+        known_ids = self._known_target_ids()
+        nested_ids, nested_names = self._pending_nested_keys()
+        resolved, unresolved, held = [], [], []
         for member in members or []:
             if not isinstance(member, dict):
                 continue
             display = safe_str(member.get("display"))
-            kind = safe_str(member.get("kind"))
-            tid = self._resolve_member(display, kind)
+            value = safe_str(member.get("value"))
+            tid = self._resolve_member(display, safe_str(member.get("kind")), value=value,
+                                       known_ids=known_ids)
             if tid:
                 resolved.append({"value": tid})
+            elif (value and value in nested_ids) or (display and display in nested_names):
+                held.append(member)
             elif display:
-                unresolved.append(f"{kind or 'member'}:{display}")
+                unresolved.append(f"{safe_str(member.get('kind')) or 'member'}:{display}")
 
         if resolved:
             self.client.patch(f"{_SCIM}/Groups/{group_id}", {
                 "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                 "Operations": [{"op": "add", "path": "members", "value": resolved}],
             })
-        parts = [f"{len(resolved)}/{len(members or [])} members added"]
+        note = self._member_note(len(resolved), len(members or []), unresolved, held=len(held))
+        if held and group_key:
+            self._held_members.append((asset_type, group_key, group_id, held, len(resolved),
+                                       len(members or []), unresolved, note))
+        return note
+
+    @staticmethod
+    def _member_note(added: int, total: int, unresolved: list, *, held: int = 0,
+                     after_nested: int = 0) -> str:
+        parts = [f"{added}/{total} members added"
+                 + (f" ({after_nested} after the nested-identity pass)" if after_nested else "")]
+        if held:
+            parts.append(f"{held} member(s) nested on source are added after the nested-identity "
+                         f"pass")
         if unresolved:
             parts.append(f"could not resolve {len(unresolved)} member(s) on target "
                          f"({', '.join(unresolved[:5])}) — they were not created/assigned, so the "
                          f"group stays under-populated until they are")
         return "; ".join(parts)
 
-    def _resolve_member(self, display: str, kind: str) -> str:
-        """A member's TARGET SCIM id, by name. Falls back across types when `kind` is unknown."""
+    def _known_target_ids(self) -> set:
+        """Every target SCIM id known so far (users, SPs, groups) — for id-first member matching."""
+        return (set(self._target_users.values()) | set(self._target_sps.values())
+                | set(self._target_groups.values())) - {""}
+
+    def _pending_nested_keys(self) -> tuple:
+        """(source ids, names) of the nested-only identities queued for PASS 3."""
+        ids, names = set(), set()
+        for unit in self._nested_pass:
+            if safe_str(unit.get("source_id")):
+                ids.add(safe_str(unit.get("source_id")))
+            for n in (self.natural_key(unit), safe_str((unit.get("payload") or {}).get("displayName"))):
+                if n:
+                    names.add(n)
+        return ids, names
+
+    def _apply_held_members(self) -> None:
+        """After PASS 3: add the held nested-only members to their groups and amend each row so
+        the report states the FINAL membership (not the interim "held" note)."""
+        held_groups, self._held_members = self._held_members, []
+        for asset_type, key, group_id, held, added, total, unresolved, old_note in held_groups:
+            known_ids = self._known_target_ids()
+            resolved, still = [], list(unresolved)
+            for member in held:
+                display = safe_str(member.get("display"))
+                tid = self._resolve_member(display, safe_str(member.get("kind")),
+                                           value=safe_str(member.get("value")), known_ids=known_ids)
+                if tid:
+                    resolved.append({"value": tid})
+                else:
+                    still.append(f"{safe_str(member.get('kind')) or 'member'}:{display}")
+            try:
+                if resolved:
+                    self.client.patch(f"{_SCIM}/Groups/{group_id}", {
+                        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                        "Operations": [{"op": "add", "path": "members", "value": resolved}],
+                    })
+            except Exception as exc:  # noqa: BLE001 — fail-soft per group, like pass 2
+                still = list(unresolved) + [
+                    f"{safe_str(m.get('kind')) or 'member'}:{safe_str(m.get('display'))}"
+                    for m in held]
+                resolved = []
+                self.log.warning(f"group membership {key}: adding nested members failed",
+                                 error=str(exc)[:200])
+            new_note = self._member_note(added + len(resolved), total, still,
+                                         after_nested=len(resolved))
+            row_note = next((safe_str(r.get("note")) for r in self.result.units
+                             if r.get("asset_type") == asset_type
+                             and safe_str(r.get("natural_key")) == key), old_note)
+            note = row_note.replace(old_note, new_note) if old_note in row_note else new_note
+            degraded = bool(still)
+            self._amend_row(key, "created_with_warning" if degraded else "", note,
+                            category="prerequisite_missing" if degraded else "",
+                            asset_type=asset_type)
+            self.log.info(f"group membership {key} → {new_note}")
+
+    def _resolve_member(self, display: str, kind: str, *, value: str = "",
+                        known_ids: set | None = None) -> str:
+        """A member's TARGET SCIM id: by source id first (account identities keep their id across
+        workspaces), then by name. Falls back across types when `kind` is unknown."""
+        if value and value in (known_ids if known_ids is not None else self._known_target_ids()):
+            return value
         if not display:
             return ""
         maps = {"user": self._target_users, "service_principal": self._target_sps,
@@ -1078,7 +1170,8 @@ class IdentityImporter(BaseImporter):
                 f"built-in group `{name}` was not found on the target workspace, which should be "
                 f"impossible — check that the run-as identity can read SCIM Groups")
         self._record_identity_row("group", name, target_id, name, unit, ACTION_ADOPTED)
-        note = self._sync_members(target_id, payload.get("members") or [])
+        note = self._sync_members(target_id, payload.get("members") or [],
+                                  group_key=self.natural_key(unit), asset_type="group_membership")
         return {"target_id": target_id, "note": f"members added to the existing group: {note}",
                 "warning": note if "could not resolve" in note else "",
                 "source_detail": self._snapshot_json("group", payload)}

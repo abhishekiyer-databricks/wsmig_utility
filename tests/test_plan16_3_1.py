@@ -731,3 +731,70 @@ def test_dry_run_intent_is_only_for_nested_creates():
     imp, _st = _importer(FakeScimClient(), [])
     assert imp.dry_run_intent(_grp("C1", []), UpsertAction.ADOPT) == ""
     assert imp.dry_run_intent(_grp("G", ["USER"]), UpsertAction.CREATE) == ""
+
+
+# ── group membership: id-first matching + nested members held until PASS 3 (2026-11-25 live) ──
+# Live Run 1 (full bed): `users` reported "160/174 members added; could not resolve 14 … stays
+# under-populated" while the target group matched the source BY ID (174/174). 13 were account users
+# whose display name differs between the two workspaces; 1 was a nested-only user that PASS 3 only
+# finds after membership was applied.
+
+def _users_membership(members):
+    return _iunit("group_membership", "users", {"displayName": "users", "members": members},
+                  kind="system", import_action="add_members")
+
+
+def _member_patches(client, gid):
+    return [v["value"] for p in client.patches_to(f"/Groups/{gid}")
+            if p[2]["Operations"][0]["path"] == "members" for v in p[2]["Operations"][0]["value"]]
+
+
+def test_member_whose_display_name_differs_on_target_resolves_by_source_id(fast):
+    client = FakeScimClient(
+        users=[{"id": "acct-1", "userName": "julia.wu@x.com", "displayName": "Julia Wu"}],
+        groups=[{"id": "grp-users", "displayName": "users"}])
+    imp, _st = _importer(client, [
+        _user("julia.wu@x.com", ["USER"]),
+        _users_membership([{"value": "acct-1", "display": "julia.wu Wu", "kind": "user"}])])
+    res = imp.run()
+    row = next(r for r in res.units if r["asset_type"] == "group_membership")
+    assert _member_patches(client, "grp-users") == ["acct-1"]
+    assert "could not resolve" not in row["note"] and row["import_status"] != "created_with_warning"
+    assert "1/1 members added" in row["note"]
+
+
+def test_name_fallback_still_used_when_source_id_is_not_on_target(fast):
+    """A recreated workspace-local identity has a NEW id — the name path must still work."""
+    client = FakeScimClient(users=[{"id": "tgt-9", "userName": "a@x.com", "displayName": "A"}],
+                            groups=[{"id": "grp-users", "displayName": "users"}])
+    imp, _st = _importer(client, [
+        _users_membership([{"value": "src-old-id", "display": "A", "kind": "user"}])])
+    imp.run()
+    assert _member_patches(client, "grp-users") == ["tgt-9"]
+
+
+def test_nested_only_member_is_held_then_added_after_pass_3_without_a_warning(fast):
+    client, units = _nested_bed()
+    client.scim["Groups"].append({"id": "grp-users", "displayName": "users"})
+    units.append(_users_membership([{"value": "src-nu", "display": "nu@x.com", "kind": "user"}]))
+    imp, st = _importer(client, units)
+    res = imp.run()
+    row = next(r for r in res.units if r["asset_type"] == "group_membership")
+    assert _member_patches(client, "grp-users") == ["src-nu"], "added once PASS 3 found it"
+    assert row["import_status"] != "created_with_warning", row
+    assert "could not resolve" not in row["note"]
+    assert "1/1 members added (1 after the nested-identity pass)" in row["note"]
+    assert st.row("group_membership", "users")["last_action"] != "created_with_warning"
+
+
+def test_nested_only_member_still_invisible_after_pass_3_is_a_real_warning(fast):
+    client, units = _nested_bed()
+    client.reveal_on_put = {}                      # parent assignment never reveals the children
+    client.scim["Groups"].append({"id": "grp-users", "displayName": "users"})
+    units.append(_users_membership([{"value": "src-nu", "display": "nu@x.com", "kind": "user"}]))
+    imp, _st = _importer(client, units)
+    res = imp.run()
+    row = next(r for r in res.units if r["asset_type"] == "group_membership")
+    assert row["import_status"] == "created_with_warning"
+    assert "0/1 members added" in row["note"] and "could not resolve 1 member(s)" in row["note"]
+    assert client.patches_to("/Groups/grp-users") == [], "nothing resolvable → no empty PATCH"

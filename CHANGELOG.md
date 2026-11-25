@@ -34,6 +34,13 @@ existing 1.2.0 bundles import as they are (no re-inventory, no re-export, no sou
   `DIRECTORY_PROTECTED` → "the owner is not assigned to the target workspace"; anything else → "confirm the run-as
   identity is a workspace admin". Owners deleted in source still go to `/Users_Backup` (decided before any
   `mkdirs`). Dry runs and the existence check never create anything.
+- **False "under-populated" group warning.** Group members were matched on the target by display name, which is
+  not stable across workspaces for the same account user, so `users` reported e.g. *160/174 members added; could
+  not resolve 14 … stays under-populated* although the target group already matched the source. Members are now
+  matched by their source id first (account identities keep their id in every workspace), with the name as the
+  fallback (recreated workspace-local identities). A member that is a nested-only identity still waiting for the
+  nested-identity pass is added after that pass instead of being reported missing; only a member that still
+  cannot be found is a warning.
 - **Service principal homes** (latent bug): every account SP is in `sp_mapping` as `appId → appId`, which the tool
   read as "recreated SP, home auto-provisioned", so it never checked or created an account SP's home and reported
   it as provisioned. Only an SP mapped to a *different* applicationId is treated as recreated now; its new home
