@@ -297,6 +297,12 @@ account-admin / customer IT.
 - Generic first: no customer- or workspace-specific values in code; all in widgets/config.
 
 ## Status (2026-08-06)
+- **1.2.1 hotfix (PLAN 16.3.1, 2026-11-23) — implemented + offline-tested, live QA pending:** (A) absent
+  `/Users/<owner>` homes (users AND account SPs) are created with `mkdirs` as the workspace-admin run-as, since
+  homes no longer appear on assignment (ES-2364565); `sp_mapping` identity entries no longer mean "recreated SP".
+  (B) identities nested-only on source (`workspace_permissions == []`) are never directly assigned/POSTed — PASS 3
+  waits for them via their parent; adopted identities get entitlements; every entitlement write is GET→PATCH→GET
+  and reported (copied / present / failed) on the identity sheets. Plan: `plans/PLAN_16_3_1_*.md`.
 - **Plans 1, 2 AND 3 are IMPLEMENTED and live-tested**. The whole pipeline runs:
   inventory → export → preflight → import (all 12 phases) → reports.
 

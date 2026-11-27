@@ -16,8 +16,9 @@ The step-by-step guide to running a real migration. Follow it top to bottom. Eve
 6. [Handling failures & manual actions](#-handling-failures--manual-actions)
 7. [Dashboards: publish, credentials, schedules](#-dashboards-publish-credentials-schedules)
 8. [Owners & run-as identities](#-owners--run-as-identities)
-9. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
-10. [Quick reference card](#-quick-reference-card)
+9. [Nested identities (via a group)](#-nested-identities-via-a-group)
+10. [Re-running (incremental migrations)](#-re-running-incremental-migrations)
+11. [Quick reference card](#-quick-reference-card)
 
 ---
 
@@ -256,6 +257,9 @@ Fix the cause, then re-run only the outstanding units.
 | **Legacy SQL dashboards** | Rebuild the visual layout (underlying queries already migrated) | — |
 | **Git repos** | Recreate from the exported metadata (url / provider / branch / path) | — |
 | **Account identities not assigned** | Customer IT/SCIM assigns them (or grant account-admin) | re-run identity |
+| **Home could not be created: the owner is not assigned** (`DIRECTORY_PROTECTED` in the note) | Assign the named user / SP to the target workspace | `retry_mode=failed_only` |
+| **Home could not be created: other error** (e.g. `PERMISSION_DENIED`) | Check that the run-as SP is a **workspace admin** on the target | `retry_mode=failed_only` |
+| **Identity entitlements not applied** (`not_applied`, "entitlements could not be applied") | Read the server message in the row; fix it (e.g. the run-as is not an admin) | `retry_mode=failed_only` |
 | **Permissions waiting on a DAB redeploy** | Redeploy the bundle to the target, then | `import_assets=acls` + `retry_mode=skipped_only` |
 
 > 🔁 After you fix identities or redeploy a DAB, re-running just **`import_assets=acls`** with
@@ -339,6 +343,22 @@ Fix the cause, then re-run only the outstanding units.
 > resolved `run_id` is missing, unreadable or incomplete, the export task goes red with the path and
 > `run_id` in the message and writes nothing. Run `01_Inventory` first, or pass the `run_id` of a
 > completed inventory. Export never re-runs the inventory by itself.
+
+> 🏠 **User and SP homes are created by the tool (1.2.1).** Since 2026-11-12 a `/Users/<owner>` home
+> appears only when its owner **signs in**, or when a **workspace admin creates it** — no longer when
+> the owner is assigned. So the import creates every missing home itself (`mkdirs`, as the
+> workspace-admin run-as), once per owner, checks that it exists, and then imports the content. The
+> home row reads `created` — *home created by the migration (mkdirs as workspace admin; owner had not
+> signed in)*. It is a real home: the owner holds `CAN_MANAGE`, and their first sign-in uses it.
+> This includes **service principal** homes (`/Users/<applicationId>`).
+> - The platform refuses a home for an owner who is **not assigned** to the target. The row is
+>   `prerequisite_missing` and quotes the server (`DIRECTORY_PROTECTED: Folder Users is protected`):
+>   assign the owner, then `retry_mode=failed_only`.
+> - An owner **deleted in source** still goes to `/Users_Backup` (no home is created for it).
+> - A **dry run** creates nothing; its home rows say *does not exist yet; a live run creates it*.
+> - **Upgrading from 1.2.0:** home rows that 1.2.0 left `prerequisite_missing` heal with one
+>   `retry_mode=failed_only` run (`dry_run=false`, same `run_id`, no re-export) — homes are created and
+>   the content and its permissions land in that run.
 
 > 📁 **`.db_internal`, `.ide` and `.databricks` folders** are Databricks-owned. They are listed in
 > the inventory and reports as **Skipped — platform-internal**, and are never read, copied or
@@ -425,6 +445,56 @@ runs as the wrong identity.
 **Permissions** → make the source owner **Is Owner**; or call `PUT /api/2.0/permissions/pipelines/<id>`
 naming the new `IS_OWNER` plus every other grant. The next import run keeps that owner (it is now the
 current owner) and changes nothing.
+
+**Jobs that run as a service principal** follow the same platform rule: the identity that creates the
+job (the import run-as) needs the **Service Principal User** role (`roles/servicePrincipal.user`) on
+each SP used as a job's `run_as` — for directly assigned and nested SPs alike. Grant it in the account
+console (service principal → **Permissions**) before the import, or grant it and re-run the failed jobs
+with `retry_mode=failed_only`.
+
+---
+
+## 👥 Nested identities (via a group)
+
+An account group, service principal or user is in a workspace in one of two ways:
+
+| How | What it means | Where you see it |
+|-----|---------------|------------------|
+| **Directly assigned** | The identity itself is assigned to the workspace | Settings → Identity and access, and `GET /api/2.0/preview/permissionassignments` |
+| **Via a group** | Only a **member** of a group that is assigned | Only when you search for it (👥 icon); not in `permissionassignments` |
+
+Group membership (including groups inside groups) is **account-wide**, so it is already the same on the
+target. Only the workspace assignments can differ.
+
+**What 1.2.1 does** (always on):
+- An identity that is **via a group on the source** is never assigned directly on the target. The
+  tool waits until it is visible through its group (normally seconds), then applies its
+  entitlements. Its row reads `adopted` with *nested on source via `<group>`…*, and the
+  **Assignment** column says `via group (<group>)`.
+- If none of its groups reaches the target, the row is `prerequisite_missing` and names the groups and
+  what happened to each. Import or assign a group, then `retry_mode=failed_only`. The tool never
+  assigns the identity directly instead.
+- An identity that is **directly assigned on the source** is directly assigned on the target too —
+  even if it was already visible there through a group.
+- An identity that already exists on the target gets its entitlements checked and applied (1.2.0 only
+  recorded it as adopted).
+
+**Every identity row shows its entitlements:** **Entitlements copied** (applied and confirmed by a
+read-back), **Already present**, and **Entitlements failed** (with the server's message — the row is
+`failed`, and `retry_mode=failed_only` retries it).
+
+**Targets migrated with 1.2.0** may have identities assigned directly that the source only had via a
+group (1.2.0 assigned them). The tool **never removes an assignment**. Such rows carry the note
+*directly assigned on target, nested only on source (via …); left unchanged*, and the Assignment column
+reads `direct on target (pre-existing); nested on source`. To mirror the source layout, remove them by
+hand:
+1. On the **source**, confirm the identity's group (named in the note) is itself assigned to the
+   target workspace — otherwise removing the direct assignment would remove its access.
+2. On the **target** workspace: **Settings → Identity and access → Groups** (or Service principals /
+   Users) → the identity → **Remove from workspace**. **Never delete the account group** — that deletes
+   it in every workspace.
+3. The identity stays visible through its group, keeps its entitlements and its object permissions.
+   Later 1.2.1 runs keep it that way (1.2.0 would have assigned it again).
 
 ---
 

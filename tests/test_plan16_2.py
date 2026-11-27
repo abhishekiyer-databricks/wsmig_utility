@@ -927,6 +927,9 @@ def test_dab_dashboard_children_are_dab_redeploy_and_skipped():
 
 def test_schedule_on_unpublished_parent_is_a_retryable_prerequisite():
     env, units = _published_env(schedules=[_sched()])
+    # PLAN 16.3.1: the owner's home is present (else the dashboard create would first mkdirs it,
+    # shifting the fake's id counter so the dashboard is no longer `d1`).
+    env.client.paths["/Users/a@x.com"] = "o0"
     did_path = "api/2.0/lakeview/dashboards/d1/published"
     env.client.fail_posts.add(did_path)
     res, _ = env.run(DashboardsImporter, units)

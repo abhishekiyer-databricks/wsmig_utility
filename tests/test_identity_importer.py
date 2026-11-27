@@ -30,6 +30,8 @@ class FakeScimClient:
         self._n = 0
         self.fail_paths: set = set()
         self.assignments: list = []
+        self.attrs: dict = {}           # SCIM object path → {"entitlements"|"roles": {values}}
+        self.lose_patches = False       # True → PATCH returns 2xx but nothing is stored
 
     def get_scim(self, resource, max_items=0, count=500):
         return list(self.scim.get(resource, []))
@@ -38,6 +40,10 @@ class FakeScimClient:
         self.calls.append(("GET", path, params))
         if "permissionassignments" in path:
             return {"permission_assignments": list(self.assignments)}
+        # PLAN 16.3.1 DB5: an identity GET returns what earlier PATCHes stored, like the real API,
+        # so the post-PATCH read-back verifies. `lose_patches` models "2xx but not applied".
+        if path in self.attrs:
+            return {a: [{"value": v} for v in sorted(vals)] for a, vals in self.attrs[path].items()}
         return {}
 
     def put(self, path, body):
@@ -90,6 +96,11 @@ class FakeScimClient:
         self.calls.append(("PATCH", path, body))
         if path in self.fail_paths:
             raise RuntimeError("PERMISSION_DENIED: cannot patch")
+        if not self.lose_patches:
+            for op in (body or {}).get("Operations") or []:
+                if op.get("path") in ("entitlements", "roles") and op.get("op") == "add":
+                    bucket = self.attrs.setdefault(path, {}).setdefault(op["path"], set())
+                    bucket.update(v.get("value") for v in op.get("value") or [])
         return {}
 
     def patches_to(self, needle):
@@ -430,18 +441,26 @@ def test_entitlements_and_roles_are_applied_as_separate_patches_after_create():
     assert "entitlements" in paths and "roles" in paths
 
 
-def test_a_failed_entitlement_patch_does_not_fail_the_identity():
-    """The identity already exists by then; losing it over an entitlement would be worse."""
+def test_a_failed_entitlement_patch_fails_the_row_but_keeps_the_identity():
+    """PLAN 16.3.1 DB5 (updated from `…_does_not_fail_the_identity`): the identity already exists
+    and is kept (target id + identity map row recorded), but the row is now FAILED `not_applied`
+    with the server's message — 1.2.0's warning-only path never reached the report, so a missing
+    entitlement looked like a clean `created`. `failed_only` re-applies it."""
     client = FakeScimClient()
     # The SP now ADOPTS its account id, so the PATCH target is acct-<appId>, not scim-N.
     client.fail_paths = {"api/2.0/preview/scim/v2/ServicePrincipals/acct-app-1"}
-    imp, _st = _importer(client, [
+    imp, st = _importer(client, [
         _unit("service_principal", "app-1",
               {"displayName": "sp", "entitlements": [{"value": "allow-cluster-create"}]},
               kind="account")])
     res = imp.run()
-    assert res.created == 1 and res.failed == 0
-    assert any("could not set entitlements" in w for w in res.warnings)
+    assert res.created == 0 and res.failed == 1
+    row = res.units[0]
+    assert row["failure_category"] == "not_applied"
+    assert row["target_id"] == "acct-app-1", "the identity exists — its target id is kept"
+    assert "PERMISSION_DENIED" in row["error_raw"]
+    assert row["entitlements_failed"].startswith("allow-cluster-create")
+    assert st.row("service_principal", "app-1")["target_object_id"] == "acct-app-1"
 
 
 # ── an SP with OAuth secrets is created but flagged degraded ────────────────

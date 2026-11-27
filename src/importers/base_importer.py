@@ -55,12 +55,21 @@ from src.utils.logger import fmt_counts, fmt_elapsed, get_logger
 # Lakeview dashboards, Genie spaces — share ONE home-resolution decision instead of a second,
 # divergent copy). `kind` ∈:
 #   "not_home"      – not under /Users → the caller proceeds unchanged
-#   "skip_root"     – the /Users/<owner> ROOT itself, provisioned not created (no-op)
-#   "remapped_sp"   – owner is a recreated SP (sp_mapping) → /Users/<newAppId>/… (IMP-6)
-#   "normal_home"   – owner's real home exists on target → use it as-is
-#   "backup"        – divert to <backup_root>/<owner>/… (orphaned/deleted-in-source owner)
-#   "prerequisite"  – owner absent on target and NOT eligible for backup → wait / recover on retry
+#   "skip_root"        – the /Users/<owner> ROOT itself, already present on target (no-op)
+#   "provisioned_root" – the ROOT itself, absent on target and just created by `_provision_home`
+#                        (mkdirs as workspace admin — PLAN 16.3.1 Part A; homes are no longer
+#                        created on workspace load, only on sign-in or an admin mkdirs)
+#   "remapped_sp"      – owner is a recreated SP (sp_mapping → a DIFFERENT appId) →
+#                        /Users/<newAppId>/… (IMP-6); its new home is present or was just created
+#   "normal_home"      – owner's real home exists on target (or was just created) → use it as-is
+#   "backup"           – divert to <backup_root>/<owner>/… (orphaned/deleted-in-source owner)
+#   "prerequisite"     – home absent and could not be created (owner not assigned, run-as not
+#                        admin, dry run, or backup off for a deleted owner) → recover on retry
 HomeResolution = namedtuple("HomeResolution", ["target_path", "kind", "note"])
+
+# The note on a home ROOT the migration created itself (PLAN 16.3.1 Part A).
+HOME_PROVISIONED_NOTE = ("home created by the migration (mkdirs as workspace admin; owner had not "
+                         "signed in)")
 
 # Flush the checkpoint every N units. Every write to a UC Volume is a FULL-file rewrite (verified
 # live — memory `uc-volume-file-io-limits`), so per-item flushing is O(n²) bytes; one flush at the
@@ -163,6 +172,28 @@ class NotApplied(RuntimeError):
     Filed `not_applied` — the report must be the source of truth, not the HTTP status."""
 
 
+class DeferredToNestedPass(Exception):
+    """A unit whose outcome is decided LATER in the same phase, not now (PLAN 16.3.1 §3B.3).
+
+    Raised by `create_one` for an identity that is only NESTED on the source (a member of an
+    assigned group, never directly assigned): it must not be assigned or POSTed here, so it waits
+    for the importer's own later pass, which records its row. `run()` records NOTHING for it now —
+    deliberately not an Exception subclass of RuntimeError so no generic handler can misfile it."""
+
+
+class EntitlementsNotApplied(NotApplied):
+    """The identity exists on target, but some entitlements/roles were refused or did not read
+    back (PLAN 16.3.1 DB5). Carries the target id and the per-value result so the FAILED row still
+    names the object and shows what was copied / already present / failed."""
+
+    def __init__(self, message: str, *, target_id: str = "", entitlements: Optional[dict] = None,
+                 error_raw: str = "") -> None:
+        super().__init__(message)
+        self.target_id = target_id
+        self.entitlements = entitlements
+        self.error_raw = error_raw
+
+
 class UnsupportedOperation(RuntimeError):
     """This asset has no REST create path in scope, so the tool never attempts it.
 
@@ -201,6 +232,17 @@ def classify_error(exc: Exception) -> tuple[str, str]:
 def is_already_exists(exc: Exception) -> bool:
     raw = str(exc)
     return any(m.lower() in raw.lower() for m in _ALREADY_EXISTS_MARKERS)
+
+
+def _failure_extras(exc: Exception, target_id: str = "") -> dict:
+    """`_record` kwargs for a FAILED row: the raw error, plus — when the exception carries them
+    (EntitlementsNotApplied, PLAN 16.3.1 DB5) — the target id of the object that DOES exist and
+    the per-value entitlement result. Any other exception gives exactly the pre-1.2.1 kwargs."""
+    extras = {"target_id": safe_str(getattr(exc, "target_id", "")) or target_id,
+              "error_raw": safe_str(getattr(exc, "error_raw", "")) or str(exc)}
+    if getattr(exc, "entitlements", None) is not None:
+        extras["entitlements"] = exc.entitlements
+    return extras
 
 
 class ImportResult:
@@ -503,16 +545,19 @@ class BaseImporter(ABC):
           • ORPHANED owner (deleted-in-source, absent from the roster) → diverted to the backup root,
             the divert recorded so the create records `created_with_warning` and a re-run ADOPTS the
             already-migrated object rather than re-creating it;
-          • an in-roster / unknown owner whose home isn't present yet → the SOURCE path is kept, so
-            the create 404s and `missing_parent_prerequisite` files a clean, retryable prerequisite
-            (unchanged reactive behaviour — never a proactive divert into backup).
+          • an in-roster / unknown owner whose home isn't present yet → the home is CREATED with
+            `mkdirs` (PLAN 16.3.1 Part A); if the platform refuses, the SOURCE path is kept, so the
+            create 404s and `missing_parent_prerequisite` files a clean, retryable prerequisite
+            (never a proactive divert into backup).
+        Only ever called from a live create/update (never in dry-run or the existence check), so
+        provisioning here has no side effect a rehearsal could trigger.
         Returns the HomeResolution so the caller can surface a backup divert as a warning. An
         empty/absent path is dropped so the body is clean."""
         raw = safe_str(body.get("parent_path"))
         if not raw:
             body.pop("parent_path", None)
             return HomeResolution("", "not_home", "")
-        res = self._resolve_home_target(raw)
+        res = self._resolve_home_target(raw, provision=True)
         if res.kind == "backup":
             # Divert to the backup root, ensure the folder exists (the create APIs for these
             # families do NOT auto-provision a parent, unlike workspace/import+mkdirs), and record
@@ -521,7 +566,8 @@ class BaseImporter(ABC):
             self._ensure_folder(res.target_path)
             self._note_path_remap(normalize_ws_path(raw), res.target_path)
         else:
-            # not_home / normal_home / remapped_sp / skip_root / prerequisite: the resolved path IS
+            # not_home / normal_home / remapped_sp / skip_root / provisioned_root / prerequisite:
+            # the resolved path IS
             # the source path for everything except an SP-home remap; prerequisite keeps the source
             # path on purpose so a genuinely-missing parent 404s into missing_parent_prerequisite.
             body["parent_path"] = res.target_path or normalize_ws_path(raw)
@@ -544,11 +590,18 @@ class BaseImporter(ABC):
             self.client.get("api/2.0/workspace/get-status", params={"path": parent_path})
         except Exception as probe:  # noqa: BLE001 — only a confirmed 404 changes the outcome
             if is_not_found(probe):
+                owner = home_owner(parent_path)
+                if owner and not self._home_present(f"/Users/{owner}"):
+                    # The folder is missing because its HOME is missing (PLAN 16.3.1 Part A): say
+                    # why the home could not be created, in the platform's own words.
+                    raise PrerequisiteMissing(
+                        f"`{natural_key}` targets workspace folder `{parent_path}`, which does not "
+                        f"exist on target yet: "
+                        + self._home_prerequisite_reason(parent_path)) from exc
                 raise PrerequisiteMissing(
                     f"`{natural_key}` targets workspace folder `{parent_path}`, which does not exist "
-                    f"on target yet — provision/assign its owner (a user home is created on first "
-                    f"login) or import the folder's content family first, then re-run with "
-                    f"retry_mode=failed_only.") from exc
+                    f"on target yet — import the folder's content family (workspace) first, then "
+                    f"re-run with retry_mode=failed_only.") from exc
             self.log.debug(f"parent {parent_path} unverifiable ({str(probe)[:160]}) — the "
                            f"server's error is reported as-is")
             return
@@ -629,22 +682,110 @@ class BaseImporter(ABC):
         return remapped, (f"service-principal home remapped {owner} → {new_app_id} "
                           f"(the SP was recreated with a new applicationId on target)")
 
+    def _is_recreated_sp(self, owner: str) -> bool:
+        """Whether a home `owner` is an SP recreated with a DIFFERENT applicationId (IMP-6).
+
+        `sp_mapping` holds EVERY migrated SP (`state_store.load_identity_map`), and an account SP
+        keeps its applicationId, so its entry is the identity mapping `appId → appId`. Membership
+        alone therefore does NOT mean "recreated" — only a mapping to a different appId does
+        (PLAN 16.3.1 D3; treating the identity mapping as recreated is the latent bug that skipped
+        every account-SP home)."""
+        new = safe_str((self.identity_map.get("sp_mapping") or {}).get(safe_str(owner)))
+        return bool(new) and new != safe_str(owner)
+
     def _home_present(self, home_root: str) -> bool:
-        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?"""
+        """Cached: does the `/Users/<owner>` home exist on target (remapped for a recreated SP)?
+
+        Always a real `get-status` (PLAN 16.3.1): an SP's home is NOT created when the SP is
+        created or assigned (P9/P10), so there is no "auto-provisioned" shortcut any more."""
         if not home_root:
             return True
         cache = getattr(self, "_home_present_cache", None)
         if cache is None:
             cache = self._home_present_cache = {}
         if home_root not in cache:
-            owner = home_owner(home_root)
-            sp_map = self.identity_map.get("sp_mapping") or {}
-            if sp_map.get(owner):
-                cache[home_root] = True   # an SP's home is auto-provisioned at SP-create
-            else:
-                remapped, _ = self._remap_home_path(home_root)
-                cache[home_root] = bool(self._get_status(remapped))
+            remapped, _ = self._remap_home_path(home_root)
+            cache[home_root] = bool(self._get_status(remapped))
         return cache[home_root]
+
+    def _provision_home(self, owner: str, home_root: str) -> bool:
+        """Create a missing `/Users/<owner>` home with `mkdirs`, as the workspace-admin run-as
+        identity (PLAN 16.3.1 Part A). Returns whether the home is now present.
+
+        Since 2026-11-12 a home appears only on the owner's sign-in or an admin `mkdirs` (P1/P4); it
+        is a REAL home (owner holds CAN_MANAGE) that the owner's first sign-in reuses (P5). The
+        platform itself refuses an owner who is not assigned to the workspace (`DIRECTORY_PROTECTED`,
+        P3) and a non-admin caller (`PERMISSION_DENIED`, P6), creating nothing — so no pre-check is
+        needed and the refusal text is kept verbatim for the prerequisite row.
+
+        At most ONE attempt per home root per importer pass (cached), never in a dry run, and every
+        success is READ BACK (the report is the source of truth, not the HTTP status)."""
+        if not home_root:
+            return False
+        cache = getattr(self, "_home_provision_cache", None)
+        if cache is None:
+            cache = self._home_provision_cache = {}
+        if home_root in cache:
+            return cache[home_root]
+        if self.dry_run:
+            return False          # never a call in a rehearsal; not cached (a dry run never flips)
+        errors = self._home_provision_errors()
+        try:
+            self.client.post("api/2.0/workspace/mkdirs", {"path": home_root})
+        except Exception as exc:  # noqa: BLE001 — the refusal becomes the prerequisite's reason
+            message = safe_str(str(exc)).strip()[:600]
+            errors[home_root] = message
+            self.log.warning(f"could not create home {home_root}  error={message}")
+            cache[home_root] = False
+            return False
+        if self._get_status(home_root):          # uncached read-back
+            present = getattr(self, "_home_present_cache", None)
+            if present is None:
+                present = self._home_present_cache = {}
+            present[home_root] = True
+            self.context.setdefault("homes_provisioned", []).append(safe_str(owner))
+            self.log.info(f"created home {home_root} (owner had not signed in)")
+            cache[home_root] = True
+            return True
+        errors[home_root] = "mkdirs returned 200 but the home is not present"
+        self.log.warning(f"could not create home {home_root}  error={errors[home_root]}")
+        cache[home_root] = False
+        return False
+
+    def _home_provision_errors(self) -> dict:
+        """`{home_root: server message}` for every home `_provision_home` could not create."""
+        errors = getattr(self, "_home_provision_error", None)
+        if errors is None:
+            errors = self._home_provision_error = {}
+        return errors
+
+    def _home_prerequisite_reason(self, path: str) -> str:
+        """WHY the home that `path` lives in is absent and was not created — the actionable half of
+        every home `prerequisite_missing` row (PLAN 16.3.1 §3A.5). Uses the platform's own refusal
+        text when `_provision_home` was refused, never a guess. Category is always
+        `prerequisite_missing`, so `retry_mode=failed_only` sweeps these rows up."""
+        norm = normalize_ws_path(path)
+        owner = home_owner(norm)
+        remapped, _ = self._remap_home_path(f"/Users/{owner}")
+        root = remapped
+        error = safe_str(self._home_provision_errors().get(root))
+        if error and "DIRECTORY_PROTECTED" in error.upper():
+            return (f"home `{root}` could not be created: the owner is not assigned to the target "
+                    f"workspace (server: {error}). Assign `{owner}` to the target, then re-run with "
+                    f"retry_mode=failed_only.")
+        if error:
+            return (f"home `{root}` could not be created (server: {error}). Confirm the run-as "
+                    f"identity is a workspace admin, then re-run with retry_mode=failed_only.")
+        if self._roster_status(owner) == "absent":
+            who = "service principal" if looks_like_app_id(owner) else "user"
+            return (f"home `{root}` does not exist and its owner ({who}) `{owner}` was deleted in "
+                    f"source (absent from the source roster); with workspace_home_backup=false its "
+                    f"content is not diverted to the backup root. Enable workspace_home_backup (or "
+                    f"recreate the owner), then re-run with retry_mode=failed_only.")
+        if self.dry_run:
+            return f"home `{root}` does not exist yet; a live run creates it."
+        return (f"home `{root}` does not exist yet and was not created. Re-run with "
+                f"retry_mode=failed_only.")
 
     def _backup_path(self, path: str, owner: str) -> str:
         """`<backup_root>/<owner>/<path-relative-to-/Users/owner>` (PLAN 9 §4.2)."""
@@ -673,18 +814,22 @@ class BaseImporter(ABC):
             self.log.debug(f"mkdirs {path} failed (the create will surface any real problem): "
                            f"{str(exc)[:200]}")
 
-    def _resolve_home_target(self, path: str) -> HomeResolution:
+    def _resolve_home_target(self, path: str, provision: bool = False) -> HomeResolution:
         """Decide where a `/Users/<owner>/<rest>` path (root OR descendant) should be created.
 
-        Folds the home logic (SP remap IMP-6, presence guard, orphaned-home divert) into ONE
-        decision (PLAN 9 §4.1; lifted to the base class in PLAN 11 Finding-8). Order:
-          1. owner is a recreated SP (`sp_mapping`) → remap to /Users/<newAppId>/… (IMP-6).
+        Folds the home logic (SP remap IMP-6, presence guard, orphaned-home divert, home creation)
+        into ONE decision (PLAN 9 §4.1; lifted to the base class in PLAN 11 Finding-8; creation
+        added in PLAN 16.3.1 Part A). Order:
+          1. owner is a RECREATED SP (`sp_mapping` → a different appId) → remap to
+             /Users/<newAppId>/… (IMP-6); its NEW home is checked, and created when `provision`.
           2. else owner's real home is present on target → use it as-is.
-          3. else owner absent on target:
-             - `workspace_home_backup` off → prerequisite (the pre-PLAN-9 behaviour).
-             - owner ABSENT from the source roster (deleted in source) → divert to the backup root.
-             - owner in-roster / unknown → prerequisite; recovers into the REAL home on
-               retry_mode=failed_only, never a silent divert.
+          3. else `workspace_home_backup` on AND owner ABSENT from the source roster (deleted in
+             source) → divert to the backup root. Decided BEFORE any mkdirs (D2).
+          4. else `provision` and `_provision_home` succeeds → the home now exists
+             (`provisioned_root` for the root, `normal_home` for a descendant).
+          5. else → prerequisite; recovers into the REAL home on retry_mode=failed_only.
+        `provision` is False for the existence check (no side effects, runs in dry-run too) and True
+        only on the live create paths.
         """
         norm = normalize_ws_path(path)
         owner = home_owner(norm)
@@ -693,15 +838,21 @@ class BaseImporter(ABC):
         home_root = f"/Users/{owner}"
         is_root = norm == home_root
 
-        sp_map = self.identity_map.get("sp_mapping") or {}
-        if sp_map.get(owner):
+        if self._is_recreated_sp(owner):
             remapped, note = self._remap_home_path(norm)
-            if is_root:
-                return HomeResolution(
-                    remapped, "skip_root",
-                    f"SP home root — auto-provisioned when the SP was created; {note}"
-                    if note else "SP home root — auto-provisioned when the SP was created")
-            return HomeResolution(remapped, "remapped_sp", note)
+            new_app_id = safe_str((self.identity_map.get("sp_mapping") or {}).get(owner))
+            new_root = f"/Users/{new_app_id}"
+            if self._home_present(new_root):
+                if is_root:
+                    return HomeResolution(remapped, "skip_root",
+                                          f"SP home root — already present; {note}")
+                return HomeResolution(remapped, "remapped_sp", note)
+            if provision and self._provision_home(new_app_id, new_root):
+                if is_root:
+                    return HomeResolution(remapped, "provisioned_root",
+                                          f"{HOME_PROVISIONED_NOTE}; {note}")
+                return HomeResolution(remapped, "remapped_sp", note)
+            return HomeResolution(remapped, "prerequisite", note)
 
         if self._home_present(home_root):
             if is_root:
@@ -710,15 +861,18 @@ class BaseImporter(ABC):
             return HomeResolution(norm, "normal_home", "")
 
         backup_on = bool(getattr(self.config.imports, "workspace_home_backup", False))
-        if not backup_on:
-            return HomeResolution(norm, "prerequisite", "")
-        if self._roster_status(owner) == "absent":
+        roster_absent = self._roster_status(owner) == "absent"
+        if backup_on and roster_absent:
             backup_path = self._backup_path(norm, owner)
             who = "service principal" if looks_like_app_id(owner) else "user"
             note = (f"owner ({who}) `{owner}` was deleted in source (absent from the source "
                     f"roster) — its home cannot be recreated under /Users/; object preserved at "
                     f"`{backup_path}`. Reassign to the intended owner if needed.")
             return HomeResolution(backup_path, "backup", note)
+        if provision and not roster_absent and self._provision_home(owner, home_root):
+            if is_root:
+                return HomeResolution(norm, "provisioned_root", HOME_PROVISIONED_NOTE)
+            return HomeResolution(norm, "normal_home", "")
         return HomeResolution(norm, "prerequisite", "")
 
     def require_remap(self, ref_type: str, source_id: str, referenced_by: str = "") -> str:
@@ -1004,6 +1158,10 @@ class BaseImporter(ABC):
         # CREATE
         try:
             out = self.create_one(unit) or {}
+        except DeferredToNestedPass:
+            # Decided by the importer's own later pass, which records the row (PLAN 16.3.1 §3B.3).
+            self.log.debug(f"{asset_type} {key} → deferred to a later pass of this phase")
+            return
         except SkippedNoObject as exc:
             # A declarative unit whose object isn't there — outstanding work, not an error (§6b-i).
             self._record(unit, ACTION_SKIPPED_NO_OBJECT, note=str(exc), category=exc.category)
@@ -1032,13 +1190,15 @@ class BaseImporter(ABC):
                 return
             category, message = classify_error(exc)
             # The ERROR outcome line (object + category + raw server error) is logged by _record.
-            self._record(unit, ACTION_FAILED, note=message, error_raw=str(exc), category=category)
+            self._record(unit, ACTION_FAILED, note=message, category=category,
+                         **_failure_extras(exc))
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_CREATED,
                      target_id=safe_str(out.get("target_id")),
                      note=warning or safe_str(out.get("note")),
-                     source_detail=safe_str(out.get("source_detail")))
+                     source_detail=safe_str(out.get("source_detail")),
+                     entitlements=out.get("entitlements"))
 
     def _do_declarative(self, unit: dict, target_id: str) -> None:
         """Apply a declarative unit (members / grants) onto an object that already exists.
@@ -1073,15 +1233,17 @@ class BaseImporter(ABC):
             return
         except Exception as exc:  # noqa: BLE001
             category, message = classify_error(exc)
-            self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
-                         error_raw=str(exc), category=category)
+            self._record(unit, ACTION_FAILED, note=message, category=category,
+                         **_failure_extras(exc, target_id))
             return
         warning = safe_str(out.get("warning"))
         status = (ACTION_CREATED_WITH_WARNING if warning else
                   ACTION_UPDATED if out.get("changed") else ACTION_ADOPTED)
         self._record(unit, status, target_id=safe_str(out.get("target_id")) or target_id,
                      note=warning or safe_str(out.get("note")) or
-                     "already existed on target — adopted into the migration state")
+                     "already existed on target — adopted into the migration state",
+                     source_detail=safe_str(out.get("source_detail")),
+                     entitlements=out.get("entitlements"))
 
     def _do_update(self, unit: dict, target_id: str) -> None:
         """The UPDATE path — always against the STORED target id, never a source id."""
@@ -1096,15 +1258,16 @@ class BaseImporter(ABC):
             out = self.update_one(unit, target_id) or {}
         except Exception as exc:  # noqa: BLE001
             category, message = classify_error(exc)
-            self._record(unit, ACTION_FAILED, target_id=target_id, note=message,
-                         error_raw=str(exc), category=category)
+            self._record(unit, ACTION_FAILED, note=message, category=category,
+                         **_failure_extras(exc, target_id))
             return
         warning = safe_str(out.get("warning"))
         self._record(unit, ACTION_CREATED_WITH_WARNING if warning else ACTION_UPDATED,
                      target_id=safe_str(out.get("target_id")) or target_id,
                      note=warning or safe_str(out.get("note")) or
                      "source changed since the last import — updated in place",
-                     source_detail=safe_str(out.get("source_detail")))
+                     source_detail=safe_str(out.get("source_detail")),
+                     entitlements=out.get("entitlements"))
 
     @staticmethod
     def _dry_status(action: UpsertAction) -> str:
@@ -1118,7 +1281,7 @@ class BaseImporter(ABC):
     def _record(self, unit: dict, status: str, *, target_id: str = "", note: str = "",
                 error_raw: str = "", category: str = "", dry: bool = False,
                 checkpoint: bool = True, source_detail: str = "", resumed: bool = False,
-                skip_reason: str = "") -> None:
+                skip_reason: str = "", entitlements: Optional[dict] = None) -> None:
         """Record one outcome in all three places: state table, checkpoint, result rows.
 
         `source_detail` (PLAN 8 Bug 5) is an optional JSON snapshot of the unit's source-side
@@ -1128,7 +1291,10 @@ class BaseImporter(ABC):
 
         `resumed` (PLAN 16.2 §1a) marks an outcome RESTORED from the checkpoint rather than done by
         this run — only the log line changes (report + state carry the restored outcome as before).
-        `skip_reason` refines a `skipped` row's report label (e.g. `platform_internal`)."""
+        `skip_reason` refines a `skipped` row's report label (e.g. `platform_internal`).
+        `entitlements` (PLAN 16.3.1 DB5, identity rows only) is the verified per-value result
+        `{copied, present, failed}`; when given, the row gains `entitlements_copied` /
+        `entitlements_present` / `entitlements_failed`. Omitted → the row is byte-identical."""
         asset_type = safe_str(unit.get("asset_type"))
         key = self.natural_key(unit)
         row = {
@@ -1150,6 +1316,10 @@ class BaseImporter(ABC):
         }
         if skip_reason:
             row["skip_reason"] = skip_reason
+        if entitlements is not None:
+            for field in ("copied", "present", "failed"):
+                row[f"entitlements_{field}"] = ", ".join(
+                    safe_str(v) for v in (entitlements.get(field) or []))
         self.result.add(row)
         self._log_outcome(asset_type, key, status, target_id=target_id, note=note,
                           error_raw=error_raw, category=category, dry=dry, resumed=resumed)

@@ -9,13 +9,15 @@ The traps this phase exists to avoid, all things a naive "mkdirs then import" ge
 
   • **Directories go top-down.** `mkdirs` does create parents, but creating them in order keeps the
     per-directory ACL rows meaningful and the report readable.
-  • **A user's home directory CANNOT be mkdir'd.** `/Users/<email>` exists only once that user is
-    provisioned on the workspace — which is *why* identity is phase 1. Attempting it fails with an
-    opaque error, so an unprovisioned owner is reported as a named prerequisite instead — UNLESS the
-    owner was DELETED in source (absent from the roster), in which case there is no real home to wait
-    for and the content is diverted to a top-level backup root (`_resolve_home_target`, PLAN 9), so
-    the bytes are preserved rather than dropped. One resolver (`_resolve_home_target`) makes this
-    decision — SP-home remap (IMP-6), present-home passthrough, orphaned-home backup, or prerequisite.
+  • **A home directory is created ONLY by its owner's sign-in or an admin `mkdirs`** (since
+    2026-11-12, ES-2364565 — never on assignment or workspace load). So an absent `/Users/<owner>`
+    of an ASSIGNED owner is created with `mkdirs` as the workspace-admin run-as (PLAN 16.3.1 Part A);
+    the platform refuses an unassigned owner (`DIRECTORY_PROTECTED`), which is reported as a named
+    prerequisite — UNLESS the owner was DELETED in source (absent from the roster), in which case
+    there is no real home to wait for and the content is diverted to a top-level backup root
+    (PLAN 9), so the bytes are preserved rather than dropped. One resolver (`_resolve_home_target`)
+    makes this decision — SP-home remap (IMP-6), present-home passthrough, orphaned-home backup,
+    home creation, or prerequisite.
   • **Special roots must be skipped**: `/Repos`, `/Users`, `/Shared`, `/Workspace` themselves, and
     Trash. They exist by construction or are not ours to create.
   • **`.bundle/` content must be skipped** — branched on `import_action`, NEVER on `migration_mode`
@@ -73,7 +75,7 @@ def is_skippable_path(path: str) -> bool:
 
 
 def is_user_home(path: str) -> bool:
-    """`/Users/<principal>` exactly — the one directory that cannot be created, only provisioned."""
+    """`/Users/<principal>` exactly — the home root (created only by sign-in or an admin mkdirs)."""
     parts = [seg for seg in safe_str(path).split("/") if seg]
     return len(parts) == 2 and parts[0] == "Users"
 
@@ -143,42 +145,35 @@ class WorkspaceImporter(BaseImporter):
         return self._upload_content(unit, overwrite=True)
 
     def _raise_home_prerequisite(self, path: str) -> None:
-        """Raise the actionable `prerequisite_missing` for a home whose owner is absent on target
-        and NOT eligible for backup (Bug 8/14 + A2 messaging). Handles the ROOT (SP vs user, with
-        the roster reason) and any DESCENDANT beneath it, preserving the existing wording."""
+        """Raise the actionable `prerequisite_missing` for a home that is absent and could not be
+        created (PLAN 16.3.1 §3A.5 — Bug 8/14 + A2 lineage). The ROOT and every DESCENDANT get the
+        same reason: the platform's own refusal (`DIRECTORY_PROTECTED` = owner not assigned;
+        anything else = check the run-as is a workspace admin), a deleted owner with backup off, or
+        a dry run. Never the old "a home appears on first login" — homes are no longer created on
+        workspace load (ES-2364565)."""
         owner = home_owner(path)
         home_root = f"/Users/{owner}"
+        reason = self._home_prerequisite_reason(path)
         if safe_str(path).rstrip("/") == home_root:
-            # The home ROOT itself. Say WHY the owner is missing (A2): distinguish "present in the
-            # source roster but not migrated this run" from "deleted in source", because the
-            # operator's next step differs.
-            if looks_like_app_id(owner):
-                roster = self._roster_status(owner)
-                if roster == "in_roster":
-                    why = ("this SP IS present in the source roster but was NOT migrated in this "
-                           "run (its identity family was skipped or filtered). Re-run the identity "
-                           "phase for this workspace pair, then re-run with retry_mode=failed_only")
-                elif roster == "absent":
-                    why = ("this appId is NOT in the source roster — the SP was deleted in source. "
-                           "Its home content is not migrated by design; confirm the SP was meant to "
-                           "be removed")
-                else:
-                    why = ("the source identity classification is unavailable, so whether this SP "
-                           "was skipped or deleted cannot be determined — check the identity phase")
-                raise PrerequisiteMissing(
-                    f"`{path}` is a SERVICE PRINCIPAL home for applicationId `{owner}`, which is not "
-                    f"in this run's identity map, so its home cannot be created — an SP home only "
-                    f"appears when the SP is provisioned. {why}.")
-            raise PrerequisiteMissing(
-                f"`{path}` is a USER HOME directory, which cannot be created — it appears only once "
-                f"`{owner}` is provisioned on this workspace. Assign that user (identity phase / "
-                f"Entra SCIM), then re-run with retry_mode=failed_only; the notebooks beneath it "
-                f"import once it exists.")
+            who = "service principal" if looks_like_app_id(owner) else "user"
+            raise PrerequisiteMissing(f"`{path}` is the home of {who} `{owner}`: {reason}")
         raise PrerequisiteMissing(
-            f"`{path}` lives under `{home_root}`, whose owner is not present on target yet — a home "
-            f"is provisioned only once its owner is assigned / logs in. Provision/assign `{owner}` "
-            f"(identity phase / Entra SCIM), then re-run with retry_mode=failed_only; ALL content "
+            f"`{path}` lives under `{home_root}`, whose home is not on target: {reason} ALL content "
             f"under this home imports once it exists.")
+
+    def dry_run_intent(self, unit: dict, action) -> str:
+        """A home whose owner has not signed in reads "a live run creates it" in the rehearsal —
+        not a generic "would CREATE" that hides the home creation (PLAN 16.3.1 §8.1)."""
+        from src.state.state_store import UpsertAction
+        if action is not UpsertAction.CREATE:
+            return ""
+        path = self.natural_key(unit)
+        if not home_owner(path) or is_skippable_path(path):
+            return ""
+        res = self._resolve_home_target(path)          # provision=False: no side effect
+        if res.kind != "prerequisite":
+            return ""
+        return f"would CREATE — {self._home_prerequisite_reason(path)}"
 
     # ── directories ───────────────────────────────────────────────────────
     def _create_directory(self, unit: dict) -> dict:
@@ -186,12 +181,13 @@ class WorkspaceImporter(BaseImporter):
         if is_skippable_path(path):
             return {"target_id": path,
                     "note": "workspace root / Trash path — exists by construction, not created"}
-        res = self._resolve_home_target(path)
-        # A home ROOT is never mkdir'd — it is auto-provisioned when its owner is created/assigned.
-        if res.kind == "skip_root":
+        res = self._resolve_home_target(path, provision=True)
+        # A home ROOT that already exists is a no-op; one the resolver just CREATED with mkdirs
+        # (PLAN 16.3.1 Part A) is recorded `created` with the provisioned note — no second mkdirs.
+        if res.kind in ("skip_root", "provisioned_root"):
             return {"target_id": res.target_path, "note": res.note}
-        # Owner absent on target and not eligible for backup → one clean, actionable prerequisite
-        # (Bug 8/14 + A2), never a raw DIRECTORY_PROTECTED / parent-missing error.
+        # Home absent and could not be created → one clean, actionable prerequisite (Bug 8/14 +
+        # A2 + PLAN 16.3.1 wording), never a raw DIRECTORY_PROTECTED / parent-missing error.
         if res.kind == "prerequisite":
             self._raise_home_prerequisite(path)
         # not_home / normal_home / remapped_sp / backup → create at the RESOLVED path. For `backup`
@@ -219,9 +215,9 @@ class WorkspaceImporter(BaseImporter):
             return {"target_id": source_path,
                     "note": "inside a platform-internal directory — owned by Databricks, not "
                             "recreated by this tool"}
-        res = self._resolve_home_target(source_path)
-        # A descendant of a home whose owner is absent on target and not eligible for backup → one
-        # clean prerequisite (Bug 8/14), rather than a raw parent-missing / DIRECTORY_PROTECTED error.
+        res = self._resolve_home_target(source_path, provision=True)
+        # A descendant of a home that is absent and could not be created (PLAN 16.3.1) → one clean
+        # prerequisite (Bug 8/14), rather than a raw parent-missing / DIRECTORY_PROTECTED error.
         if res.kind == "prerequisite":
             self._raise_home_prerequisite(source_path)
         # A notebook/file under a recreated SP's home follows the home to its NEW appId path (IMP-6);
